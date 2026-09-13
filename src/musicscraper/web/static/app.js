@@ -92,7 +92,6 @@ function switchTab(tabId) {
     artist: 'Multi-Source Artist Downloader',
     quality: 'Audio Quality Scanner & Upgrader',
     tagger: 'Last.fm Automated Genre Tagger',
-    scrapers: 'Bandcamp & Web Release Crawlers',
     cleaner: 'Empty & Non-Music Folder Cleaner',
     tasks: 'Live Task Monitor & Console',
     settings: 'Settings & Integrations',
@@ -184,7 +183,6 @@ async function loadConfig() {
     document.getElementById('cfg-nav-url').value = cfg.NAVIDROME_URL || '';
     document.getElementById('cfg-nav-user').value = cfg.NAVIDROME_USER || cfg.NAVIDROME_USERNAME || '';
     document.getElementById('cfg-lastfm-key').value = cfg.LASTFM_API_KEY || '';
-    document.getElementById('cfg-bc-email').value = cfg.BANDCAMP_EMAIL || '';
 
     if (cfg.has_slskd_password) {
       document.getElementById('cfg-slskd-pass').placeholder = '•••••••• (configured in .env)';
@@ -213,12 +211,6 @@ async function loadConfig() {
     }
     if (!document.getElementById('cleaner-path').value) {
       document.getElementById('cleaner-path').value = cfg.DEFAULT_OUTPUT_DIR || '';
-    }
-    if (!document.getElementById('bc-output').value) {
-      document.getElementById('bc-output').value = cfg.DEFAULT_OUTPUT_DIR || '';
-    }
-    if (!document.getElementById('crawl-output').value) {
-      document.getElementById('crawl-output').value = cfg.DEFAULT_OUTPUT_DIR || '';
     }
   } catch (err) {
     console.error('Error loading config:', err);
@@ -779,7 +771,6 @@ function setupForms() {
     const format = document.getElementById('artist-dl-format').value;
     const outputDir = document.getElementById('artist-dl-output').value.trim();
     const libraryDir = document.getElementById('artist-dl-lib').value.trim();
-    const useBandcamp = document.getElementById('artist-dl-use-bc').checked;
     const useSoulseek = document.getElementById('artist-dl-use-slsk').checked;
     const dryRun = document.getElementById('artist-dl-dry-run').checked;
 
@@ -789,7 +780,6 @@ function setupForms() {
       format,
       output_dir: outputDir,
       library_dir: libraryDir,
-      use_bandcamp: useBandcamp,
       use_soulseek: useSoulseek,
       dry_run: dryRun,
     }, `Artist Downloader: ${artist}`);
@@ -842,41 +832,7 @@ function setupForms() {
     }, `Genre Tagging: ${path}`);
   });
 
-  // 6. Bandcamp Downloader
-  document.getElementById('form-bc-dl').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const targets = document.getElementById('bc-targets').value.trim();
-    const format = document.getElementById('bc-format').value;
-    const outputDir = document.getElementById('bc-output').value.trim();
-    const fallback = document.getElementById('bc-fallback').checked;
-
-    switchTab('tasks');
-    await startTask('bandcamp_download', {
-      targets,
-      format,
-      output_dir: outputDir,
-      fallback,
-    }, 'Bandcamp Downloads');
-  });
-
-  // 7. Universal Web Crawler
-  document.getElementById('form-crawl-dl').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const url = document.getElementById('crawl-url').value.trim();
-    const workers = parseInt(document.getElementById('crawl-workers').value, 10) || 4;
-    const outputDir = document.getElementById('crawl-output').value.trim();
-    const overwrite = document.getElementById('crawl-overwrite').checked;
-
-    switchTab('tasks');
-    await startTask('universal_scrape', {
-      url,
-      max_workers: workers,
-      output_dir: outputDir,
-      overwrite,
-    }, `Web Scraper: ${url}`);
-  });
-
-  // 8. Folder Cleaner Form
+  // 6. Folder Cleaner Form
   document.getElementById('form-cleaner').addEventListener('submit', async (e) => {
     e.preventDefault();
     const path = document.getElementById('cleaner-path').value.trim();
@@ -889,7 +845,7 @@ function setupForms() {
     }, `Folder Cleaner (${execute ? 'Execute' : 'Preview'}): ${path}`);
   });
 
-  // 9. Settings Form
+  // 7. Settings Form
   document.getElementById('form-settings').addEventListener('submit', async (e) => {
     e.preventDefault();
     const slskdPass = document.getElementById('cfg-slskd-pass').value.trim();
@@ -904,7 +860,6 @@ function setupForms() {
       NAVIDROME_USER: document.getElementById('cfg-nav-user').value.trim(),
       NAVIDROME_USERNAME: document.getElementById('cfg-nav-user').value.trim(),
       LASTFM_API_KEY: document.getElementById('cfg-lastfm-key').value.trim(),
-      BANDCAMP_EMAIL: document.getElementById('cfg-bc-email').value.trim(),
     };
 
     if (slskdPass) {
@@ -1305,8 +1260,8 @@ async function loadLibraryReleases(refresh = false) {
         AppState.selectedReleaseId = updated.id;
         AppState.selectedReleaseData = updated;
         renderReleaseDetails(updated);
-        // Refresh full audited details in background to ensure tracks match latest disk scan
-        selectLibraryRelease(updated.id, true);
+        // Refresh full details in background to ensure tracks match latest disk scan
+        selectLibraryRelease(updated.id);
       } else if (AppState.selectedReleaseData) {
         renderReleaseDetails(AppState.selectedReleaseData);
       }
@@ -1317,59 +1272,103 @@ async function loadLibraryReleases(refresh = false) {
   }
 }
 
-function renderReleasesList() {
+function renderReleaseListItemHtml(r) {
+  const isComplete = r.status === 'complete' || (r.missing_count === 0 && r.found_count > 0);
+  const badgeClass = isComplete ? 'badge-found' : 'badge-missing';
+  const missingText = r.missing_count > 0 ? `${r.missing_count} missing` : (isComplete ? 'Complete' : `${r.found_count} tracks`);
+  const isSelected = AppState.selectedReleaseId === r.id;
+
+  return `
+    <div class="release-list-item ${isSelected ? 'active' : ''}" data-release-id="${escapeHtml(r.id)}" onclick="selectLibraryRelease('${escapeHtml(r.id)}')">
+      <div class="release-item-art">💿</div>
+      <div class="release-item-details">
+        <div class="release-item-title">${escapeHtml(r.title)}</div>
+        <div class="release-item-artist">${escapeHtml(r.artist)} ${r.year ? `(${r.year})` : ''}</div>
+        <div class="release-item-tags">
+          <span class="badge ${badgeClass}">${missingText}</span>
+          <span class="badge font-mono">${r.found_count}${r.total_tracks_expected > r.found_count ? ` / ${r.total_tracks_expected}` : ''} trks</span>
+          ${(r.formats || []).map((f) => `<span class="badge">${escapeHtml(f)}</span>`).join('')}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function updateSelectedReleaseHighlight(releaseId) {
   const masterList = document.getElementById('releases-master-list');
   if (!masterList) return;
+  const items = masterList.querySelectorAll('.release-list-item');
+  items.forEach((item) => {
+    if (item.getAttribute('data-release-id') === releaseId) {
+      item.classList.add('active');
+    } else {
+      item.classList.remove('active');
+    }
+  });
+}
+
+function updateReleaseListItemDOM(rel) {
+  if (!rel || !rel.id) return;
+  const masterList = document.getElementById('releases-master-list');
+  if (!masterList) return;
+  const item = masterList.querySelector(`.release-list-item[data-release-id="${rel.id}"]`);
+  if (item) {
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = renderReleaseListItemHtml(rel).trim();
+    const newEl = tempDiv.firstElementChild;
+    if (newEl) {
+      item.replaceWith(newEl);
+    }
+  }
+}
+
+function renderReleasesList(preserveScroll = true) {
+  const masterList = document.getElementById('releases-master-list');
+  if (!masterList) return;
+
+  const prevScrollTop = preserveScroll ? masterList.scrollTop : 0;
 
   if (!AppState.libraryReleases || AppState.libraryReleases.length === 0) {
     masterList.innerHTML = '<div class="empty-state-card"><div class="text-muted">No releases matching current filters.</div></div>';
     return;
   }
 
-  // Sort releases
+  // Sort releases deterministically with stable tie-breakers
   const sorted = [...AppState.libraryReleases].sort((a, b) => {
     const sortBy = AppState.releaseSortBy || 'artist';
+    let cmp = 0;
     if (sortBy === 'title') {
-      return (a.title || '').localeCompare(b.title || '');
+      cmp = (a.title || '').localeCompare(b.title || '', undefined, { sensitivity: 'base' });
     } else if (sortBy === 'year') {
-      return (b.year || '').localeCompare(a.year || '');
+      cmp = (b.year || '').localeCompare(a.year || '');
     } else if (sortBy === 'missing') {
-      return (b.missing_count || 0) - (a.missing_count || 0);
+      cmp = (b.missing_count || 0) - (a.missing_count || 0);
     } else if (sortBy === 'tracks') {
-      return (b.found_count || 0) - (a.found_count || 0);
+      cmp = (b.found_count || 0) - (a.found_count || 0);
+    } else {
+      cmp = (a.artist || '').localeCompare(b.artist || '', undefined, { sensitivity: 'base' });
     }
-    // Default: artist
-    const artCmp = (a.artist || '').localeCompare(b.artist || '');
+    if (cmp !== 0) return cmp;
+    // Tie-breaker 1: Artist
+    const artCmp = (a.artist || '').localeCompare(b.artist || '', undefined, { sensitivity: 'base' });
     if (artCmp !== 0) return artCmp;
-    return (a.title || '').localeCompare(b.title || '');
+    // Tie-breaker 2: Title
+    const titleCmp = (a.title || '').localeCompare(b.title || '', undefined, { sensitivity: 'base' });
+    if (titleCmp !== 0) return titleCmp;
+    // Tie-breaker 3: ID
+    return (a.id || '').localeCompare(b.id || '');
   });
 
-  masterList.innerHTML = sorted.map((r) => {
-    const isComplete = r.status === 'complete' || (r.missing_count === 0 && r.found_count > 0);
-    const badgeClass = isComplete ? 'badge-found' : 'badge-missing';
-    const missingText = r.missing_count > 0 ? `${r.missing_count} missing` : (isComplete ? 'Complete' : `${r.found_count} tracks`);
-    const isSelected = AppState.selectedReleaseId === r.id;
+  masterList.innerHTML = sorted.map((r) => renderReleaseListItemHtml(r)).join('');
 
-    return `
-      <div class="release-list-item ${isSelected ? 'active' : ''}" onclick="selectLibraryRelease('${r.id}')">
-        <div class="release-item-art">💿</div>
-        <div class="release-item-details">
-          <div class="release-item-title">${escapeHtml(r.title)}</div>
-          <div class="release-item-artist">${escapeHtml(r.artist)} ${r.year ? `(${r.year})` : ''}</div>
-          <div class="release-item-tags">
-            <span class="badge ${badgeClass}">${missingText}</span>
-            <span class="badge font-mono">${r.found_count}${r.total_tracks_expected > r.found_count ? ` / ${r.total_tracks_expected}` : ''} trks</span>
-            ${(r.formats || []).map((f) => `<span class="badge">${escapeHtml(f)}</span>`).join('')}
-          </div>
-        </div>
-      </div>
-    `;
-  }).join('');
+  if (preserveScroll) {
+    masterList.scrollTop = prevScrollTop;
+  }
 }
 
-async function selectLibraryRelease(releaseId, audit = true) {
+async function selectLibraryRelease(releaseId, forceAudit = false) {
   AppState.selectedReleaseId = releaseId;
-  renderReleasesList();
+  updateSelectedReleaseHighlight(releaseId);
 
   const placeholder = document.getElementById('release-empty-placeholder');
   const detailWrapper = document.getElementById('release-detail-wrapper');
@@ -1377,33 +1376,62 @@ async function selectLibraryRelease(releaseId, audit = true) {
   if (placeholder) placeholder.classList.add('hidden');
   if (detailWrapper) detailWrapper.classList.remove('hidden');
 
-  // If we already have full audited data for this release in memory, render that immediately
-  if (AppState.selectedReleaseData && AppState.selectedReleaseData.id === releaseId && AppState.selectedReleaseData.tracks && AppState.selectedReleaseData.tracks.length > 0) {
-    renderReleaseDetails(AppState.selectedReleaseData);
+  // If we already have full data for this release in memory, render that immediately
+  let currentRel = null;
+  if (AppState.selectedReleaseData && AppState.selectedReleaseData.id === releaseId) {
+    currentRel = AppState.selectedReleaseData;
   } else {
-    // Otherwise find in master list for quick immediate display
-    const localRel = AppState.libraryReleases.find((r) => r.id === releaseId);
-    if (localRel) {
-      renderReleaseDetails(localRel);
-    }
+    currentRel = AppState.libraryReleases.find((r) => r.id === releaseId);
   }
 
-  // Fetch full audited details from server if requested
-  try {
-    const res = await fetch(`/api/library/releases/${releaseId}?audit=${audit ? 'true' : 'false'}`);
-    if (!res.ok) return;
-    const releaseData = await res.json();
-    AppState.selectedReleaseData = releaseData;
-    renderReleaseDetails(releaseData);
+  if (currentRel) {
+    AppState.selectedReleaseData = currentRel;
+    renderReleaseDetails(currentRel);
+  }
 
-    // Sync master list release object with audited data
-    const idx = AppState.libraryReleases.findIndex((r) => r.id === releaseId);
-    if (idx !== -1) {
-      AppState.libraryReleases[idx] = { ...AppState.libraryReleases[idx], ...releaseData };
-      renderReleasesList();
+  // Check if release has placeholder titles like "Track 01 (Missing)" or hasn't been audited
+  const hasPlaceholders = (currentRel?.tracks || []).some((t) =>
+    /^(?:Disc\s+\d+\s+)?Track\s+\d+\s*\(Missing\)$/i.test(t.title || '')
+  );
+  const isAudited = Boolean(currentRel?.is_audited);
+  const shouldAudit =
+    forceAudit ||
+    !isAudited ||
+    hasPlaceholders ||
+    !currentRel ||
+    !currentRel.tracks ||
+    currentRel.tracks.length === 0;
+
+  if (shouldAudit) {
+    const btnAuditMB = document.getElementById('btn-rel-audit-mb');
+    if (btnAuditMB && (hasPlaceholders || !isAudited)) {
+      btnAuditMB.disabled = true;
+      btnAuditMB.textContent = 'Auditing MusicBrainz...';
     }
-  } catch (err) {
-    console.error('Error fetching release details:', err);
+
+    try {
+      const res = await fetch(`/api/library/releases/${encodeURIComponent(releaseId)}?audit=true`);
+      if (!res.ok) return;
+      const releaseData = await res.json();
+      if (AppState.selectedReleaseId === releaseId) {
+        AppState.selectedReleaseData = releaseData;
+        renderReleaseDetails(releaseData);
+      }
+
+      // Sync master list release object in memory and update DOM element in place (NO list jumping or re-sorting)
+      const idx = AppState.libraryReleases.findIndex((r) => r.id === releaseId);
+      if (idx !== -1) {
+        AppState.libraryReleases[idx] = { ...AppState.libraryReleases[idx], ...releaseData };
+        updateReleaseListItemDOM(AppState.libraryReleases[idx]);
+      }
+    } catch (err) {
+      console.error('Error fetching release details:', err);
+    } finally {
+      if (btnAuditMB) {
+        btnAuditMB.disabled = false;
+        btnAuditMB.textContent = '🔍 Re-Audit with MusicBrainz';
+      }
+    }
   }
 }
 
@@ -1610,10 +1638,11 @@ async function auditSelectedRelease() {
         const idx = AppState.libraryReleases.findIndex((r) => r.id === data.release.id || r.id === relId);
         if (idx !== -1) {
           AppState.libraryReleases[idx] = data.release;
+          updateReleaseListItemDOM(data.release);
         } else {
           AppState.libraryReleases.push(data.release);
+          renderReleasesList(true);
         }
-        renderReleasesList();
       }
     } else {
       const errData = await res.json().catch(() => ({}));

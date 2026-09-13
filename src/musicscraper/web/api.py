@@ -520,7 +520,7 @@ def run_soulseek_queue_task(task: BackgroundTask) -> Dict[str, Any]:
 
 
 def run_artist_download_task(task: BackgroundTask) -> Dict[str, Any]:
-    """Executes multi-source artist discography downloader."""
+    """Executes artist discography downloader (MusicBrainz + Soulseek)."""
     task.check_cancelled()
     from musicscraper.services.artist import ArtistDownloadOrchestrator
     artist = task.params.get("artist", "").strip()
@@ -528,14 +528,13 @@ def run_artist_download_task(task: BackgroundTask) -> Dict[str, Any]:
     library_dir = Path(task.params.get("library_dir", str(Config.DEFAULT_LIBRARY_DIR)))
     preferred_format = task.params.get("format", "flac")
     dry_run = bool(task.params.get("dry_run", False))
-    use_bandcamp = bool(task.params.get("use_bandcamp", True))
     use_soulseek = bool(task.params.get("use_soulseek", True))
     timeout = float(task.params.get("timeout", 25.0))
 
     if not artist:
         raise ValueError("Artist name is required.")
 
-    task.update_progress(10, f"Initializing multi-source orchestrator for '{artist}'...")
+    task.update_progress(10, f"Initializing artist orchestrator for '{artist}'...")
     task.check_cancelled()
     orchestrator = ArtistDownloadOrchestrator(
         artist_query=artist,
@@ -543,7 +542,6 @@ def run_artist_download_task(task: BackgroundTask) -> Dict[str, Any]:
         library_dir=library_dir,
         preferred_format=preferred_format,
         dry_run=dry_run,
-        use_bandcamp=use_bandcamp,
         use_soulseek=use_soulseek,
         search_timeout=timeout
     )
@@ -648,86 +646,6 @@ def run_genre_tag_task(task: BackgroundTask) -> Dict[str, Any]:
     task.check_cancelled()
     task.update_progress(100, "Genre tagging completed.")
     return {"path": str(path), "strategy": strategy, "dry_run": dry_run}
-
-
-def run_bandcamp_download_task(task: BackgroundTask) -> Dict[str, Any]:
-    """Downloads releases/tracks from Bandcamp."""
-    task.check_cancelled()
-    from musicscraper.scrapers.bandcamp import BandcampEngine
-    targets = task.params.get("targets", [])
-    if isinstance(targets, str):
-        targets = [t.strip() for t in targets.splitlines() if t.strip()]
-
-    output_dir = Path(task.params.get("output_dir", str(Config.DEFAULT_OUTPUT_DIR)))
-    audio_format = task.params.get("format", "mp3-320")
-    fallback = bool(task.params.get("fallback", True))
-    overwrite = bool(task.params.get("overwrite", False))
-
-    if not targets:
-        raise ValueError("At least one Bandcamp URL or artist name is required.")
-
-    task.update_progress(10, f"Initializing Bandcamp engine for {len(targets)} targets...")
-    task.check_cancelled()
-    engine = BandcampEngine(
-        output_dir=output_dir,
-        audio_format=audio_format,
-        fallback=fallback,
-        overwrite=overwrite
-    )
-
-    downloaded = []
-    for idx, target in enumerate(targets):
-        task.check_cancelled()
-        task.update_progress(20 + int((idx / len(targets)) * 75), f"Processing Bandcamp target: {target}")
-        norm_url, target_type = BandcampEngine.normalize_target(target)
-        if target_type == "artist":
-            task.check_cancelled()
-            rel_urls = engine.get_artist_release_urls(norm_url)
-            for r_url in rel_urls:
-                task.check_cancelled()
-                meta = engine.get_release_metadata(r_url)
-                if meta:
-                    task.check_cancelled()
-                    engine.download_release(meta)
-                    downloaded.append(meta.get("title", r_url))
-        else:
-            task.check_cancelled()
-            meta = engine.get_release_metadata(norm_url)
-            if meta:
-                task.check_cancelled()
-                engine.download_release(meta)
-                downloaded.append(meta.get("title", norm_url))
-
-    task.check_cancelled()
-    task.update_progress(100, f"Bandcamp download complete. {len(downloaded)} releases processed.")
-    return {"targets": targets, "downloaded_count": len(downloaded), "releases": downloaded}
-
-
-def run_universal_scrape_task(task: BackgroundTask) -> Dict[str, Any]:
-    """Crawls a music release website and batch downloads audio files."""
-    task.check_cancelled()
-    from musicscraper.scrapers.universal import UniversalScraper, MusicDownloader
-    url = task.params.get("url", "").strip()
-    output_dir = Path(task.params.get("output_dir", str(Config.DEFAULT_OUTPUT_DIR)))
-    max_workers = int(task.params.get("max_workers", 4))
-    overwrite = bool(task.params.get("overwrite", False))
-
-    if not url:
-        raise ValueError("URL to scrape is required.")
-
-    task.update_progress(15, f"Crawling release links from {url}...")
-    task.check_cancelled()
-    scraper = UniversalScraper(base_url=url)
-    releases = scraper.crawl()
-    task.check_cancelled()
-
-    task.update_progress(50, f"Discovered {len(releases)} releases. Starting downloads...")
-    downloader = MusicDownloader(output_dir=output_dir, max_workers=max_workers, overwrite=overwrite)
-    downloader.download_all(releases)
-    task.check_cancelled()
-
-    task.update_progress(100, f"Downloaded {len(releases)} releases from {url}.")
-    return {"url": url, "releases_count": len(releases)}
 
 
 def run_clean_folders_task(task: BackgroundTask) -> Dict[str, Any]:
@@ -917,8 +835,6 @@ TASK_DISPATCHER = {
     "quality_scan": run_quality_scan_task,
     "quality_upgrade": run_quality_upgrade_task,
     "genre_tag": run_genre_tag_task,
-    "bandcamp_download": run_bandcamp_download_task,
-    "universal_scrape": run_universal_scrape_task,
     "clean_folders": run_clean_folders_task,
     "library_scan": run_library_scan_task,
     "library_audit": run_library_audit_all_task,

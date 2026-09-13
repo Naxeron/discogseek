@@ -35,12 +35,6 @@ def test_cli_parser_commands():
     assert args.strategy == "blend"
     assert args.limit == 5
 
-    # Bandcamp subcommand
-    args = parser.parse_args(["bandcamp", "https://artist.bandcamp.com", "--overwrite"])
-    assert args.command == "bandcamp"
-    assert args.targets == ["https://artist.bandcamp.com"]
-    assert args.overwrite is True
-
     # Clean subcommand
     args = parser.parse_args(["clean", "/music", "-y", "-v"])
     assert args.command == "clean"

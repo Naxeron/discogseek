@@ -415,6 +415,7 @@ class LibraryReleaseService:
                     "tracks": [],
                     "total_tracks_expected": 0,
                     "status": "unverified",
+                    "is_audited": False,
                     "found_count": 0,
                     "missing_count": 0,
                     "completion_pct": 100.0,
@@ -900,10 +901,12 @@ class LibraryReleaseService:
             result["completion_pct"] = completion_pct
             result["status"] = "has_missing" if missing_count > 0 else "complete"
             result["tracks"] = reconciled_tracklist
+            result["is_audited"] = True
             return result
 
         # Fallback if no MB release found: return existing release data with verified status
         result = dict(release_data)
+        result["is_audited"] = True
         result["status"] = "complete" if result.get("missing_count", 0) == 0 else "has_missing"
         return result
 

@@ -47,7 +47,6 @@ class Config:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     )
-    BANDCAMP_USER_AGENT = "bandcamper/0.0.2"
 
     # MusicBrainz Application Identity
     MB_APP_NAME = "MusicScraper"
@@ -94,8 +93,8 @@ class Config:
         or ""
     )
 
-    # Bandcamp Account (optional)
-    BANDCAMP_EMAIL = os.environ.get("BANDCAMP_EMAIL")
+    # Legacy compatibility dummy attribute
+    BANDCAMP_EMAIL = os.environ.get("BANDCAMP_EMAIL", "")
 
     @classmethod
     def save_to_env(cls) -> bool:

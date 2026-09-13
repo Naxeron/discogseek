@@ -106,11 +106,6 @@ POLISH_DIACRITICS_MAP: Dict[str, str] = {
     "Ó": "O", "Ś": "S", "Ź": "Z", "Ż": "Z"
 }
 
-# Supported Bandcamp formats in order of download preference
-BANDCAMP_SUPPORTED_FORMATS = [
-    "flac", "mp3-320", "wav", "aac-hi", "aiff-lossless", "alac", "vorbis", "mp3-v0", "mp3-128"
-]
-
 import os
 from pathlib import Path
 DEFAULT_CACHE_DIR: Path = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "musicscraper"

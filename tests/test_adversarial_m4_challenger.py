@@ -68,6 +68,9 @@ def web_server():
 
     server.shutdown()
     server.server_close()
+    for task in global_task_manager.list_tasks(limit=100):
+        if task.status in ("pending", "running"):
+            global_task_manager.cancel_task(task.id)
 
 
 # ==============================================================================
@@ -250,7 +253,7 @@ class TestAdversarialWebTaskDispatcher:
 
     def test_task_dispatcher_exhaustiveness(self):
         """
-        Verifies that all 15 task types are registered in TASK_DISPATCHER
+        Verifies that all 13 active task types are registered in TASK_DISPATCHER
         and are callable functions.
         """
         expected_types = {
@@ -261,8 +264,6 @@ class TestAdversarialWebTaskDispatcher:
             "quality_scan",
             "quality_upgrade",
             "genre_tag",
-            "bandcamp_download",
-            "universal_scrape",
             "clean_folders",
             "library_scan",
             "library_audit",
@@ -356,6 +357,7 @@ class TestAdversarialWebTaskDispatcher:
         payload = json.loads(resp.read().decode("utf-8"))
         assert payload["success"] is True
         assert payload["task"]["type"] == "library_audit"
+        global_task_manager.cancel_task(payload["task"]["id"])
 
     def test_concurrent_task_dispatch_and_rapid_cancellation(self):
         """
@@ -365,36 +367,38 @@ class TestAdversarialWebTaskDispatcher:
         and proper terminal state transitions.
         """
         mgr = TaskManager(max_workers=8)
+        try:
+            def dummy_worker(task: BackgroundTask):
+                for _ in range(50):
+                    if task.is_cancelled:
+                        raise TaskCancelledException("Task cooperatively cancelled")
+                    time.sleep(0.02)
+                return {"finished": True}
 
-        def dummy_worker(task: BackgroundTask):
-            for _ in range(50):
-                if task.is_cancelled:
-                    raise TaskCancelledException("Task cooperatively cancelled")
-                time.sleep(0.02)
-            return {"finished": True}
+            tasks = []
+            for i in range(20):
+                t = mgr.submit(
+                    name=f"Worker {i}",
+                    task_type="clean_folders",
+                    target_fn=dummy_worker
+                )
+                tasks.append(t)
 
-        tasks = []
-        for i in range(20):
-            t = mgr.submit(
-                name=f"Worker {i}",
-                task_type="clean_folders",
-                target_fn=dummy_worker
-            )
-            tasks.append(t)
+            # Cancel half immediately
+            for t in tasks[:10]:
+                t.cancel()
 
-        # Cancel half immediately
-        for t in tasks[:10]:
-            t.cancel()
+            # Wait up to 3 seconds for all tasks to settle
+            start = time.time()
+            while time.time() - start < 3.0:
+                if all(t.status in ("completed", "cancelled", "failed") for t in tasks):
+                    break
+                time.sleep(0.05)
 
-        # Wait up to 3 seconds for all tasks to settle
-        start = time.time()
-        while time.time() - start < 3.0:
-            if all(t.status in ("completed", "cancelled", "failed") for t in tasks):
-                break
-            time.sleep(0.05)
-
-        cancelled_count = sum(1 for t in tasks if t.status == "cancelled")
-        assert cancelled_count >= 8, f"Expected most cancelled tasks to settle as 'cancelled', got {cancelled_count}"
+            cancelled_count = sum(1 for t in tasks if t.status == "cancelled")
+            assert cancelled_count >= 8, f"Expected most cancelled tasks to settle as 'cancelled', got {cancelled_count}"
+        finally:
+            mgr._executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ==============================================================================

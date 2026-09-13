@@ -15,8 +15,6 @@ from musicscraper.services.artist import ArtistDownloadOrchestrator
 from musicscraper.services.quality import LocalLibraryQualityScanner, SoulseekQualityUpgrader
 from musicscraper.services.tagger import GenreTaggerService
 from musicscraper.services.cleaner import FolderCleanerService
-from musicscraper.scrapers.bandcamp import BandcampEngine
-from musicscraper.scrapers.universal import UniversalScraper, MusicDownloader
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,13 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     slsk_p.add_argument("--dry-run", action="store_true", help="Scan and verify matches without queueing transfers")
 
     # 3. Artist Subcommand
-    artist_p = subparsers.add_parser("artist", help="End-to-end multi-source artist downloader (MusicBrainz + Bandcamp + Soulseek)")
+    artist_p = subparsers.add_parser("artist", help="End-to-end artist downloader (MusicBrainz + Soulseek)")
     artist_p.add_argument("artist", help="Artist name to download")
     artist_p.add_argument("-o", "--output-dir", default=str(Config.DEFAULT_OUTPUT_DIR), help="Output directory")
     artist_p.add_argument("-d", "--library-dir", default=str(Config.DEFAULT_LIBRARY_DIR), help="Local library path for pre-scan")
     artist_p.add_argument("-f", "--format", default="flac", choices=["flac", "mp3-320"], help="Preferred audio format")
     artist_p.add_argument("-t", "--timeout", type=float, default=25.0, help="Soulseek search timeout in seconds (default: 25.0)")
-    artist_p.add_argument("--no-bandcamp", action="store_true", help="Disable Bandcamp downloading")
     artist_p.add_argument("--no-soulseek", action="store_true", help="Disable Soulseek queueing")
     artist_p.add_argument("--dry-run", action="store_true", help="Preview downloads without downloading")
 
@@ -75,23 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     tag_p.add_argument("--mode", choices=["overwrite", "skip_existing", "append"], default="overwrite", help="Write mode")
     tag_p.add_argument("--dry-run", action="store_true", help="Preview genre changes without modifying files")
 
-    # 6. Bandcamp Subcommand
-    bc_p = subparsers.add_parser("bandcamp", aliases=["bc"], help="Download Bandcamp artist discography, album, or track")
-    bc_p.add_argument("targets", nargs="*", help="Bandcamp artist subdomain, URL, album, or track URL")
-    bc_p.add_argument("-i", "--input", help="File containing Bandcamp URLs (one per line)")
-    bc_p.add_argument("-o", "--output-dir", default=str(Config.DEFAULT_OUTPUT_DIR), help="Output directory")
-    bc_p.add_argument("-f", "--format", default="mp3-320", help="Preferred audio format for free downloads")
-    bc_p.add_argument("--no-fallback", action="store_true", help="Disable MP3-128 stream fallback")
-    bc_p.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-
-    # 7. Scrape Subcommand
-    scrape_p = subparsers.add_parser("scrape", help="Crawl and download releases from web pages (Dochakuso, Otherman, Archive.org, MediaFire)")
-    scrape_p.add_argument("url", help="Target URL to crawl (or release URL)")
-    scrape_p.add_argument("-o", "--output-dir", default=str(Config.DEFAULT_OUTPUT_DIR), help="Output directory")
-    scrape_p.add_argument("--max-workers", "-w", type=int, default=4, help="Download worker threads")
-    scrape_p.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-
-    # 8. Clean Subcommand
+    # 6. Clean Subcommand
     clean_p = subparsers.add_parser("clean", help="Remove empty and non-music folders")
     clean_p.add_argument("path", nargs="?", default=str(Config.DEFAULT_OUTPUT_DIR), help="Directory to clean")
     clean_p.add_argument("--execute", "-y", action="store_true", help="Perform actual deletion (default is dry-run)")
@@ -156,7 +137,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             library_dir=Path(args.library_dir),
             preferred_format=args.format,
             dry_run=args.dry_run,
-            use_bandcamp=not args.no_bandcamp,
             use_soulseek=not args.no_soulseek,
             search_timeout=args.timeout
         )
@@ -185,49 +165,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             dry_run=args.dry_run
         )
         tagger.process_target(Path(args.path))
-        return 0
-
-    elif args.command in ("bandcamp", "bc"):
-        engine = BandcampEngine(
-            output_dir=Path(args.output_dir),
-            audio_format=args.format,
-            fallback=not args.no_fallback,
-            overwrite=args.overwrite
-        )
-        targets = list(args.targets or [])
-        if args.input and Path(args.input).exists():
-            with open(args.input, "r", encoding="utf-8") as f:
-                for line in f:
-                    t = line.strip()
-                    if t and not t.startswith("#"):
-                        targets.append(t)
-
-        if not targets:
-            console.print("[yellow]No Bandcamp target URL or artist specified.[/yellow]")
-            return 1
-
-        for target in targets:
-            norm_url, target_type = BandcampEngine.normalize_target(target)
-            if target_type == "artist":
-                rel_urls = engine.get_artist_release_urls(norm_url)
-                console.print(f"[cyan]Found {len(rel_urls)} releases for {norm_url}[/cyan]")
-                for r_url in rel_urls:
-                    meta = engine.get_release_metadata(r_url)
-                    if meta:
-                        engine.download_release(meta)
-            else:
-                meta = engine.get_release_metadata(norm_url)
-                if meta:
-                    engine.download_release(meta)
-        return 0
-
-    elif args.command == "scrape":
-        scraper = UniversalScraper(base_url=args.url)
-        releases = scraper.crawl()
-        downloader = MusicDownloader(output_dir=Path(args.output_dir), max_workers=args.max_workers, overwrite=args.overwrite)
-        downloader.download_all(releases)
-        return 0
-
     elif args.command == "clean":
         cleaner = FolderCleanerService()
         cleaner.clean(target_dir=Path(args.path), dry_run=not args.execute, verbose=args.verbose)
