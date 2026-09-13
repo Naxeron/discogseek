@@ -1,3 +1,5 @@
+> Historical planning document. For current setup and architecture, see [README](../../README.md).
+
 # TEST_READY: MusicScraper Hardening E2E Test Suite
 
 ## 1. Test Suite Status: READY

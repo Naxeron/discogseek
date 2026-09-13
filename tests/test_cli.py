@@ -22,22 +22,15 @@ def test_cli_parser_commands():
     assert args.dry_run is True
     assert args.format == "flac"
 
-    # Quality upgrade subcommand
-    args = parser.parse_args(["upgrade", "--dry-run", "-f", "mp3-320"])
-    assert args.command == "upgrade"
+    # Artist subcommand
+    args = parser.parse_args(["artist", "Boards of Canada", "--dry-run", "-f", "flac"])
+    assert args.command == "artist"
+    assert args.artist == "Boards of Canada"
     assert args.dry_run is True
-    assert args.format == "mp3-320"
+    assert args.format == "flac"
 
-    # Genre tagger subcommand
-    args = parser.parse_args(["tag", "/music", "--strategy", "blend", "--limit", "5"])
-    assert args.command == "tag"
-    assert args.path == "/music"
-    assert args.strategy == "blend"
-    assert args.limit == 5
-
-    # Clean subcommand
-    args = parser.parse_args(["clean", "/music", "-y", "-v"])
-    assert args.command == "clean"
-    assert args.path == "/music"
-    assert args.execute is True
-    assert args.verbose is True
+    # Web subcommand
+    args = parser.parse_args(["web", "--port", "9090", "--host", "0.0.0.0"])
+    assert args.command == "web"
+    assert args.port == 9090
+    assert args.host == "0.0.0.0"

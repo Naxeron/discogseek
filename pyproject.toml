@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "musicscraper"
 version = "1.0.0"
-description = "A complete music collection, archival, metadata tagging, and discography download suite"
+description = "Music library auditing and Soulseek discography downloads"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -29,6 +29,9 @@ ms = "musicscraper.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"musicscraper.web" = ["static/*.html", "static/*.css", "static/*.js", "static/js/*.js"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

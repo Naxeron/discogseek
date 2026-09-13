@@ -53,11 +53,6 @@ class Config:
     MB_APP_VERSION = "1.0"
     MB_APP_CONTACT = "https://github.com/naxeron/musicscraper"
 
-    # Last.fm Settings
-    LASTFM_API_KEY = os.environ.get("LASTFM_API_KEY", "b25b959554ed76058ac220b7b2e0a026")
-    LASTFM_API_SECRET = os.environ.get("LASTFM_API_SECRET", "")
-    LASTFM_API_URL = "https://ws.audioscrobbler.com/2.0/"
-
     # Soulseek / slskd Settings
     SLSKD_URL = os.environ.get("SLSKD_URL", "http://localhost:5030").rstrip("/")
     SLSKD_USERNAME = os.environ.get("SLSKD_USERNAME")
@@ -93,9 +88,6 @@ class Config:
         or ""
     )
 
-    # Legacy compatibility dummy attribute
-    BANDCAMP_EMAIL = os.environ.get("BANDCAMP_EMAIL", "")
-
     @classmethod
     def save_to_env(cls) -> bool:
         """Persists current configuration to the active .env file if available."""
@@ -116,8 +108,6 @@ class Config:
                 set_key(env_str, "NAVIDROME_USERNAME", cls.NAVIDROME_USER)
             if cls.NAVIDROME_TOKEN:
                 set_key(env_str, "NAVIDROME_PASSWORD", cls.NAVIDROME_TOKEN)
-            if cls.LASTFM_API_KEY:
-                set_key(env_str, "LASTFM_API_KEY", cls.LASTFM_API_KEY)
             return True
         except Exception:
             return False

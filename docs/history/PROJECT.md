@@ -1,3 +1,5 @@
+> Historical planning document. For current setup and architecture, see [README](../../README.md).
+
 # Project: MusicScraper Soulseek & Local Library Audit Hardening
 
 ## Architecture

@@ -3,7 +3,7 @@ Lightweight, zero-bloat HTTP server and REST API for MusicScraper Web GUI.
 Built directly on Python standard library's http.server with multi-threading.
 """
 
-import os
+import logging
 import sys
 import json
 import time
@@ -16,8 +16,6 @@ from typing import Optional, Dict, Any
 from musicscraper.web.tasks import global_task_manager
 from musicscraper.web import api
 
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +181,9 @@ class MusicScraperHTTPRequestHandler(BaseHTTPRequestHandler):
             return self._serve_static_file("app.css", "text/css; charset=utf-8")
         elif path == "/app.js" or path == "/static/app.js":
             return self._serve_static_file("app.js", "application/javascript; charset=utf-8")
+        elif path.startswith("/static/js/") and path.endswith(".js"):
+            filename = urllib.parse.unquote(path[len("/static/"):])
+            return self._serve_static_file(filename, "application/javascript; charset=utf-8")
 
         # 2. REST API: System Status & Config
         if path == "/api/status":

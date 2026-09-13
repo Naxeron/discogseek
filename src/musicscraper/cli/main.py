@@ -12,15 +12,12 @@ from musicscraper.core.report import console
 from musicscraper.services.auditor import AuditorService
 from musicscraper.services.soulseek import SlskdArtistScraper
 from musicscraper.services.artist import ArtistDownloadOrchestrator
-from musicscraper.services.quality import LocalLibraryQualityScanner, SoulseekQualityUpgrader
-from musicscraper.services.tagger import GenreTaggerService
-from musicscraper.services.cleaner import FolderCleanerService
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="musicscraper",
-        description="MusicScraper - Modern, Modular Music Archiving & Library Automation Suite"
+        description="MusicScraper - Music library audits and Soulseek downloads"
     )
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
@@ -56,29 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     artist_p.add_argument("--no-soulseek", action="store_true", help="Disable Soulseek queueing")
     artist_p.add_argument("--dry-run", action="store_true", help="Preview downloads without downloading")
 
-    # 4. Quality Upgrade Subcommand
-    upg_p = subparsers.add_parser("upgrade", aliases=["quality"], help="Scan local library and upgrade low-bitrate audio to FLAC/320k via Soulseek")
-    upg_p.add_argument("-d", "--library-dir", default=str(Config.DEFAULT_LIBRARY_DIR), help="Path to music library")
-    upg_p.add_argument("-a", "--artist", help="Filter quality scan to a specific artist")
-    upg_p.add_argument("-f", "--format", default="flac", choices=["flac", "mp3-320"], help="Target audio format")
-    upg_p.add_argument("-t", "--timeout", type=float, default=25.0, help="Soulseek search timeout in seconds (default: 25.0)")
-    upg_p.add_argument("--dry-run", action="store_true", help="Identify upgrade candidates without queueing transfers")
-
-    # 5. Genre Tagger Subcommand
-    tag_p = subparsers.add_parser("tag", aliases=["genre"], help="Auto-tag music library with curated Last.fm genres")
-    tag_p.add_argument("path", nargs="?", default=str(Config.DEFAULT_LIBRARY_DIR), help="File or folder path to tag")
-    tag_p.add_argument("--strategy", choices=["cascade", "blend", "artist", "album", "track"], default="cascade", help="Tagging strategy (default: cascade)")
-    tag_p.add_argument("--limit", type=int, default=3, help="Max genres to apply per track (default: 3)")
-    tag_p.add_argument("--mode", choices=["overwrite", "skip_existing", "append"], default="overwrite", help="Write mode")
-    tag_p.add_argument("--dry-run", action="store_true", help="Preview genre changes without modifying files")
-
-    # 6. Clean Subcommand
-    clean_p = subparsers.add_parser("clean", help="Remove empty and non-music folders")
-    clean_p.add_argument("path", nargs="?", default=str(Config.DEFAULT_OUTPUT_DIR), help="Directory to clean")
-    clean_p.add_argument("--execute", "-y", action="store_true", help="Perform actual deletion (default is dry-run)")
-    clean_p.add_argument("-v", "--verbose", action="store_true", help="Verbose log of retained folders")
-
-    # 9. Web GUI Subcommand
+    # 4. Web GUI Subcommand
     web_p = subparsers.add_parser("web", aliases=["gui"], help="Launch MusicScraper Web GUI server")
     web_p.add_argument("--host", default="127.0.0.1", help="Host interface to bind (default: 127.0.0.1)")
     web_p.add_argument("-p", "--port", type=int, default=8080, help="Port to listen on (default: 8080)")
@@ -141,33 +116,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             search_timeout=args.timeout
         )
         orchestrator.run()
-        return 0
-
-    elif args.command in ("upgrade", "quality"):
-        scanner = LocalLibraryQualityScanner(
-            library_dir=Path(args.library_dir),
-            target_format=args.format
-        )
-        candidates = scanner.scan(artist_filter=args.artist)
-        upgrader = SoulseekQualityUpgrader(
-            preferred_format=args.format,
-            dry_run=args.dry_run,
-            search_timeout=args.timeout
-        )
-        upgrader.upgrade_candidates(candidates)
-        return 0
-
-    elif args.command in ("tag", "genre"):
-        tagger = GenreTaggerService(
-            strategy=args.strategy,
-            limit=args.limit,
-            mode=args.mode,
-            dry_run=args.dry_run
-        )
-        tagger.process_target(Path(args.path))
-    elif args.command == "clean":
-        cleaner = FolderCleanerService()
-        cleaner.clean(target_dir=Path(args.path), dry_run=not args.execute, verbose=args.verbose)
         return 0
 
     elif args.command in ("web", "gui"):

@@ -1,3 +1,5 @@
+> Historical planning document. For current setup and architecture, see [README](../../README.md).
+
 # E2E Test Infrastructure: MusicScraper Audit & Soulseek Hardening
 
 ## 1. Overview & Test Philosophy

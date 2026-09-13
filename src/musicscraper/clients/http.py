@@ -1,33 +1,13 @@
 """
-Resilient HTTP session creation, retry policies, user-agent defaults, and rate limiting.
+Resilient HTTP session creation with shared retry and user-agent defaults.
 """
 
-import time
-import threading
 from typing import Optional
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from musicscraper.config import Config
-
-
-class RateLimiter:
-    """Thread-safe rate limiter to enforce delays between API requests."""
-
-    def __init__(self, min_interval: float = 0.2):
-        self.min_interval = min_interval
-        self._last_call: float = 0.0
-        self._lock = threading.Lock()
-
-    def wait(self) -> None:
-        """Blocks until the required interval has passed since the last request."""
-        with self._lock:
-            now = time.time()
-            elapsed = now - self._last_call
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
-            self._last_call = time.time()
 
 
 def create_resilient_session(

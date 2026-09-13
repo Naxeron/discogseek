@@ -84,7 +84,8 @@ class TestTier1FeatureAndEndpointCoverage:
             assert "text/html" in req.headers.get("Content-Type", "")
             content = req.read().decode("utf-8")
             assert "MusicScraper" in content
-            assert "Discog Auditor" in content
+            assert "Library Releases" in content
+            assert "Artist Downloader" in content
 
         # 2. CSS routes
         for route in ("/app.css", "/static/app.css"):
@@ -132,18 +133,22 @@ class TestTier1FeatureAndEndpointCoverage:
         assert "SLSKD_URL" in cfg
 
         # Update config
-        post_data = json.dumps({"BANDCAMP_EMAIL": "user@musicscraper.org"}).encode("utf-8")
-        req_post = urllib.request.Request(
-            f"{web_server}/api/config",
-            data=post_data,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        resp = urllib.request.urlopen(req_post)
-        assert resp.status == 200
-        res = json.loads(resp.read().decode("utf-8"))
-        assert res.get("success") is True
-        assert res["config"]["BANDCAMP_EMAIL"] == "user@musicscraper.org"
+        saved_user = Config.SLSKD_USERNAME
+        try:
+            post_data = json.dumps({"SLSKD_USERNAME": "test_user_cfg"}).encode("utf-8")
+            req_post = urllib.request.Request(
+                f"{web_server}/api/config",
+                data=post_data,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            resp = urllib.request.urlopen(req_post)
+            assert resp.status == 200
+            res = json.loads(resp.read().decode("utf-8"))
+            assert res.get("success") is True
+            assert res["config"]["SLSKD_USERNAME"] == "test_user_cfg"
+        finally:
+            Config.SLSKD_USERNAME = saved_user
 
     def test_navidrome_and_slskd_credential_handling(self, web_server: str):
         """Verifies credentials flags and password preservation during config updates."""
@@ -274,12 +279,12 @@ class TestTier1FeatureAndEndpointCoverage:
         assert det_data["id"] == task.id
         assert det_data["name"] == "Tier 1 List Test Task"
 
-    def test_task_run_clean_folders(self, web_server: str):
-        """Tests POST /api/tasks/run with clean_folders task type."""
+    def test_task_run_library_scan(self, web_server: str):
+        """Tests POST /api/tasks/run with library_scan task type."""
         payload = json.dumps({
-            "type": "clean_folders",
-            "name": "Clean Folders Run",
-            "params": {"path": "/tmp", "execute": False}
+            "type": "library_scan",
+            "name": "Library Scan Run",
+            "params": {"library_dir": "/tmp", "force_rescan": True}
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -293,7 +298,7 @@ class TestTier1FeatureAndEndpointCoverage:
         data = json.loads(resp.read().decode("utf-8"))
         assert data.get("success") is True
         assert "task" in data
-        assert data["task"]["type"] == "clean_folders"
+        assert data["task"]["type"] == "library_scan"
 
     def test_task_run_release_missing_download(self, web_server: str):
         """Tests POST /api/tasks/run with release_missing_download task type."""
@@ -648,7 +653,7 @@ class TestTier2BoundaryAndCornerCases:
         # Non-dict params
         req_bad_params = urllib.request.Request(
             f"{web_server}/api/tasks/run",
-            data=json.dumps({"type": "clean_folders", "params": "not_a_dict"}).encode("utf-8"),
+            data=json.dumps({"type": "library_scan", "params": "not_a_dict"}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST"
         )
@@ -661,7 +666,7 @@ class TestTier2BoundaryAndCornerCases:
         # Non-string name
         req_bad_name = urllib.request.Request(
             f"{web_server}/api/tasks/run",
-            data=json.dumps({"type": "clean_folders", "name": 12345}).encode("utf-8"),
+            data=json.dumps({"type": "library_scan", "name": 12345}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST"
         )
@@ -1094,13 +1099,15 @@ class TestTier3ConcurrencyAndTaskSubsystem:
 class TestTier4RealWorldScenariosAndE2E:
     """Verifies complete end-to-end client flows, SSE streaming, and high-concurrency bursts."""
 
-    def test_e2e_task_lifecycle_with_sse_event_stream(self, web_server: str):
+    def test_e2e_task_lifecycle_with_sse_event_stream(self, web_server: str, tmp_path):
         """Tests end-to-end flow: submit task -> stream SSE logs -> receive completion event."""
         # 1. Submit task
+        test_dir = tmp_path / "music_test"
+        test_dir.mkdir()
         payload = json.dumps({
-            "type": "clean_folders",
+            "type": "library_scan",
             "name": "E2E SSE Flow Task",
-            "params": {"path": "/tmp", "execute": False}
+            "params": {"library_dir": str(test_dir), "force_rescan": True}
         }).encode("utf-8")
 
         req = urllib.request.Request(
