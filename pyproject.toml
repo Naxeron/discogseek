@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "musicscraper"
+name = "discogseek"
 version = "1.0.0"
 description = "Music library auditing and Soulseek discography downloads"
 readme = "README.md"
@@ -14,7 +14,6 @@ dependencies = [
     "musicbrainzngs>=0.7.1",
     "mutagen>=1.47.0",
     "unidecode>=1.3.0",
-    "rich>=13.0.0",
     "python-dotenv>=1.0.0",
 ]
 
@@ -24,14 +23,11 @@ dev = [
 ]
 
 [project.scripts]
-musicscraper = "musicscraper.cli.main:main"
-ms = "musicscraper.cli.main:main"
+discogseek = "discogseek.cli.main:main"
+ds = "discogseek.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-"musicscraper.web" = ["static/*.html", "static/*.css", "static/*.js", "static/js/*.js"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

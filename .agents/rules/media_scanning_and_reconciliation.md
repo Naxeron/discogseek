@@ -1,6 +1,6 @@
 # Media Library Scanning, Tag Extraction & Reconciliation Rules
 
-Guidelines and invariants for audio file discovery, metadata tag parsing, persistent caching, and MusicBrainz discography reconciliation in the `musicscraper` codebase.
+Guidelines and invariants for audio file discovery, metadata tag parsing, persistent caching, and MusicBrainz discography reconciliation in the `discogseek` codebase.
 
 ## 1. Fast Candidate Discovery & Substring Avoidance
 - **Never use naive substring matching** (`needle in string` or `any(x in string for x in list)`) on disk paths or filenames without word boundaries.
@@ -14,7 +14,7 @@ Guidelines and invariants for audio file discovery, metadata tag parsing, persis
 - **Folder-Level Candidate Propagation**: If a non-canonical folder (such as inside a downloads directory) contains $\ge 2$ tracks matching catalog items, scan the entire folder as a cohesive album candidate.
 
 ## 2. Persistent Audio Tag Caching
-- **SQLite Metadata Caching**: Always check `AudioMetadataCache` (`~/.cache/musicscraper/audio_cache.db`) before invoking `mutagen` file reads over disk.
+- **SQLite Metadata Caching**: Always check `AudioMetadataCache` (`~/.cache/discogseek/discogseek_cache.db`) before invoking `mutagen` file reads over disk.
 - **Cache Key Invariants**: Cache records must be keyed by `(path, mtime, size)`. Unmodified files must resolve from cache in microseconds to prevent multi-minute blocking disk I/O.
 - **Batch Operations**: Perform SQLite cache lookups and writes in chunks/batches.
 

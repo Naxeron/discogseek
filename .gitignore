@@ -23,8 +23,15 @@ downloads/
 
 # Cache and local state
 .cache/
+.pytest_cache/
+.ruff_cache/
 releases.json
 *.log
+
+# Python packaging output
+build/
+dist/
+*.egg-info/
 
 # OS metadata
 .DS_Store

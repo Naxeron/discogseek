@@ -1,3 +1,3 @@
 """
-MusicScraper test suite.
+Discogseek test suite.
 """

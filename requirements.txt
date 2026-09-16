@@ -2,5 +2,4 @@ requests>=2.28.0
 musicbrainzngs>=0.7.1
 mutagen>=1.47.0
 unidecode>=1.3.0
-rich>=13.0.0
 python-dotenv>=1.0.0
