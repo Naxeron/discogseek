@@ -112,6 +112,8 @@ def merge_library_releases(releases: List[Dict[str, Any]]) -> List[Dict[str, Any
         else:
             current = merged[key]
             current.setdefault("tracks", []).extend(release.get("tracks", []))
+            if release.get("recording_candidates"):
+                current.setdefault("recording_candidates", []).extend(release["recording_candidates"])
             current["formats"] = sorted(set(current.get("formats") or []) | set(release.get("formats") or []))
             current["sources"] = sorted(set(current["sources"]) | set(release.get("sources") or [release.get("source") or "local"]))
             if release.get("navidrome_id"):
@@ -128,6 +130,25 @@ def merge_library_releases(releases: List[Dict[str, Any]]) -> List[Dict[str, Any
         _prepare_tracks(release)
     result.sort(key=lambda release: (_natural_key(release), release.get("mb_release_id") or ""))
     return result
+
+
+def _add_recording_candidates(releases: List[Dict[str, Any]]) -> None:
+    """Share tagged recordings across same-name editions without merging identities."""
+    siblings: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for release in releases:
+        if release.get("mb_release_id"):
+            siblings.setdefault(_natural_key(release), []).append(release)
+    for group in siblings.values():
+        for release in group:
+            candidates = [
+                deepcopy(track)
+                for sibling in group
+                if sibling["mb_release_id"] != release["mb_release_id"]
+                for track in sibling.get("tracks", [])
+                if track.get("status") == "found" and track.get("mb_rec_ids")
+            ]
+            if candidates:
+                release["recording_candidates"] = candidates
 
 
 class LibraryBrowserService:
@@ -167,7 +188,10 @@ class LibraryBrowserService:
             if selected_release is None:
                 remote = scanner.scan_library_releases(on_progress=on_progress)
             else:
-                remote = scanner.scan_library_releases(on_progress=on_progress, selected_release=selected_release)
+                remote = scanner.scan_library_releases(
+                    on_progress=on_progress, selected_release=selected_release,
+                    include_sibling_editions=True,
+                )
             releases = releases + remote
         # MusicBrainz can correct an album's artist credit (especially a partial
         # compilation). Remember that verified identity across subsequent scans.
@@ -185,7 +209,9 @@ class LibraryBrowserService:
                 identities = identities_by_name.get(_natural_key(release), set())
                 if len(identities) == 1:
                     release["mb_release_id"] = next(iter(identities))
-        return merge_library_releases(releases) if combine_known_identities else releases
+        inventory = merge_library_releases(releases) if combine_known_identities else releases
+        _add_recording_candidates(inventory)
+        return inventory
 
     def _resolve_local_aliases(self, releases: List[Dict[str, Any]], selected: Dict[str, Any]) -> None:
         """Resolve possible local copies before a prioritized download interrupts the audit."""

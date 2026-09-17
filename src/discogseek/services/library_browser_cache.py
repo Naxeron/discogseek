@@ -10,7 +10,7 @@ from discogseek.core.cache import UnifiedCacheManager
 
 # Bump this namespace when reconciliation rules change: old results must then be
 # rechecked even when their source files have not changed.
-_NAMESPACE = "library_browser_audits_v1"
+_NAMESPACE = "library_browser_audits_v2"
 _TRANSIENT_FIELDS = {
     "id", "browser_name_key", "browser_alias_keys", "navidrome_ids",
     "is_audited", "audit_error", "status", "found_count", "missing_count",
@@ -58,7 +58,7 @@ class BrowserAuditCache:
             if inventory.get(field):
                 inventory[field] = sorted(inventory[field])
         files = {}
-        for track in release.get("tracks", []):
+        for track in release.get("tracks", []) + release.get("recording_candidates", []):
             path = track.get("path")
             if path and track.get("source", "local") != "navidrome":
                 try:

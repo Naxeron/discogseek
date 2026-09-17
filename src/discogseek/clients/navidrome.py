@@ -98,6 +98,7 @@ class NavidromeScanner:
         on_progress: Optional[Callable[[int, int, str], None]] = None,
         page_size: int = 500,
         selected_release: Optional[Dict[str, Any]] = None,
+        include_sibling_editions: bool = False,
     ) -> List[Dict[str, Any]]:
         """Read every indexed album and its full tracklist, with no artist search cap.
 
@@ -135,7 +136,9 @@ class NavidromeScanner:
 
         candidates = [
             (album_id, summary) for album_id, summary in albums.items()
-            if selected_release is None or self._matches_selected_album(summary, selected_release, True)
+            if selected_release is None or self._matches_selected_album(
+                summary, selected_release, True, include_sibling_editions,
+            )
         ]
         releases = []
         for index, (album_id, summary) in enumerate(candidates, 1):
@@ -143,7 +146,9 @@ class NavidromeScanner:
             if "album" not in response:
                 raise RuntimeError(f"Navidrome scan failed: missing album {album_id}")
             album = dict(summary, **response["album"])
-            if selected_release is not None and not self._matches_selected_album(album, selected_release):
+            if selected_release is not None and not self._matches_selected_album(
+                album, selected_release, include_sibling_editions=include_sibling_editions,
+            ):
                 continue
             songs = album.get("song", [])
             if album.get("songCount", 0) > len(songs):
@@ -210,12 +215,16 @@ class NavidromeScanner:
     @staticmethod
     def _matches_selected_album(
         album: Dict[str, Any], selected: Dict[str, Any], allow_unknown_artist: bool = False,
+        include_sibling_editions: bool = False,
     ) -> bool:
         """Choose refresh candidates without treating another tagged edition as this one."""
         target_id = selected.get("mb_release_id")
         album_id = album.get("musicBrainzId")
         if target_id and album_id:
-            return target_id == album_id
+            if target_id == album_id:
+                return True
+            if not include_sibling_editions:
+                return False
         navidrome_ids = set(selected.get("navidrome_ids") or [])
         if selected.get("navidrome_id"):
             navidrome_ids.add(selected["navidrome_id"])

@@ -151,3 +151,35 @@ def test_selected_refresh_resolves_missing_summary_credit_before_accepting_album
         {"album": {"id": "same-title", "name": "Album", "artist": "Another Artist", "songCount": 0}},
     ])
     assert client.scan_library_releases(selected_release={"title": "Album", "artist": "Artist"}) == []
+
+
+def test_selected_refresh_can_read_sibling_editions_for_recording_candidates():
+    client = scanner()
+    summaries = [
+        {"id": "selected", "name": "Album", "artist": "Artist", "musicBrainzId": "edition"},
+        {"id": "sibling", "name": "Album", "artist": "Artist", "musicBrainzId": "other-edition"},
+        {"id": "unrelated", "name": "Album", "artist": "Someone Else", "musicBrainzId": "unrelated"},
+    ]
+    client._scan_request = MagicMock(side_effect=[
+        {"albumList2": {"album": summaries}},
+        *[{"album": {**album, "songCount": 0}} for album in summaries[:2]],
+    ])
+    result = client.scan_library_releases(
+        selected_release={"title": "Album", "artist": "Artist", "mb_release_id": "edition"},
+        include_sibling_editions=True,
+    )
+    assert [album["mb_release_id"] for album in result] == ["edition", "other-edition"]
+    assert [call.args[1]["id"] for call in client._scan_request.call_args_list
+            if call.args[0] == "getAlbum"] == ["selected", "sibling"]
+
+
+def test_sibling_refresh_verifies_unknown_artist_from_album_details():
+    client = scanner()
+    client._scan_request = MagicMock(side_effect=[
+        {"albumList2": {"album": [{"id": "candidate", "name": "Album", "musicBrainzId": "other"}]}},
+        {"album": {"id": "candidate", "name": "Album", "artist": "Someone Else", "songCount": 0}},
+    ])
+    assert client.scan_library_releases(
+        selected_release={"title": "Album", "artist": "Artist", "mb_release_id": "edition"},
+        include_sibling_editions=True,
+    ) == []

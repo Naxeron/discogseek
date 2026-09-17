@@ -146,10 +146,19 @@ def audit_release(
 
         # Reconcile local tracks against official tracks
         matched_local_indices: Set[int] = set()
+        matched_candidate_indices: Set[int] = set()
+        recording_candidates = release_data.get("recording_candidates", [])
         reconciled_tracklist: List[Dict[str, Any]] = []
+        positions_by_recording: Dict[str, Set[Tuple[int, str]]] = {}
+        for track in official_tracks:
+            if track["mb_recording_id"]:
+                positions_by_recording.setdefault(track["mb_recording_id"], set()).add(
+                    (int(track["disc_number"] or 1), track["track_number"])
+                )
 
         for off_trk in official_tracks:
             matched_local = None
+            reserved_local_indices: Set[int] = set()
             p_off = parse_track_title_structure(off_trk["title"])
 
             # Pass 1: MBID match
@@ -159,6 +168,15 @@ def audit_release(
                 if off_trk["mb_recording_id"] and off_trk["mb_recording_id"] in lt.get(
                     "mb_rec_ids", []
                 ):
+                    # Reserve a repeated recording for its actual position when
+                    # that position also appears on this edition's tracklist.
+                    own_disc = int(lt.get("disc_number") or 1)
+                    if not (own_disc == int(off_trk["disc_number"] or 1)
+                            and is_track_number_match(lt.get("track_number"), off_trk["track_number"])):
+                        if any(own_disc == disc and is_track_number_match(lt.get("track_number"), number)
+                               for disc, number in positions_by_recording[off_trk["mb_recording_id"]]):
+                            reserved_local_indices.add(idx)
+                            continue
                     matched_local = lt
                     matched_local_indices.add(idx)
                     break
@@ -170,7 +188,7 @@ def audit_release(
             # Pass 2: Track number + Title match (with numeric filename support)
             if not matched_local:
                 for idx, lt in enumerate(local_tracks):
-                    if idx in matched_local_indices:
+                    if idx in matched_local_indices or idx in reserved_local_indices:
                         continue
 
                     # Check disc number alignment if both are specified
@@ -217,7 +235,7 @@ def audit_release(
             # Pass 3: High title similarity
             if not matched_local:
                 for idx, lt in enumerate(local_tracks):
-                    if idx in matched_local_indices:
+                    if idx in matched_local_indices or idx in reserved_local_indices:
                         continue
 
                     if is_numeric_track_item(lt):
@@ -253,6 +271,30 @@ def audit_release(
                     if (p_off["base_norm"] == p_lt["base_norm"] or sim >= 0.85) and ver_compat:
                         matched_local = lt
                         matched_local_indices.add(idx)
+                        break
+
+            # A library album can be split across edition tags (e.g. CD and
+            # digital). Only an exact recording at the same position can supply
+            # a missing track from another edition; title similarity is not proof.
+            if not matched_local and off_trk["mb_recording_id"]:
+                off_position = parse_disc_and_track_number(
+                    off_trk["track_number"], meta_disc=int(off_trk["disc_number"] or 1),
+                )[:2]
+                for idx, candidate in enumerate(recording_candidates):
+                    if idx in matched_candidate_indices:
+                        continue
+                    if not (candidate.get("path") or candidate.get("filename")
+                            or candidate.get("source") == "navidrome"):
+                        continue
+                    if off_trk["mb_recording_id"] not in candidate.get("mb_rec_ids", []):
+                        continue
+                    position = parse_disc_and_track_number(
+                        candidate.get("track_number"), filename=candidate.get("filename"),
+                        meta_disc=candidate.get("disc_number"),
+                    )[:2]
+                    if off_position[1] is not None and position == off_position:
+                        matched_local = candidate
+                        matched_candidate_indices.add(idx)
                         break
 
             eff_trk_artist = (
