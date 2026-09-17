@@ -1,5 +1,7 @@
 """Library release grouping, sequence gaps, and compilation discovery."""
 
+import pytest
+
 from discogseek.core.audio import AudioMetadata
 from discogseek.core.cache import UnifiedCacheManager
 from discogseek.services.library import LibraryReleaseService
@@ -265,6 +267,38 @@ def test_scan_library_various_artists_compilation(tmp_path):
     assert sampler_rel["artist"] == "Various Artists"
     assert sampler_rel["is_va"] is True
     assert len(sampler_rel["tracks"]) == 2
+
+@pytest.mark.parametrize("folder_name", [
+    "TSUGIHAGI RECORDS (Buster Nalmi) - Lightning",
+    "Various Artists/Lightning",
+])
+def test_scan_library_keeps_explicit_album_artist_with_guest_tracks(tmp_path, folder_name):
+    music_dir = tmp_path / "music"
+    album_dir = music_dir / folder_name
+    album_dir.mkdir(parents=True)
+    cache = UnifiedCacheManager(db_path=tmp_path / "cache.db")
+    album_artist = "TSUGIHAGI RECORDS (Buster Nalmi)"
+    for number, (title, artist) in enumerate([
+        ("Get High", "Buster Nalmi"),
+        ("I'm done deadly at all (Band Edit)", "The Busters"),
+    ], 1):
+        path = album_dir / f"{number:02d} {title}.flac"
+        path.write_text("dummy")
+        cache.store_audio_metadata(AudioMetadata(
+            path=path, title=title, artist=artist, album_artist=album_artist,
+            album="Lightning", track_number=str(number), format_label="FLAC",
+        ))
+
+    releases = LibraryReleaseService(cache_manager=cache).scan_library_releases(
+        library_dir=music_dir,
+    )
+
+    assert len(releases) == 1
+    assert releases[0]["artist"] == album_artist
+    assert releases[0]["album_artist"] == album_artist
+    assert releases[0]["is_va"] is False
+    assert [track["artist"] for track in releases[0]["tracks"]] == ["Buster Nalmi", "The Busters"]
+
 
 def test_scan_library_unifies_mbid_tagged_track_with_untagged_downloads(tmp_path):
     """Verifies that an album with 1 MBID-tagged track in Library/ and untagged tracks in downloads/ unifies into one release."""

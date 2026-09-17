@@ -10,7 +10,7 @@ from discogseek.core.cache import UnifiedCacheManager
 
 # Bump this namespace when reconciliation rules change: old results must then be
 # rechecked even when their source files have not changed.
-_NAMESPACE = "library_browser_audits_v2"
+_NAMESPACE = "library_browser_audits_v3"
 _TRANSIENT_FIELDS = {
     "id", "browser_name_key", "browser_alias_keys", "navidrome_ids",
     "is_audited", "audit_error", "status", "found_count", "missing_count",

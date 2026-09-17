@@ -110,7 +110,8 @@ def audit_release(
             rg_type == "compilation"
             or "compilation" in rg_sec_types
             or is_various_artists(mb_artist)
-            or release_data.get("is_va", False)
+            # Local compilation inference must not override an official credit.
+            or (not mb_artist and release_data.get("is_va", False))
         )
         rel_artist = "Various Artists" if is_mb_compilation else (mb_artist or artist)
 

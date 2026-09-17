@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from discogseek.services.library import LibraryReleaseService
 
 
@@ -136,3 +138,37 @@ def test_audit_release_various_artists_reconciliation():
     assert tracks[0]["title"] == "Destruction" and tracks[0]["artist"] == "Exnoiz" and tracks[0]["status"] == "found"
     assert tracks[1]["title"] == "Amen Terror" and tracks[1]["artist"] == "Venetian Snares" and tracks[1]["status"] == "missing"
     assert tracks[2]["title"] == "Mashup Core" and tracks[2]["artist"] == "Bong-Ra" and tracks[2]["status"] == "missing"
+
+
+@pytest.mark.parametrize("mb_artist, expected_artist, expected_va", [
+    ("Buster Nalmi", "Buster Nalmi", False),
+    (None, "Various Artists", True),
+])
+def test_audit_release_prefers_official_album_artist_over_inferred_compilation(
+    mb_artist, expected_artist, expected_va,
+):
+    mb = MagicMock()
+    mb.get_release_by_id.return_value = {
+        "id": "lightning-mbid", "title": "Lightning",
+        "artist-credit": [{"name": mb_artist}] if mb_artist else [],
+        "medium-list": [{"position": 1, "track-list": [
+            {"number": "1", "recording": {"id": "rec-1", "title": "Get High"}},
+            {"number": "2", "artist-credit": [{"name": "The Busters"}],
+             "recording": {"id": "rec-2", "title": "Band Edit"}},
+        ]}],
+    }
+    service = LibraryReleaseService(mb_client=mb, slskd_client=MagicMock())
+    local = {
+        "title": "Lightning", "artist": "Various Artists", "album_artist": "Various Artists",
+        "is_va": True, "mb_release_id": "lightning-mbid", "tracks": [
+            {"filename": "01 Get High.flac", "title": "Get High", "track_number": "1"},
+        ],
+    }
+
+    audited = service.audit_release(local)
+
+    assert audited["artist"] == audited["album_artist"] == expected_artist
+    assert audited["is_va"] is expected_va
+    assert audited["tracks"][0]["artist"] == expected_artist
+    assert audited["tracks"][1]["artist"] == "The Busters"
+    assert audited["found_count"] == audited["missing_count"] == 1

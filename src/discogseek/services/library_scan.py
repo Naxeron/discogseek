@@ -100,9 +100,11 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
     for meta in all_tracks:
         folder = str(meta.path.parent)
         is_folder_multi_artist = len(folder_artists.get(folder, set())) > 1
-        is_va = (
-            is_various_artists(meta.album_artist)
-            or is_various_artists(meta.artist)
+        # Guest/remix credits and a VA folder are only hints when no album
+        # artist is tagged. Preserve an explicit album credit across its tracks.
+        tagged_album_artist = (meta.album_artist or "").strip()
+        is_va = is_various_artists(tagged_album_artist) if tagged_album_artist else (
+            is_various_artists(meta.artist)
             or is_folder_multi_artist
             or is_various_artists_directory(meta.path.parent)
         )
@@ -111,8 +113,8 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
             artist = "Various Artists"
             album_artist = "Various Artists"
         else:
-            artist = meta.album_artist or meta.artist or "Unknown Artist"
-            album_artist = meta.album_artist or artist
+            artist = tagged_album_artist or meta.artist or "Unknown Artist"
+            album_artist = tagged_album_artist or artist
 
         album = meta.album
         # Derive clean album name fallback from parent folder if not tagged

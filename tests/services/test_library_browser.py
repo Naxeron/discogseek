@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from discogseek.config import Config
+from discogseek.cli.browser import download_release
 from discogseek.services.library import LibraryReleaseService
 from discogseek.services.library_browser import LibraryBrowserService, merge_library_releases
 
@@ -251,6 +252,107 @@ def test_prioritized_refresh_blocks_if_same_title_local_identity_is_unverified()
     browser.release_service.mb_client.search_release.return_value = []
     with pytest.raises(ValueError, match="same-title local release"):
         browser.refresh_release(selected)
+
+
+def browser_with_downloaded_alias():
+    downloaded = [dict(track(title, number), duration=180.5)
+                  for number, title in enumerate(["First", "Second"], 1)]
+    local = [release([track("Third", 3)]),
+             release(downloaded, artist="ZZ Label (Artist)", release_id=None)]
+    browser = make_browser(local)
+    mb = browser.release_service.mb_client
+    mb.search_release.return_value = []
+    for medium in mb.get_release_by_id.return_value["medium-list"]:
+        medium["position"] = "1"
+        for official in medium["track-list"]:
+            official["id"] = "track-" + official["number"]
+            official["length"] = "180000"
+    return browser, local
+
+
+@pytest.mark.parametrize("force_refresh", [False, True])
+def test_download_recognizes_untagged_alias_by_full_track_metadata_without_search_match(force_refresh):
+    browser, local = browser_with_downloaded_alias()
+    selected = next(browser.iter_releases())
+    assert selected["missing_count"] == 2
+    browser.release_service.download_missing_tracks = MagicMock()
+    if force_refresh:
+        selected = browser.refresh_release(selected, force_refresh=True)
+
+    fresh, result = download_release(browser, selected, library_dir=None)
+
+    assert fresh["missing_count"] == result["total_missing"] == 0
+    assert fresh["found_count"] == 3
+    assert fresh["artist"] == "Artist"
+    assert ("zz label artist", "album") in fresh["browser_alias_keys"]
+    browser.release_service.download_missing_tracks.assert_not_called()
+    assert local[1]["mb_release_id"] is None
+    restarted, _ = browser_with_downloaded_alias()
+    restarted.release_service.mb_client.search_release.side_effect = AssertionError("Unexpected search")
+    assert list(restarted.iter_releases())[-1]["missing_count"] == 0
+    restarted.release_service.mb_client.search_release.assert_not_called()
+
+
+@pytest.mark.parametrize("change", [
+    {"title": "First (Live)"}, {"artist": "Another Artist"}, {"duration": 200},
+    {"duration": None}, {"track_number": "4"}, {"disc_number": 2},
+    {"title": "01", "filename": "01.flac"}, {"mb_rec_ids": ["different-recording"]},
+    {"mb_track_ids": ["different-edition-track"]},
+])
+def test_alias_fallback_rejects_conflicting_or_insufficient_track_metadata(change):
+    browser, local = browser_with_downloaded_alias()
+    local[1]["tracks"][0].update(change)
+    selected = next(browser.iter_releases())
+
+    with pytest.raises(ValueError, match="same-title local release"):
+        browser.refresh_release(selected)
+    assert ("zz label artist", "album") not in browser._release_aliases["edition-1"]
+
+
+@pytest.mark.parametrize("edition_track_id", [None, "track-1"])
+def test_single_alias_track_requires_exact_edition_track_id(edition_track_id):
+    browser, local = browser_with_downloaded_alias()
+    local[1]["tracks"] = local[1]["tracks"][:1]
+    local[1]["tracks"][0]["mb_rec_ids"] = ["rec-1"]
+    if edition_track_id:
+        local[1]["tracks"][0]["mb_track_ids"] = [edition_track_id]
+    selected = next(browser.iter_releases())
+
+    if edition_track_id:
+        assert browser.refresh_release(selected)["missing_count"] == 1
+    else:
+        with pytest.raises(ValueError, match="same-title local release"):
+            browser.refresh_release(selected)
+
+
+def test_alias_fallback_checks_fresh_official_tracklist_before_remembering_identity():
+    browser, local = browser_with_downloaded_alias()
+    selected = next(browser.iter_releases())
+    official = browser.release_service.mb_client.get_release_by_id.return_value
+    official["medium-list"][0]["track-list"][0]["length"] = "200000"
+
+    with pytest.raises(ValueError, match="same-title local release"):
+        browser.refresh_release(selected, force_refresh=True)
+
+    assert ("zz label artist", "album") not in browser._release_aliases["edition-1"]
+    restarted, _ = browser_with_downloaded_alias()
+    assert list(restarted.iter_releases())[-1]["is_audited"] is False
+    restarted.release_service.mb_client.search_release.assert_called_once()
+
+
+def test_explicit_refresh_forces_musicbrainz_lookup_for_unresolved_local_alias():
+    browser, _ = browser_with_downloaded_alias()
+    selected = next(browser.iter_releases())
+    browser.release_service.audit_release = MagicMock(wraps=browser.release_service.audit_release)
+
+    assert browser.refresh_release(selected, force_refresh=True)["missing_count"] == 0
+
+    alias_calls = [call for call in browser.release_service.audit_release.call_args_list
+                   if call.args[0]["artist"] == "ZZ Label (Artist)"]
+    assert alias_calls
+    assert alias_calls[0].kwargs["force_refresh"] is True
+    reference_call = next(call for call in alias_calls if not call.args[0]["tracks"])
+    assert reference_call.kwargs["force_refresh"] is True
 
 
 def test_verified_audit_survives_browser_and_service_restart():

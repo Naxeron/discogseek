@@ -10,6 +10,7 @@ from discogseek.config import Config
 from discogseek.core.release_metadata import is_various_artists, parse_disc_and_track_number
 from discogseek.core.text import normalize_text
 from discogseek.services.library import LibraryReleaseService
+from discogseek.services.library_audit import is_numeric_track_item
 from discogseek.services.library_browser_cache import BrowserAuditCache
 from discogseek.services.reconciler import deduplicate_candidate_tracks
 
@@ -25,11 +26,60 @@ def _natural_key(release: Dict[str, Any]) -> Tuple[str, str]:
 
 
 def _track_position(track: Dict[str, Any]) -> Tuple[int, str]:
+    try:
+        disc_number = int(track.get("disc_number") or 1)
+    except (TypeError, ValueError):
+        disc_number = None
     disc, number, _ = parse_disc_and_track_number(
         track.get("track_number"), filename=track.get("filename"),
-        meta_disc=track.get("disc_number"),
+        meta_disc=disc_number,
     )
     return disc or 1, str(number) if number is not None else str(track.get("track_number") or "")
+
+
+def _matches_verified_tracklist(local: Dict[str, Any], verified: Dict[str, Any]) -> bool:
+    """Require independent track evidence before correcting an untagged album credit."""
+    if not verified.get("is_audited") or not verified.get("mb_release_id"):
+        return False
+    official = {
+        _track_position(track): track for track in verified.get("tracks", [])
+        if track.get("mb_track_id") or track.get("mb_recording_id")
+    }
+    positions = set()
+    edition_track_match = False
+    for track in local.get("tracks", []):
+        if track.get("status") != "found":
+            continue
+        position = _track_position(track)
+        expected = official.get(position)
+        if expected is None or not position[1]:
+            return False
+        track_ids = set(track.get("mb_track_ids") or [])
+        recording_ids = set(track.get("mb_rec_ids") or [])
+        if ((track_ids and expected.get("mb_track_id") not in track_ids)
+                or (recording_ids and expected.get("mb_recording_id") not in recording_ids)):
+            return False
+        if track_ids:
+            edition_track_match = True
+        else:
+            # A shared recording alone does not identify an edition. Untagged
+            # copies need matching positions, full titles (including versions),
+            # artists, and lengths for every file, across at least two tracks.
+            if (is_numeric_track_item(track)
+                    or not normalize_text(track.get("title"))
+                    or normalize_text(track.get("title")) != normalize_text(expected.get("title"))
+                    or not normalize_text(track.get("artist"))
+                    or is_various_artists(track.get("artist"))
+                    or normalize_text(track.get("artist")) != normalize_text(expected.get("artist"))):
+                return False
+            try:
+                duration, expected_duration = float(track["duration"]), float(expected["duration"])
+                if not (duration > 0 and expected_duration > 0 and abs(duration - expected_duration) <= 2):
+                    return False
+            except (KeyError, TypeError, ValueError):
+                return False
+        positions.add(position)
+    return bool(positions) and (edition_track_match or len(positions) >= 2)
 
 
 def _prepare_tracks(release: Dict[str, Any]) -> None:
@@ -169,6 +219,8 @@ class LibraryBrowserService:
         self, library_dir: Optional[Path], on_progress: ProgressCallback = None,
         selected_release: Optional[Dict[str, Any]] = None,
         combine_known_identities: bool = True,
+        force_refresh: bool = False,
+        invalidated_editions: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         scanner = self.navidrome_scanner
         if scanner is None and Config.NAVIDROME_URL:
@@ -181,7 +233,7 @@ class LibraryBrowserService:
             library_dir=library_dir, force_rescan=False, on_progress=on_progress,
         )
         if selected_release and selected_release.get("mb_release_id"):
-            self._resolve_local_aliases(releases, selected_release)
+            self._resolve_local_aliases(releases, selected_release, force_refresh, invalidated_editions)
         if scanner is not None:
             if not scanner.test_connection():
                 raise RuntimeError(f"Navidrome connection failed: {scanner.last_error}")
@@ -213,7 +265,10 @@ class LibraryBrowserService:
         _add_recording_candidates(inventory)
         return inventory
 
-    def _resolve_local_aliases(self, releases: List[Dict[str, Any]], selected: Dict[str, Any]) -> None:
+    def _resolve_local_aliases(
+        self, releases: List[Dict[str, Any]], selected: Dict[str, Any], force_refresh: bool = False,
+        invalidated_editions: Optional[Set[str]] = None,
+    ) -> None:
         """Resolve possible local copies before a prioritized download interrupts the audit."""
         exact_id = selected["mb_release_id"]
         known_names = self._release_aliases.get(exact_id, set())
@@ -226,7 +281,29 @@ class LibraryBrowserService:
             # The album may have been filed under one contributing artist, whose
             # initial background audit has not run yet. Resolve its own credit;
             # never assign the selected MBID just because the titles agree.
-            audited = self._audit(merge_library_releases([release])[0], False)
+            prepared = merge_library_releases([release])[0]
+            audited = self._audit(prepared, force_refresh, invalidated_editions)
+            if not audited.get("is_audited") or not audited.get("mb_release_id"):
+                if _matches_verified_tracklist(prepared, selected):
+                    candidate = dict(prepared, mb_release_id=exact_id)
+                    try:
+                        # Empty inventory preserves the official lengths; a
+                        # reconciled found track carries the local file's length.
+                        verified = self.release_service.audit_release(
+                            dict(candidate, tracks=[], recording_candidates=[]), force_refresh=force_refresh,
+                        )
+                    except Exception:
+                        verified = {}
+                    # Recheck against the fetched edition before remembering or
+                    # caching the alias; the selected UI snapshot may be stale.
+                    if (verified.get("mb_release_id") == exact_id
+                            and _matches_verified_tracklist(prepared, verified)):
+                        if force_refresh:
+                            self._audit_cache.invalidate(
+                                candidate, None, invalidated_editions if invalidated_editions is not None else set(),
+                            )
+                        audited = self._audit(candidate, False)
+                        self._audit_cache.store(self._audit_cache.key(prepared), prepared, audited, None)
             if not audited.get("is_audited") or not audited.get("mb_release_id"):
                 raise ValueError(
                     f"Cannot verify the same-title local release '{release.get('artist', '')} — "
@@ -347,7 +424,11 @@ class LibraryBrowserService:
             selected["navidrome_ids"] = sorted(
                 self._navidrome_ids.get(exact_id, set()) | set(release.get("navidrome_ids") or [])
             )
-        inventory = self._inventory(library_dir, on_progress, selected)
+        invalidated_editions: Set[str] = set()
+        inventory = self._inventory(
+            library_dir, on_progress, selected, force_refresh=force_refresh,
+            invalidated_editions=invalidated_editions,
+        )
         original_name = tuple(release.get("browser_name_key") or _natural_key(release))
         matches = [candidate for candidate in inventory if (
             exact_id and candidate.get("mb_release_id") == exact_id
@@ -366,6 +447,6 @@ class LibraryBrowserService:
         if exact_id:
             fresh["mb_release_id"] = exact_id
         fresh["id"] = release.get("id") or fresh["id"]
-        audited = self._audit(fresh, force_refresh)
+        audited = self._audit(fresh, force_refresh, invalidated_editions)
         self._remember_identity(fresh, audited)
         return audited
