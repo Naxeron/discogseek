@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from discogseek.cli import browser
-from discogseek.cli.browser import ReleaseBrowser, release_key
+from discogseek.cli.browser import ReleaseBrowser, release_key, track_key
 from discogseek.cli.main import build_parser
 
 
@@ -117,11 +117,8 @@ def test_finished_download_updates_status_then_retries_delayed_import(tui, servi
     service.refresh_release.assert_not_called()
 
 
-@pytest.mark.parametrize("state", ["Queued, Remotely", "InProgress", "Completed",
-                                   "Completed, Cancelled", "Completed, TimedOut",
-                                   "Completed, Errored", "Completed, Rejected",
-                                   "Completed, Aborted"])
-def test_active_and_failed_transfers_do_not_refresh_or_claim_success(tui, service, state):
+@pytest.mark.parametrize("state", ["Queued, Remotely", "InProgress", "Completed"])
+def test_active_and_unknown_transfers_remain_queued_without_claiming_success(tui, service, state):
     row = release()
     remember(tui, row)
     service.release_service.slskd_client.get_downloads.return_value = transfers(transfer(state=state))
@@ -130,6 +127,98 @@ def test_active_and_failed_transfers_do_not_refresh_or_claim_success(tui, servic
 
     service.refresh_release.assert_not_called()
     assert tui.model.track_status(row, row["tracks"][1]) == "queued"
+    assert tui.model.pending(row) == [row["tracks"][2]]
+
+
+@pytest.mark.parametrize("state", ["Completed, Cancelled", "Completed, TimedOut",
+                                   "Completed, Errored", "Completed, Rejected",
+                                   "Completed, Aborted"])
+def test_terminal_failure_restores_missing_track_and_stops_empty_watch(tui, service, state):
+    row = release(missing=1)
+    remember(tui, row)
+    key, identity = release_key(row), track_key(row["tracks"][1])
+    # Clear stale successful overlays as well as the queue submission history.
+    tui.model.downloaded[key] = {identity}
+    get_downloads = service.release_service.slskd_client.get_downloads
+    get_downloads.return_value = transfers(transfer(state=state))
+
+    check(tui, service)
+
+    service.refresh_release.assert_not_called()
+    assert tui.model.track_status(row, row["tracks"][1]) == "missing"
+    assert tui.model.pending(row) == [row["tracks"][1]]
+    for history in (tui.model.queued, tui.model.matched, tui.model.downloaded):
+        assert identity not in history.get(key, set())
+    assert key not in tui._downloads
+    assert tui.jobs.empty()
+    get_downloads.reset_mock()
+
+    tui._check_downloads(service)
+
+    get_downloads.assert_not_called()
+    service.refresh_release.assert_not_called()
+    assert tui.events.empty()
+    assert tui.jobs.empty()
+
+
+def test_pressing_d_retries_failed_transfer_without_automatic_resubmission(tui, service):
+    row = release(missing=1)
+    remember(tui, row)
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state="Completed, Errored"),
+    )
+
+    check(tui, service)
+
+    assert tui.jobs.empty()
+    keys = SimpleNamespace(**{name: index for index, name in enumerate([
+        "KEY_ENTER", "KEY_BTAB", "KEY_LEFT", "KEY_RIGHT", "KEY_UP", "KEY_DOWN",
+        "KEY_NPAGE", "KEY_PPAGE", "KEY_HOME", "KEY_END",
+    ], 1000)})
+    tui._handle_key("d", keys, page_size=10)
+
+    kind, payload = tui.jobs.get_nowait()
+    selected, queued, only_track, dry_run = payload
+    assert kind == "download"
+    assert release_key(selected) == release_key(row)
+    assert queued == set()
+    assert only_track is None and not dry_run
+    assert tui.busy
+    assert tui.jobs.empty()
+
+
+def test_failure_only_releases_failed_track_with_other_downloads_in_progress(tui, service):
+    row = release(missing=3)
+    other = release("edition-2", missing=1)
+    remember(tui, row, queued_result(row, positions=(1, 2, 3)))
+    remember(tui, other, queued_result(other, user="other-peer"))
+    service.release_service.slskd_client.get_downloads.return_value = (
+        transfers(transfer(2, "Completed, TimedOut"), transfer(3), transfer(4, "InProgress"))
+        + transfers(transfer(), user="other-peer")
+    )
+    service.refresh_release.side_effect = lambda release, **kwargs: deepcopy(release)
+
+    check(tui, service)
+
+    fresh = tui.model.releases[release_key(row)]
+    other_fresh = tui.model.releases[release_key(other)]
+    assert [tui.model.track_status(fresh, track) for track in fresh["tracks"]] == [
+        "found", "missing", "downloaded", "queued",
+    ]
+    assert tui.model.track_status(other_fresh, other_fresh["tracks"][1]) == "downloaded"
+    assert tui.model.pending(fresh) == [fresh["tracks"][1]]
+    assert tui.model.pending(other_fresh) == []
+    assert len(tui._downloads[release_key(row)]["files"]) == 2
+    assert len(tui._downloads[release_key(other)]["files"]) == 1
+    assert service.refresh_release.call_count == 2
+    assert tui.jobs.empty()
+
+    tui.model.selected_key = release_key(row)
+    tui._download()
+
+    kind, (_, queued, _, _) = tui.jobs.get_nowait()
+    assert kind == "download"
+    assert queued == {track_key(fresh["tracks"][2]), track_key(fresh["tracks"][3])}
 
 
 @pytest.mark.parametrize("other", [transfers(transfer(), user="different-peer"),

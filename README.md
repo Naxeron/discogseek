@@ -78,7 +78,7 @@ Press **Enter** for a menu offering **Download all missing tracks** and **Downlo
 | / | Edit the artist filter; Enter applies, Esc cancels |
 | Esc | Clear the applied artist filter |
 | Enter | Open download options; ↑ / ↓ chooses, Enter runs, Esc closes |
-| d | Download all unqueued missing tracks in this release |
+| d | Queue a request to download all unqueued missing tracks in this release |
 | t | Download the selected missing track |
 | p | Preview matches for the release without queueing |
 | P | Preview matches for the selected track without queueing |
@@ -88,11 +88,11 @@ Press **Enter** for a menu offering **Download all missing tracks** and **Downlo
 | ? | Open keyboard help |
 | q | Quit after the current operation finishes |
 
-Artist filtering includes compilation track credits. Searches and audits run in the background, so navigation and filtering stay responsive. Selected downloads and refreshes run between release audits, then the library scan resumes. Downloads recheck the local and remote libraries first and skip tracks successfully queued during this browser session. Queue failures remain retryable. `--dry-run` makes both download shortcuts previews for the entire session.
+Artist filtering includes compilation track credits. Searches and audits run in the background, so navigation and filtering stay responsive. Press `d` on several releases to add download requests in order, even while another release is being searched or refreshed. The release list marks requests as searching or waiting, and the header shows the waiting count. Repeated requests for the same release and scope are ignored while already waiting or running; previews and real downloads remain separate. Requests run one at a time between library audits. Each request rechecks the local and remote libraries when it starts and skips tracks already submitted successfully during this browser session, including earlier single-track requests. Submission failures remain retryable. `--dry-run` makes both download shortcuts previews for the entire session. Pressing `q` finishes the current operation and discards waiting requests; files already submitted to slskd continue transferring. Waiting requests are not saved across browser sessions.
 
 Single-track downloads search by the track's artist and title first, then try album searches if needed. Downloading all missing tracks starts with album searches and falls back to searches for the remaining individual tracks, using track artist credits for compilations. Both choices queue only the requested missing tracks.
 
-Downloads queued during the browser session update automatically. The background worker checks slskd every three seconds between operations and refreshes affected releases when transfers finish. `DOWNLOADED` means the transfer succeeded but the library has not picked up the file yet; the browser retries the library check every 15 seconds until it becomes `FOUND`, and complete releases leave the incomplete list. Files go to slskd's configured download destination, so they must be moved into the scanned library or indexed by Navidrome to count as found. Unverified releases cannot be downloaded from the browser. Browsing itself does not require slskd credentials. The UI uses Python's standard `curses` module on Linux/macOS and needs an interactive terminal of at least 72 columns by 14 rows.
+Downloads queued during the browser session update automatically. The background worker checks slskd every three seconds between operations, prioritizing overdue checks before the next waiting request, and refreshes affected releases when transfers finish. A running search or audit can delay these checks. Failed, cancelled, rejected, aborted, or timed-out transfers become missing again so `d` or `t` can retry them; they are not resubmitted automatically. `DOWNLOADED` means the transfer succeeded but the library has not picked up the file yet; the browser retries the library check every 15 seconds until it becomes `FOUND`, and complete releases leave the incomplete list. Files go to slskd's configured download destination, so they must be moved into the scanned library or indexed by Navidrome to count as found. Unverified releases cannot be downloaded from the browser. Browsing itself does not require slskd credentials. The UI uses Python's standard `curses` module on Linux/macOS and needs an interactive terminal of at least 72 columns by 14 rows.
 
 ## Download
 

@@ -9,6 +9,8 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Dict
 
 from discogseek.core.text import normalize_text
@@ -17,6 +19,7 @@ from discogseek.services.library_browser import LibraryBrowserService
 
 DOWNLOAD_POLL_INTERVAL = 3.0
 DOWNLOAD_IMPORT_RETRY_INTERVAL = 15.0
+DOWNLOAD_FAILURE_STATES = {"Cancelled", "TimedOut", "Errored", "Rejected", "Aborted"}
 
 
 class _ScanStopped(Exception):
@@ -163,6 +166,13 @@ def clipped(text, width):
     return "".join(output)
 
 
+@dataclass
+class DownloadRequest:
+    release: Dict[str, Any]
+    only_track: Any = None
+    dry_run: bool = False
+
+
 class ReleaseBrowser:
     def __init__(self, args, service_factory=LibraryBrowserService):
         self.args = args
@@ -170,6 +180,9 @@ class ReleaseBrowser:
         self.model = BrowserModel(args.artist or "")
         self.events = queue.Queue()
         self.jobs = queue.Queue()
+        # The UI dispatches one request at a time, after applying prior results.
+        self.pending_downloads = deque()
+        self.active_download = None
         self.stopping = threading.Event()
         self.busy = False
         self.scanning = False
@@ -186,6 +199,7 @@ class ReleaseBrowser:
         self.download_error = ""
         # Only the worker touches transfer watches and the service clients.
         self._downloads = {}
+        self._submitted_tracks = {}
 
     @staticmethod
     def _transfer_key(username, filename):
@@ -194,6 +208,8 @@ class ReleaseBrowser:
 
     def _update_download_watch(self, release, old_key=None):
         key = release_key(release)
+        if old_key is not None and old_key != key and old_key in self._submitted_tracks:
+            self._submitted_tracks.setdefault(key, set()).update(self._submitted_tracks.pop(old_key))
         if old_key is not None and old_key != key and old_key in self._downloads:
             previous = self._downloads.pop(old_key)
             current = self._downloads.setdefault(key, previous)
@@ -212,6 +228,9 @@ class ReleaseBrowser:
     def _remember_downloads(self, release, result):
         if result.get("dry_run"):
             return
+        self._submitted_tracks.setdefault(release_key(release), set()).update(
+            track_key(track) for track in result.get("queued_tracks", [])
+        )
         files = {
             self._transfer_key(file.get("user"), file.get("filename")): track_key(track)
             for file, track in zip(result.get("queued_files", []), result.get("queued_tracks", []))
@@ -247,6 +266,16 @@ class ReleaseBrowser:
             watch["completed"].update(completed)
             if newly_completed:
                 self.events.put(("downloaded", (key, {watch["files"][file] for file in newly_completed})))
+            failed = {file for file in watch["files"] if file not in watch["completed"]
+                      and "Completed" in transfers.get(file, set())
+                      and DOWNLOAD_FAILURE_STATES.intersection(transfers.get(file, set()))}
+            if failed:
+                tracks = {watch["files"].pop(file) for file in failed}
+                self._submitted_tracks.get(key, set()).difference_update(tracks)
+                self.events.put(("failed", (key, tracks)))
+                if not watch["files"]:
+                    del self._downloads[key]
+                    continue
             # A cleared transfer may already be imported. Only a library audit
             # can mark it found; terminal failures are never treated as success.
             if not watch["completed"] and all(file in transfers for file in watch["files"]):
@@ -287,20 +316,12 @@ class ReleaseBrowser:
         scan = None
         next_download_check = time.monotonic() + DOWNLOAD_POLL_INTERVAL
         while True:
-            try:
-                job = self.jobs.get_nowait()
-            except queue.Empty:
-                timeout = (max(0, next_download_check - time.monotonic())
-                           if self._downloads and not self.stopping.is_set() else None)
-                if timeout == 0:
-                    job = ("check_downloads", None)
-                elif scan is not None:
-                    job = ("scan_step", None)
-                else:
-                    try:
-                        job = self.jobs.get(timeout=timeout)
-                    except queue.Empty:
-                        continue
+            # A backlog of user requests must not starve completion/failure checks.
+            if (self._downloads and not self.stopping.is_set()
+                    and time.monotonic() >= next_download_check):
+                job = ("check_downloads", None)
+            else:
+                job = self._next_job(scan, next_download_check)
             if job is None:
                 return
             kind, payload = job
@@ -323,9 +344,10 @@ class ReleaseBrowser:
                     self.events.put(("release", (release_key(payload), release)))
                 elif kind == "check_downloads":
                     self._check_downloads(service)
-                    next_download_check = time.monotonic() + DOWNLOAD_POLL_INTERVAL
                 else:
                     release, queued, only_track, dry_run = payload
+                    # A failure poll may have invalidated the UI's queued snapshot.
+                    queued = self._submitted_tracks.get(release_key(release), queued)
                     fresh, result = download_release(
                         service, release, self.args.music_dir, queued, only_track,
                         self.args.format, self.args.timeout, dry_run, self._download_progress,
@@ -342,10 +364,29 @@ class ReleaseBrowser:
                     scan = None
                     self.events.put(("done", "scan"))
             finally:
-                if kind not in ("scan", "scan_step", "check_downloads"):
+                if kind == "check_downloads":
+                    next_download_check = time.monotonic() + DOWNLOAD_POLL_INTERVAL
+                elif kind not in ("scan", "scan_step"):
                     self.events.put(("done", kind))
 
-    def _start(self, kind, payload=None):
+    def _next_job(self, scan, next_download_check):
+        while True:
+            try:
+                return self.jobs.get_nowait()
+            except queue.Empty:
+                timeout = (max(0, next_download_check - time.monotonic())
+                           if self._downloads and not self.stopping.is_set() else None)
+                if timeout == 0:
+                    return "check_downloads", None
+                elif scan is not None:
+                    return "scan_step", None
+                else:
+                    try:
+                        return self.jobs.get(timeout=timeout)
+                    except queue.Empty:
+                        continue
+
+    def _start(self, kind, payload=None, clear_error=True):
         if self.busy and (self.operation != "scan" or kind == "scan"):
             self.message = f"{self.operation.capitalize()} in progress; you can still browse and filter."
             return False
@@ -353,11 +394,38 @@ class ReleaseBrowser:
         if kind == "scan":
             self.scanning = True
             self.refreshed_during_scan.clear()
-        self.error = ""
+        if clear_error:
+            self.error = ""
         self.message = {"scan": "Scanning the library and loading saved audits…", "refresh": "Refreshing selected release…",
                         "download": "Checking the library, then searching for missing tracks…"}[kind]
         self.jobs.put((kind, payload))
         return True
+
+    def _update_release(self, release, old_key=None):
+        self.model.update(release, old_key)
+        requests = list(self.pending_downloads)
+        if self.active_download is not None:
+            requests.append(self.active_download)
+        for request in requests:
+            if release_key(request.release) in (old_key, release_key(release)):
+                request.release = copy.deepcopy(release)
+
+    def _start_next_download(self):
+        if self.quit_requested or (self.busy and self.operation != "scan"):
+            return
+        while self.pending_downloads:
+            request = self.pending_downloads.popleft()
+            key = release_key(request.release)
+            release = self.model.releases.get(key, request.release)
+            if not self.model.pending(release, request.only_track):
+                continue
+            request.release = copy.deepcopy(release)
+            self.active_download = request
+            self._start("download", (copy.deepcopy(release), set(self.model.queued.get(key, set())),
+                                     request.only_track, request.dry_run), clear_error=False)
+            action = "Previewing" if request.dry_run else "Downloading"
+            self.message = f"{action} {release['title']}. Checking the library first…"
+            return
 
     def _drain_events(self):
         while True:
@@ -373,9 +441,9 @@ class ReleaseBrowser:
                 if old_key is not None:
                     if self.scanning:
                         self.refreshed_during_scan.add(key)
-                    self.model.update(release, old_key)
+                    self._update_release(release, old_key)
                 elif key not in self.refreshed_during_scan:
-                    self.model.update(release)
+                    self._update_release(release)
             elif kind == "error":
                 self.error = data
             elif kind == "download_error":
@@ -384,11 +452,19 @@ class ReleaseBrowser:
                 key, tracks = data
                 self.model.downloaded.setdefault(key, set()).update(tracks)
                 self.message = f"{len(tracks)} download(s) finished. Checking the library automatically…"
+            elif kind == "failed":
+                key, tracks = data
+                for history in (self.model.queued, self.model.matched, self.model.downloaded):
+                    history.get(key, set()).difference_update(tracks)
+                release = self.model.releases.get(key, {})
+                self.last_result = (f"{release.get('title', 'Release')}: {len(tracks)} transfer(s) failed; "
+                                    "press d or t to retry.")
+                self.message = self.last_result
             elif kind == "result":
                 old_key, release, result = data
                 if self.scanning:
                     self.refreshed_during_scan.add(release_key(release))
-                self.model.update(release, old_key)
+                self._update_release(release, old_key)
                 self.model.record_result(release, result)
                 unresolved = result.get("total_missing", 0) - result.get("resolved_count", 0)
                 count = result.get("matched_count", 0) if result.get("dry_run") else result.get("queued_count", 0)
@@ -406,13 +482,18 @@ class ReleaseBrowser:
                         self.busy = False
                     self.message = f"Scan finished: {len(self.model.releases)} releases checked."
                 else:
+                    if data == "download":
+                        self.active_download = None
                     self.busy = self.scanning
                     if self.scanning:
                         self.operation = "scan"
                     if data == "refresh":
                         self.message = "Release refreshed from the library and MusicBrainz."
+        self._start_next_download()
 
     def _download(self, single=False, preview=False):
+        if self.quit_requested:
+            return
         release = self.model.selected()
         if not release:
             self.message = "Select an incomplete release first."
@@ -433,13 +514,21 @@ class ReleaseBrowser:
         if not self.model.pending(release, only_track):
             self.message = "No unqueued missing tracks in this selection."
             return
-        if self._start("download", (copy.deepcopy(release),
-                                   set(self.model.queued.get(release_key(release), set())),
-                                   only_track, preview or self.args.dry_run)):
-            target = (f"track: {selected_track['title']}" if single
-                      else f"{len(self.model.pending(release))} missing tracks: {release['title']}")
-            action = "Previewing" if preview or self.args.dry_run else "Downloading"
-            self.message = f"{action} {target}. Checking the library first…"
+        dry_run = preview or self.args.dry_run
+        requests = list(self.pending_downloads)
+        if self.active_download is not None:
+            requests.append(self.active_download)
+        if any(release_key(request.release) == release_key(release) and request.dry_run == dry_run
+               and (request.only_track is None or request.only_track == only_track) for request in requests):
+            self.message = f"{release['title']}: request already waiting or in progress."
+            return
+        request = DownloadRequest(copy.deepcopy(release), only_track, dry_run)
+        self.pending_downloads.append(request)
+        if not self.busy or self.operation == "scan":
+            self.error = ""
+        self._start_next_download()
+        if self.active_download is not request:
+            self.message = f"{release['title']}: request added ({len(self.pending_downloads)} waiting)."
 
     def _open_download_options(self):
         if not self.model.selected():
@@ -467,8 +556,11 @@ class ReleaseBrowser:
     def _quit(self):
         self.quit_requested = True
         self.stopping.set()
+        waiting = len(self.pending_downloads)
+        self.pending_downloads.clear()
         if self.busy:
-            self.message = "Exiting after the current operation finishes…"
+            self.message = ("Exiting after the current operation finishes…"
+                            + (f" Discarded {waiting} waiting request(s)." if waiting else ""))
 
     def _handle_key(self, key, curses, page_size):
         if self.overlay is not None:
@@ -547,7 +639,7 @@ class ReleaseBrowser:
         rows, selected = self.model.visible(), self.model.selected()
         unverified = sum(not r.get("is_audited") for r in self.model.releases.values())
         put(2, 1, f"{len(rows)} shown | {unverified} unverified (u: {'hide' if self.model.show_unverified else 'show'}) | "
-            + ("working…" if self.busy else "ready"))
+            + (f"working · {len(self.pending_downloads)} waiting" if self.busy else "ready"))
         split = max(28, min(width * 2 // 5, 52))
         for y in range(3, height - 5):
             put(y, split, "│")
@@ -563,7 +655,12 @@ class ReleaseBrowser:
             active = release_key(release) == self.model.selected_key
             counts = (f"{release.get('missing_count', 0)}/{len(release.get('tracks', []))} missing"
                       if release.get("is_audited") else "unverified")
-            put(y, 1, f"{'›' if active else ' '} {release['title']}", split - 2,
+            request_label = ""
+            if self.active_download and release_key(self.active_download.release) == release_key(release):
+                request_label = "[searching] "
+            elif any(release_key(request.release) == release_key(release) for request in self.pending_downloads):
+                request_label = "[waiting] "
+            put(y, 1, f"{'›' if active else ' '} {request_label}{release['title']}", split - 2,
                 curses.A_REVERSE if active else 0)
             put(y + 1, 3, f"{release['artist']} · {counts}", split - 4, curses.A_DIM)
         if not rows:
@@ -620,7 +717,7 @@ class ReleaseBrowser:
                 "/: artist filter    Esc: clear filter    u: unverified",
                 "r: refresh selected release from MusicBrainz",
                 "R: rescan library, reuse saved audits if unchanged",
-                "Downloads update automatically; DOWNLOADED awaits library import",
+                "d/t requests wait in order; q discards waiting requests",
                 "Esc / Enter: close help    q: quit",
             ], 1):
                 line(row, text)

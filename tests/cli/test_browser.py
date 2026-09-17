@@ -476,19 +476,23 @@ def test_worker_prioritizes_download_between_audits_then_resumes_scan(tui, monke
     assert not tui.scanning and not tui.busy
 
 
-def test_idle_worker_checks_downloads_without_input_and_prioritizes_jobs(tui, monkeypatch):
+def test_worker_checks_due_downloads_before_waiting_jobs(tui, monkeypatch):
     row = release()
     tui._remember_downloads(row, {
         "queued_files": [{"user": "peer", "filename": "Album/02 Two.flac"}],
         "queued_tracks": [row["tracks"][1]],
     })
     actions = []
-    clock = iter([0, 3, 3])
-    monkeypatch.setattr(browser.time, "monotonic", lambda: next(clock))
+    clock = [0]
+    monkeypatch.setattr(browser.time, "monotonic", lambda: clock[0])
     service = SimpleNamespace(refresh_release=Mock(side_effect=lambda *a, **k: (
         actions.append("user refresh"), row,
     )[1]))
-    tui.service_factory.return_value = service
+    def create_service():
+        clock[0] = browser.DOWNLOAD_POLL_INTERVAL
+        return service
+
+    tui.service_factory.side_effect = create_service
 
     def check_downloads(actual_service):
         assert actual_service is service
@@ -496,12 +500,15 @@ def test_idle_worker_checks_downloads_without_input_and_prioritizes_jobs(tui, mo
         tui.jobs.put(None)
 
     monkeypatch.setattr(tui, "_check_downloads", check_downloads)
+    # Initialize the service before the refresh; it makes the poll overdue.
+    service.iter_releases = Mock(return_value=iter(()))
+    tui.jobs.put(("scan", None))
     tui._start("refresh", row)
 
     tui._worker()
     tui._drain_events()
 
-    assert actions == ["user refresh", "download check"]
+    assert actions == ["download check", "user refresh"]
     assert not tui.busy
     assert tui.error == ""
 
