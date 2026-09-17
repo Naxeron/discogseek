@@ -1,6 +1,6 @@
 # discogseek
 
-A small command-line tool for two jobs: audit an artist or release against MusicBrainz, and search slskd to queue missing music. Libraries can be local files, Navidrome/Subsonic, or both. slskd handles transfers and download destinations.
+A command-line tool to audit music against MusicBrainz, browse incomplete releases, and search slskd to queue missing tracks. Libraries can be local files, Navidrome/Subsonic, or both. slskd handles transfers and download destinations.
 
 ## Setup
 
@@ -53,6 +53,47 @@ Artist queries accept names or MusicBrainz artist MBIDs. For a release query, su
 
 `--full-scan` inspects all local tags during an artist audit instead of targeting likely files. `--force-refresh` refreshes MusicBrainz metadata; scans reuse metadata cached for unchanged local files. `--found-only` and `--missing-only` filter the plain terminal report; exports always contain the full audit, except TXT, which lists missing tracks.
 
+## Browse incomplete releases
+
+```bash
+# Two-panel browser for your whole library
+discogseek browse
+
+# Start with an artist filter or a different library
+discogseek browse --artist "Artist" -d /path/to/music
+
+# Inspect matches without submitting downloads
+discogseek browse --dry-run -f flac
+```
+
+The left pane lists incomplete releases; the right shows every track in the selected release, including disc/track numbers and found, missing, matched, or queued status. The browser scans local files and every configured Navidrome/Subsonic album and reuses saved MusicBrainz audits for unchanged releases across launches. The first run builds this audit cache. New or changed releases are audited as needed; failed audits remain retryable. Use `r` to refresh a selected release from MusicBrainz or launch with `--force-refresh` to refresh all audits. It covers releases already represented in your library; use `download "Artist"` for entirely absent releases.
+
+Press **Enter** for a menu offering **Download all missing tracks** and **Download selected track only**, with previews for either choice. To select an individual track, press **Tab**, then **↑ / ↓**; the arrow beside the track shows the selection. The download shortcuts also stay visible at the bottom of the screen.
+
+| Key | Action |
+| --- | --- |
+| ↑ / ↓ or j / k | Move through the focused pane |
+| Tab or ← / → | Switch panes |
+| Page Up / Page Down, Home / End | Move through long lists |
+| / | Edit the artist filter; Enter applies, Esc cancels |
+| Esc | Clear the applied artist filter |
+| Enter | Open download options; ↑ / ↓ chooses, Enter runs, Esc closes |
+| d | Download all unqueued missing tracks in this release |
+| t | Download the selected missing track |
+| p | Preview matches for the release without queueing |
+| P | Preview matches for the selected track without queueing |
+| r | Rescan and refresh the selected release's MusicBrainz audit |
+| R | Rescan the library, reusing saved audits for unchanged releases |
+| u | Show or hide releases MusicBrainz could not verify |
+| ? | Open keyboard help |
+| q | Quit after the current operation finishes |
+
+Artist filtering includes compilation track credits. Searches and audits run in the background, so navigation and filtering stay responsive. Selected downloads and refreshes run between release audits, then the library scan resumes. Downloads recheck the local and remote libraries first and skip tracks successfully queued during this browser session. Queue failures remain retryable. `--dry-run` makes both download shortcuts previews for the entire session.
+
+Single-track downloads search by the track's artist and title first, then try album searches if needed. Downloading all missing tracks starts with album searches and falls back to searches for the remaining individual tracks, using track artist credits for compilations. Both choices queue only the requested missing tracks.
+
+Queued tracks remain incomplete until files arrive in the library: press `r` to pick up completed transfers. Files go to slskd's configured download destination. Unverified releases cannot be downloaded from the browser. Browsing itself does not require slskd credentials. The UI uses Python's standard `curses` module on Linux/macOS and needs an interactive terminal of at least 72 columns by 14 rows.
+
 ## Download
 
 ```bash
@@ -75,11 +116,11 @@ Use `--timeout` to change the 30-second search timeout, `--min-match` to adjust 
 
 ## Scope and code
 
-The web server, browser assets, background task framework, Rich terminal displays, runtime settings editor, external download-link harvesting, audio tag writer, and old compatibility scripts have been removed. Configuration comes from the environment or `.env`; downloads go to the location configured in slskd.
+The web server, browser assets, background task framework, Rich terminal displays, runtime settings editor, external download-link harvesting, audio tag writer, and old compatibility scripts have been removed. The two-pane terminal browser uses the standard library. Configuration comes from the environment or `.env`; downloads go to the location configured in slskd.
 
 ```text
 src/discogseek/
-  cli/          Plain audit and download commands
+  cli/          Audit/download commands and the two-pane release browser
   clients/      MusicBrainz, slskd, Navidrome/Subsonic
   core/         Audio metadata, matching, caching, report exports
   services/     Artist/release auditing, reconciliation, download selection
