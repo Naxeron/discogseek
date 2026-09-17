@@ -58,7 +58,9 @@ def audit_release(
 
     # Defensive normalization: ensure disc_number and track_number are accurately parsed from filenames
     for lt in local_tracks:
-        curr_disc = lt.get("disc_number")
+        curr_disc = int(lt["disc_number"]) if lt.get("disc_number") else None
+        if curr_disc is not None:
+            lt["disc_number"] = curr_disc
         if not curr_disc or curr_disc == 1:
             p_disc, p_trk, _ = parse_disc_and_track_number(
                 lt.get("track_number"),
@@ -119,7 +121,9 @@ def audit_release(
         media_list = mb_release.get("medium-list", [])
 
         for medium in media_list:
-            disc_num = medium.get("position", 1)
+            # MusicBrainz positions are strings. Keep official and unmatched
+            # local tracks numeric so their combined list sorts consistently.
+            disc_num = int(medium.get("position") or 1)
             for trk in medium.get("track-list", []):
                 rec = trk.get("recording", {})
                 trk_num = trk.get("number") or str(trk.get("position", ""))

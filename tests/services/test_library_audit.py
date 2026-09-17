@@ -172,3 +172,43 @@ def test_audit_release_prefers_official_album_artist_over_inferred_compilation(
     assert audited["tracks"][0]["artist"] == expected_artist
     assert audited["tracks"][1]["artist"] == "The Busters"
     assert audited["found_count"] == audited["missing_count"] == 1
+
+
+@pytest.mark.parametrize("official_disc_type", [str, int])
+@pytest.mark.parametrize("local_disc_type", [str, int])
+def test_audit_sorts_official_and_unmatched_tracks_with_mixed_disc_types(
+    official_disc_type, local_disc_type,
+):
+    mb = MagicMock()
+    mb.get_release_by_id.return_value = {
+        "id": "mixed-discs", "title": "Album", "artist-credit": [{"name": "Artist"}],
+        "medium-list": [
+            {"position": official_disc_type(disc), "track-list": [
+                {"number": str(number), "recording": {"id": f"rec-{disc}-{number}", "title": title}}
+                for number, title in enumerate(titles, 1)
+            ]}
+            for disc, titles in [(10, ["Finale"]), (2, ["Disc Two"]), (1, ["First", "Second"])]
+        ],
+    }
+    service = LibraryReleaseService(mb_client=mb, slskd_client=MagicMock())
+    local = {
+        "artist": "Artist", "title": "Album", "mb_release_id": "mixed-discs", "tracks": [
+            {"disc_number": local_disc_type(disc), "track_number": str(number),
+             "title": title, "filename": f"{number:02d} {title}.flac"}
+            for disc, number, title in [(2, 1, "Disc Two"), (1, 3, "Bonus mix"), (1, 1, "First")]
+        ],
+    }
+
+    audited = service.audit_release(local)
+
+    assert audited["is_audited"] is True
+    assert audited["found_count"] == 3
+    assert audited["missing_count"] == 2
+    assert [(t["disc_number"], t["track_number"], t["title"], t["status"])
+            for t in audited["tracks"]] == [
+        (1, "1", "First", "found"),
+        (1, "2", "Second", "missing"),
+        (1, "3", "Bonus mix", "found"),
+        (2, "1", "Disc Two", "found"),
+        (10, "1", "Finale", "missing"),
+    ]

@@ -9,6 +9,8 @@ import pytest
 from discogseek.cli import browser
 from discogseek.cli.browser import ReleaseBrowser, release_key, track_key
 from discogseek.cli.main import build_parser
+from discogseek.services.library import LibraryReleaseService
+from discogseek.services.library_browser import LibraryBrowserService
 
 
 def release(identity="edition-1", missing=2):
@@ -115,6 +117,51 @@ def test_finished_download_updates_status_then_retries_delayed_import(tui, servi
 
     service.release_service.slskd_client.get_downloads.assert_not_called()
     service.refresh_release.assert_not_called()
+
+
+def test_finished_download_refreshes_real_audit_with_string_discs_and_local_bonus(tui, monkeypatch):
+    mb = Mock()
+    mb.get_release_by_id.return_value = {
+        "id": "edition-1", "title": "Album", "artist-credit": [{"name": "Artist"}],
+        "medium-list": [{"position": "1", "track-list": [
+            {"number": str(number), "recording": {"id": f"rec-{number}", "title": title}}
+            for number, title in enumerate(["First", "Second"], 1)
+        ]}],
+    }
+
+    def local_track(number, title):
+        return {"disc_number": 1, "track_number": str(number), "title": title,
+                "artist": "Artist", "source": "local", "status": "found",
+                "filename": f"{number} {title}.flac", "path": f"/music/Album/{number} {title}.flac"}
+
+    local = {"id": "local-album", "mb_release_id": "edition-1", "title": "Album",
+             "artist": "Artist", "tracks": [local_track(1, "First")]}
+    slskd = SimpleNamespace(get_downloads=Mock(return_value=transfers(transfer())))
+    release_service = LibraryReleaseService(mb_client=mb, slskd_client=slskd)
+    release_service.scan_library_releases = Mock(return_value=[local])
+    service = LibraryBrowserService(release_service)
+    row = next(service.iter_releases())
+    assert row["is_audited"] and row["missing_count"] == 1
+    remember(tui, row)
+    release_service.scan_library_releases.return_value = [dict(local, tracks=[
+        local_track(1, "First"), local_track(2, "Second"), local_track(3, "Bonus"),
+    ])]
+    put_event = Mock(wraps=tui.events.put)
+    monkeypatch.setattr(tui.events, "put", put_event)
+
+    tui._check_downloads(service)
+
+    events = [call.args[0] for call in put_event.call_args_list]
+    assert not [payload for kind, payload in events if kind == "download_error" and payload]
+    assert any(kind == "release" for kind, _ in events)
+    tui._drain_events()
+    fresh = tui.model.releases[release_key(row)]
+    assert tui.download_error == ""
+    assert fresh["found_count"] == 3 and fresh["missing_count"] == 0
+    assert [track["title"] for track in fresh["tracks"]] == ["First", "Second", "Bonus"]
+    assert tui.model.track_status(fresh, fresh["tracks"][1]) == "found"
+    assert release_key(row) not in tui._downloads
+    assert tui.model.visible() == []
 
 
 @pytest.mark.parametrize("state", ["Queued, Remotely", "InProgress", "Completed"])
