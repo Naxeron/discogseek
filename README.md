@@ -92,7 +92,7 @@ Artist filtering includes compilation track credits. Searches and audits run in 
 
 Single-track downloads search by the track's artist and title first, then try album searches if needed. Downloading all missing tracks starts with album searches and falls back to searches for the remaining individual tracks, using track artist credits for compilations. Both choices queue only the requested missing tracks.
 
-Queued tracks remain incomplete until files arrive in the library: press `r` to pick up completed transfers. Files go to slskd's configured download destination. Unverified releases cannot be downloaded from the browser. Browsing itself does not require slskd credentials. The UI uses Python's standard `curses` module on Linux/macOS and needs an interactive terminal of at least 72 columns by 14 rows.
+Downloads queued during the browser session update automatically. The background worker checks slskd every three seconds between operations and refreshes affected releases when transfers finish. `DOWNLOADED` means the transfer succeeded but the library has not picked up the file yet; the browser retries the library check every 15 seconds until it becomes `FOUND`, and complete releases leave the incomplete list. Files go to slskd's configured download destination, so they must be moved into the scanned library or indexed by Navidrome to count as found. Unverified releases cannot be downloaded from the browser. Browsing itself does not require slskd credentials. The UI uses Python's standard `curses` module on Linux/macOS and needs an interactive terminal of at least 72 columns by 14 rows.
 
 ## Download
 

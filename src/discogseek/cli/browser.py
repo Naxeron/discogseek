@@ -4,13 +4,19 @@ import copy
 import locale
 import logging
 import queue
+import re
 import sys
 import threading
+import time
 import unicodedata
 from typing import Any, Dict
 
 from discogseek.core.text import normalize_text
 from discogseek.services.library_browser import LibraryBrowserService
+
+
+DOWNLOAD_POLL_INTERVAL = 3.0
+DOWNLOAD_IMPORT_RETRY_INTERVAL = 15.0
 
 
 class _ScanStopped(Exception):
@@ -45,6 +51,7 @@ class BrowserModel:
         self.track_index = 0
         self.queued = {}
         self.matched = {}
+        self.downloaded = {}
 
     def visible(self):
         query = normalize_text(self.artist_filter)
@@ -73,7 +80,7 @@ class BrowserModel:
         key = release_key(release)
         if old_key is not None and old_key != key:
             self.releases.pop(old_key, None)
-            for history in (self.queued, self.matched):
+            for history in (self.queued, self.matched, self.downloaded):
                 if old_key in history:
                     history.setdefault(key, set()).update(history.pop(old_key))
             if self.selected_key == old_key:
@@ -110,6 +117,8 @@ class BrowserModel:
         if track.get("status") == "found":
             return "found"
         key, identity = release_key(release), track_key(track)
+        if identity in self.downloaded.get(key, set()):
+            return "downloaded"
         if identity in self.queued.get(key, set()):
             return "queued"
         if identity in self.matched.get(key, set()):
@@ -174,6 +183,93 @@ class ReleaseBrowser:
         self.error = ""
         self.last_result = ""
         self.refreshed_during_scan = set()
+        self.download_error = ""
+        # Only the worker touches transfer watches and the service clients.
+        self._downloads = {}
+
+    @staticmethod
+    def _transfer_key(username, filename):
+        username = re.sub(r"\s*\(.*?\)$", "", username or "").strip()
+        return username, (filename or "").replace("\\", "/")
+
+    def _update_download_watch(self, release, old_key=None):
+        key = release_key(release)
+        if old_key is not None and old_key != key and old_key in self._downloads:
+            previous = self._downloads.pop(old_key)
+            current = self._downloads.setdefault(key, previous)
+            current["files"].update(previous["files"])
+            current["completed"].update(previous["completed"])
+        watch = self._downloads.get(key)
+        if watch is None:
+            return
+        watch["release"] = copy.deepcopy(release)
+        found = {track_key(t) for t in release.get("tracks", []) if t.get("status") == "found"}
+        watch["files"] = {file: track for file, track in watch["files"].items() if track not in found}
+        watch["completed"].intersection_update(watch["files"])
+        if not watch["files"]:
+            del self._downloads[key]
+
+    def _remember_downloads(self, release, result):
+        if result.get("dry_run"):
+            return
+        files = {
+            self._transfer_key(file.get("user"), file.get("filename")): track_key(track)
+            for file, track in zip(result.get("queued_files", []), result.get("queued_tracks", []))
+            if file.get("user") and file.get("filename")
+        }
+        if files:
+            watch = self._downloads.setdefault(release_key(release), {
+                "release": copy.deepcopy(release), "files": {}, "completed": set(), "refresh_after": 0,
+            })
+            watch["files"].update(files)
+            self._update_download_watch(release)
+
+    def _check_downloads(self, service):
+        if not self._downloads or self.stopping.is_set():
+            return
+        try:
+            transfers = {}
+            if any(set(w["files"]) - w["completed"] for w in self._downloads.values()):
+                for user in service.release_service.slskd_client.get_downloads():
+                    for directory in user.get("directories", []):
+                        for file in directory.get("files", []):
+                            key = self._transfer_key(user.get("username"), file.get("filename"))
+                            transfers[key] = {part.strip() for part in (file.get("state") or "").split(",")}
+        except Exception as exc:
+            self.events.put(("download_error", f"Download updates: {exc}; retrying automatically."))
+            return
+        refreshes = []
+        for key, watch in list(self._downloads.items()):
+            if self.stopping.is_set():
+                break
+            completed = {file for file in watch["files"] if "Succeeded" in transfers.get(file, set())}
+            newly_completed = completed - watch["completed"]
+            watch["completed"].update(completed)
+            if newly_completed:
+                self.events.put(("downloaded", (key, {watch["files"][file] for file in newly_completed})))
+            # A cleared transfer may already be imported. Only a library audit
+            # can mark it found; terminal failures are never treated as success.
+            if not watch["completed"] and all(file in transfers for file in watch["files"]):
+                continue
+            if newly_completed or time.monotonic() >= watch["refresh_after"]:
+                refreshes.append((key, watch))
+        # Show every known completion before potentially slow library audits.
+        errors = []
+        for key, watch in refreshes:
+            if self.stopping.is_set():
+                break
+            try:
+                fresh = service.refresh_release(watch["release"], library_dir=self.args.music_dir)
+                if not fresh.get("is_audited"):
+                    raise ValueError(fresh.get("audit_error") or "Release audit unavailable")
+                self._update_download_watch(fresh, key)
+                self.events.put(("release", (key, fresh)))
+            except Exception as exc:
+                errors.append(str(exc))
+            finally:
+                watch["refresh_after"] = time.monotonic() + DOWNLOAD_IMPORT_RETRY_INTERVAL
+        message = f"Download updates: {'; '.join(errors)}; retrying automatically." if errors else ""
+        self.events.put(("download_error", message))
 
     def _progress(self, done, total, message, unit=None):
         if self.stopping.is_set() and self.operation == "scan":
@@ -189,14 +285,22 @@ class ReleaseBrowser:
     def _worker(self):
         service = None
         scan = None
+        next_download_check = time.monotonic() + DOWNLOAD_POLL_INTERVAL
         while True:
-            if scan is None:
-                job = self.jobs.get()
-            else:
-                try:
-                    job = self.jobs.get_nowait()
-                except queue.Empty:
+            try:
+                job = self.jobs.get_nowait()
+            except queue.Empty:
+                timeout = (max(0, next_download_check - time.monotonic())
+                           if self._downloads and not self.stopping.is_set() else None)
+                if timeout == 0:
+                    job = ("check_downloads", None)
+                elif scan is not None:
                     job = ("scan_step", None)
+                else:
+                    try:
+                        job = self.jobs.get(timeout=timeout)
+                    except queue.Empty:
+                        continue
             if job is None:
                 return
             kind, payload = job
@@ -215,13 +319,19 @@ class ReleaseBrowser:
                 elif kind == "refresh":
                     release = service.refresh_release(payload, library_dir=self.args.music_dir,
                                                       force_refresh=True)
+                    self._update_download_watch(release, release_key(payload))
                     self.events.put(("release", (release_key(payload), release)))
+                elif kind == "check_downloads":
+                    self._check_downloads(service)
+                    next_download_check = time.monotonic() + DOWNLOAD_POLL_INTERVAL
                 else:
                     release, queued, only_track, dry_run = payload
                     fresh, result = download_release(
                         service, release, self.args.music_dir, queued, only_track,
                         self.args.format, self.args.timeout, dry_run, self._download_progress,
                     )
+                    self._update_download_watch(fresh, release_key(release))
+                    self._remember_downloads(fresh, result)
                     self.events.put(("result", (release_key(release), fresh, result)))
             except (StopIteration, _ScanStopped):
                 scan = None
@@ -232,7 +342,7 @@ class ReleaseBrowser:
                     scan = None
                     self.events.put(("done", "scan"))
             finally:
-                if kind not in ("scan", "scan_step"):
+                if kind not in ("scan", "scan_step", "check_downloads"):
                     self.events.put(("done", kind))
 
     def _start(self, kind, payload=None):
@@ -268,6 +378,12 @@ class ReleaseBrowser:
                     self.model.update(release)
             elif kind == "error":
                 self.error = data
+            elif kind == "download_error":
+                self.download_error = data
+            elif kind == "downloaded":
+                key, tracks = data
+                self.model.downloaded.setdefault(key, set()).update(tracks)
+                self.message = f"{len(tracks)} download(s) finished. Checking the library automatically…"
             elif kind == "result":
                 old_key, release, result = data
                 if self.scanning:
@@ -420,7 +536,7 @@ class ReleaseBrowser:
 
         if height < 14 or width < 72:
             put(0, 0, "Enlarge terminal to at least 72 x 14. Press q to quit.")
-            put(2, 0, self.error or self.message)
+            put(2, 0, self.error or self.download_error or self.message)
             screen.refresh()
             return
         put(0, 1, "DISCOGSEEK  /  incomplete releases", attr=curses.A_BOLD)
@@ -474,8 +590,9 @@ class ReleaseBrowser:
                 f"Track {self.model.track_index + 1}/{len(tracks)} · MBID: {selected.get('mb_release_id') or 'unresolved'}"
             )
             put(height - 6, split + 2, detail, attr=curses.A_DIM)
-        put(height - 5, 1, self.error or self.message, attr=curses.A_BOLD if self.error else 0)
-        put(height - 4, 1, self.last_result or "QUEUED = in slskd. Press r after files arrive in your library.", attr=curses.A_DIM)
+        put(height - 5, 1, self.error or self.download_error or self.message,
+            attr=curses.A_BOLD if self.error or self.download_error else 0)
+        put(height - 4, 1, self.last_result or "Downloads update automatically; DOWNLOADED = waiting for library.", attr=curses.A_DIM)
         put(height - 3, 1, "d Download all missing · t Download selected track · Enter options", attr=curses.A_BOLD)
         put(height - 2, 1, "↑↓ move · Tab pane · / artist · p preview · r refresh · ? help · q quit")
         if self.overlay is not None:
@@ -503,7 +620,7 @@ class ReleaseBrowser:
                 "/: artist filter    Esc: clear filter    u: unverified",
                 "r: refresh selected release from MusicBrainz",
                 "R: rescan library, reuse saved audits if unchanged",
-                "QUEUED = submitted to slskd; r checks files after arrival",
+                "Downloads update automatically; DOWNLOADED awaits library import",
                 "Esc / Enter: close help    q: quit",
             ], 1):
                 line(row, text)

@@ -476,6 +476,148 @@ def test_worker_prioritizes_download_between_audits_then_resumes_scan(tui, monke
     assert not tui.scanning and not tui.busy
 
 
+def test_idle_worker_checks_downloads_without_input_and_prioritizes_jobs(tui, monkeypatch):
+    row = release()
+    tui._remember_downloads(row, {
+        "queued_files": [{"user": "peer", "filename": "Album/02 Two.flac"}],
+        "queued_tracks": [row["tracks"][1]],
+    })
+    actions = []
+    clock = iter([0, 3, 3])
+    monkeypatch.setattr(browser.time, "monotonic", lambda: next(clock))
+    service = SimpleNamespace(refresh_release=Mock(side_effect=lambda *a, **k: (
+        actions.append("user refresh"), row,
+    )[1]))
+    tui.service_factory.return_value = service
+
+    def check_downloads(actual_service):
+        assert actual_service is service
+        actions.append("download check")
+        tui.jobs.put(None)
+
+    monkeypatch.setattr(tui, "_check_downloads", check_downloads)
+    tui._start("refresh", row)
+
+    tui._worker()
+    tui._drain_events()
+
+    assert actions == ["user refresh", "download check"]
+    assert not tui.busy
+    assert tui.error == ""
+
+
+def test_worker_monitors_new_submissions_until_library_confirms_completion(tui, monkeypatch):
+    row = release()
+    clock = [0]
+    monkeypatch.setattr(browser.time, "monotonic", lambda: clock[0])
+    filename = "Album/02 Two.flac"
+
+    def queue_download(**kwargs):
+        clock[0] = browser.DOWNLOAD_POLL_INTERVAL
+        return {"total_missing": 1, "resolved_count": 1, "queued_count": 1,
+                "queued_tracks": kwargs["missing_tracks"],
+                "queued_files": [{"user": "peer", "filename": filename}]}
+
+    def refresh_release(release, **kwargs):
+        if clock[0] == 0:
+            return deepcopy(release)
+        fresh = deepcopy(release)
+        fresh["tracks"][1]["status"] = "found"
+        fresh["missing_count"] = 0
+        tui.jobs.put(None)
+        return fresh
+
+    client = SimpleNamespace(get_downloads=Mock(return_value=[{
+        "username": "peer", "directories": [{"files": [
+            {"filename": filename, "state": "Completed, Succeeded"},
+        ]}],
+    }]))
+    service = SimpleNamespace(refresh_release=Mock(side_effect=refresh_release),
+                              release_service=SimpleNamespace(
+                                  download_missing_tracks=Mock(side_effect=queue_download), slskd_client=client))
+    tui.service_factory.return_value = service
+    tui.model.update(row)
+    tui._download()
+
+    tui._worker()
+    tui._drain_events()
+
+    assert service.refresh_release.call_count == 2
+    client.get_downloads.assert_called_once_with()
+    assert tui.model.track_status(row, row["tracks"][1]) == "downloaded"
+    fresh = tui.model.releases[release_key(row)]
+    assert tui.model.track_status(fresh, fresh["tracks"][1]) == "found"
+    assert tui.model.visible() == []
+    assert tui._downloads == {}
+    assert not tui.busy and not tui.error
+
+
+def test_download_completion_between_audits_survives_stale_scan(tui, monkeypatch):
+    old = release()
+    fresh = deepcopy(old)
+    fresh["tracks"][1]["status"] = "found"
+    fresh["missing_count"] = 0
+    tui.model.update(old)
+    result = {"queued_files": [{"user": "peer", "filename": "Album/02 Two.flac"}],
+              "queued_tracks": [old["tracks"][1]]}
+    tui.model.record_result(old, result)
+    tui._remember_downloads(old, result)
+    clock = [0]
+    monkeypatch.setattr(browser.time, "monotonic", lambda: clock[0])
+
+    def scan(**kwargs):
+        clock[0] = 3
+        yield old
+        # This inventory was captured before the download finished.
+        yield deepcopy(old)
+        tui.jobs.put(None)
+
+    client = SimpleNamespace(get_downloads=Mock(return_value=[{
+        "username": "peer", "directories": [{"files": [
+            {"filename": "Album/02 Two.flac", "state": "Completed, Succeeded"},
+        ]}],
+    }]))
+    service = SimpleNamespace(iter_releases=scan, refresh_release=Mock(return_value=fresh),
+                              release_service=SimpleNamespace(slskd_client=client))
+    tui.service_factory.return_value = service
+    put = tui.events.put
+
+    def consume(event):
+        put(event)
+        tui._drain_events()
+        if event[0] == "release":
+            assert tui.busy and tui.scanning
+
+    monkeypatch.setattr(tui.events, "put", consume)
+    tui._start("scan")
+
+    tui._worker()
+
+    client.get_downloads.assert_called_once_with()
+    service.refresh_release.assert_called_once_with(old, library_dir=tui.args.music_dir)
+    assert tui.model.releases[release_key(old)] == fresh
+    assert tui.model.visible() == []
+    assert not tui.busy and not tui.scanning
+    assert tui._downloads == {}
+
+
+def test_worker_quits_without_polling_pending_downloads(tui, monkeypatch):
+    row = release()
+    tui._remember_downloads(row, {
+        "queued_files": [{"user": "peer", "filename": "Album/02 Two.flac"}],
+        "queued_tracks": [row["tracks"][1]],
+    })
+    check = Mock()
+    monkeypatch.setattr(tui, "_check_downloads", check)
+    tui._quit()
+    tui.jobs.put(None)
+
+    tui._worker()
+
+    check.assert_not_called()
+    tui.service_factory.assert_not_called()
+
+
 @pytest.mark.parametrize("action", ["refresh", "download"])
 def test_explicit_refresh_survives_stale_scan_but_next_rescan_can_update_it(tui, terminal_keys, action):
     old = dict(release("original-browser-id"), mb_release_id="edition-1")
