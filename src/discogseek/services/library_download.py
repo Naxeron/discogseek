@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from discogseek.clients.slskd import SlskdClient
+from discogseek.clients.slskd import SlskdAPIError, SlskdClient, SlskdPeerUnavailableError
 from discogseek.core.audio import AudioQualityAnalyzer
 from discogseek.core.constants import AUDIO_EXTENSIONS
 from discogseek.core.release_metadata import (
@@ -22,6 +22,7 @@ from discogseek.core.text import (
     normalize_text,
     parse_track_title_structure,
 )
+from discogseek.core.transfers import DownloadHistory, source_key
 from discogseek.services.candidates import PeerCandidateIndex, pre_parse_single_track
 from discogseek.services.reconciler import have_conflicting_numbers
 
@@ -37,6 +38,7 @@ def download_missing_tracks(
     dry_run: bool = False,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     search_scope: str = "release",
+    excluded_sources: Optional[Set[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
     """
     Orchestrates Soulseek discovery and queueing for missing tracks of a release.
@@ -104,6 +106,11 @@ def download_missing_tracks(
     if any(is_missing_track_placeholder(t.get("title", "")) for t in missing_tracks):
         raise ValueError("Cannot download unresolved track placeholders; audit the release with MusicBrainz first")
 
+    try:
+        history = DownloadHistory(slskd_client.get_downloads(), excluded_sources=excluded_sources)
+    except Exception as error:
+        raise SlskdAPIError(f"Cannot check existing slskd downloads before searching: {error}") from error
+
     # Check if release is compilation / Various Artists
     is_va = is_various_artists(artist)
     track_artists = {
@@ -129,8 +136,12 @@ def download_missing_tracks(
     matched_tracks: List[Dict[str, Any]] = []
     queued_tracks: List[Dict[str, Any]] = []
     queue_errors: List[Dict[str, Any]] = []
+    peer_queue_errors: List[Dict[str, Any]] = []
+    matched_missing: Set[Tuple[int, Optional[int], str]] = set()
     resolved_missing: Set[Tuple[int, Optional[int], str]] = set()
     used_files: Set[Tuple[str, str]] = set()
+    unavailable_users: Set[str] = set()
+    failed_source_tracks: Dict[Tuple[int, Optional[int], str], Set[Tuple[str, str]]] = {}
     requested_by_key = {
         track_key(resolved): requested
         for requested, resolved in zip(requested_tracks, missing_tracks)
@@ -153,6 +164,9 @@ def download_missing_tracks(
 
     def file_key(user: str, file: Dict[str, Any]) -> Tuple[str, str]:
         return user, file.get("filename", "").replace("\\", "/")
+
+    def user_key(user: str) -> str:
+        return re.sub(r"\s*\(.*?\)$", "", user).strip().casefold()
 
     def candidate_matches(track: Dict[str, Any], file: Dict[str, Any], individual: bool) -> bool:
         filename = file.get("filename", "").replace("\\", "/")
@@ -232,22 +246,43 @@ def download_missing_tracks(
         return p_missing["base_norm"] == p_remote["base_norm"] or sim >= (0.80 if individual else 0.85)
 
     def queue_matches(user: str, matches: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> None:
+        if user_key(user) in unavailable_users:
+            return
         items = []
         originals = []
+        keys = []
         for track, file in matches:
             key = track_key(track)
             if key in resolved_missing or file_key(user, file) in used_files:
                 continue
             disc, number = track_position(track)
-            items.append({
+            item = {
                 "filename": file.get("filename"), "size": file.get("size", 0),
                 "title": track.get("title", ""), "artist": track.get("artist") or artist, "disc_number": disc,
                 "track_number": number, "user": user,
-            })
-            originals.append(requested_by_key[key])
+            }
+            if key not in matched_missing:
+                matched_tracks.append(requested_by_key[key])
+                matched_missing.add(key)
             resolved_missing.add(key)
             used_files.add(file_key(user, file))
-        matched_tracks.extend(originals)
+            if history.is_protected(user, file.get("filename", "")):
+                # An existing live/successful transfer already fulfills this
+                # request; retain its attribution without sending another POST.
+                queued_files.append(item)
+                if not dry_run:
+                    queued_tracks.append(requested_by_key[key])
+                continue
+            items.append(item)
+            originals.append(requested_by_key[key])
+            keys.append(key)
+        if items and not dry_run:
+            try:
+                # Stop slskd retrying the failed source before submitting its replacement.
+                history.prepare_recovery(slskd_client)
+            except SlskdAPIError as error:
+                queue_errors.append({"stage": "recovery", "error": str(error), "tracks": originals})
+                return
         # Keep each API call to one chunk, so a later failure cannot hide earlier successes.
         for start in range(0, len(items), 50):
             chunk = items[start:start + 50]
@@ -256,6 +291,28 @@ def download_missing_tracks(
                 report_progress(f"Queueing {len(chunk)} matched tracks from {user} in slskd…")
                 try:
                     slskd_client.enqueue_download(user, chunk)
+                except SlskdPeerUnavailableError as error:
+                    unavailable_users.add(user_key(user))
+                    # A definite peer connection failure is safe to recover from
+                    # by choosing another peer. Keep any accepted files, and free
+                    # both the rejected chunk and any chunks not yet submitted.
+                    accepted = {file_key(user, file) for file in error.queued_files}
+                    failed_tracks = []
+                    for item, track, key in zip(items[start:], originals[start:], keys[start:]):
+                        identity = file_key(user, item)
+                        if identity in accepted:
+                            queued_files.append(item)
+                            queued_tracks.append(track)
+                        else:
+                            resolved_missing.discard(key)
+                            used_files.discard(identity)
+                            failed_tracks.append(track)
+                    if failed_tracks:
+                        detail = {"user": user, "error": str(error), "tracks": failed_tracks}
+                        queue_errors.append(detail)
+                        peer_queue_errors.append(detail)
+                    report_progress(f"Peer {user} is unavailable; trying other matches…")
+                    break
                 except Exception as error:
                     queue_errors.append({"user": user, "error": str(error), "tracks": tracks})
                     continue
@@ -274,12 +331,22 @@ def download_missing_tracks(
     def unique_queries(queries: List[str]) -> List[str]:
         return list(dict.fromkeys(query.strip() for query in queries if query.strip()))
 
+    def candidate_available(track: Dict[str, Any], user: str, file: Dict[str, Any], individual: bool) -> bool:
+        if not candidate_matches(track, file, individual):
+            return False
+        if history.is_protected(user, file.get("filename", "")):
+            return True
+        if history.excludes(user, file.get("filename", "")):
+            failed_source_tracks.setdefault(track_key(track), set()).add(source_key(user, file.get("filename", "")))
+            return False
+        return True
+
     def evaluate_album(responses: List[Dict[str, Any]], require_artist: bool = False) -> None:
         # Compare all peers before choosing, so response ordering cannot override format preference.
         peer_directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for response in responses:
             user = response.get("username")
-            if not user:
+            if not user or user_key(user) in unavailable_users:
                 continue
             for file in response.get("files", []):
                 filename = file.get("filename", "")
@@ -291,6 +358,7 @@ def download_missing_tracks(
         candidate_index = PeerCandidateIndex(peer_directories)
         matches_by_directory: Dict[Tuple[str, str], Dict[Tuple[int, Optional[int], str], Any]] = {}
         selected_by_directory: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
+        protected_matches: Dict[Tuple[int, Optional[int], str], Tuple[str, Dict[str, Any], Dict[str, Any]]] = {}
         for track in remaining_tracks():
             candidates = candidate_index.get_candidate_files_for_track(pre_parse_single_track(track.get("title", "")))
             for candidate in sorted(candidates, key=lambda item: candidate_rank(item.user, item.raw_file)):
@@ -303,10 +371,20 @@ def download_missing_tracks(
                 matches = matches_by_directory.setdefault(directory, {})
                 selected_files = selected_by_directory.setdefault(directory, set())
                 identity = file_key(candidate.user, candidate.raw_file)
+                # Inspect even lower-ranked matches so old failed transfers are
+                # stopped when a better file from this directory replaces them.
+                if not candidate_available(track, candidate.user, candidate.raw_file, False):
+                    continue
+                if history.is_protected(candidate.user, candidate.raw_file.get("filename", "")):
+                    protected_matches.setdefault(track_key(track), (candidate.user, track, candidate.raw_file))
                 if track_key(track) not in matches and identity not in selected_files:
-                    if candidate_matches(track, candidate.raw_file, False):
-                        matches[track_key(track)] = (track, candidate.raw_file)
-                        selected_files.add(identity)
+                    matches[track_key(track)] = (track, candidate.raw_file)
+                    selected_files.add(identity)
+
+        # Keep a healthy queued transfer even when another peer offers a higher
+        # ranked format; sending its alternative would download the track twice.
+        for user, track, file in protected_matches.values():
+            queue_matches(user, [(track, file)])
 
         directory_matches = []
         for (user, folder), matches in matches_by_directory.items():
@@ -388,14 +466,19 @@ def download_missing_tracks(
                 candidates = [
                     (response["username"], file)
                     for response in results.get(query, {}).get("responses", [])
-                    if response.get("username")
+                    if response.get("username") and user_key(response["username"]) not in unavailable_users
                     for file in response.get("files", [])
                 ]
                 candidates.sort(key=lambda item: candidate_rank(*item))
                 for track in tracks:
-                    for user, file in candidates:
-                        if file_key(user, file) not in used_files and candidate_matches(track, file, True):
-                            queue_matches(user, [(track, file)])
+                    available = [
+                        (user, file) for user, file in candidates
+                        if file_key(user, file) not in used_files and candidate_available(track, user, file, True)
+                    ]
+                    available.sort(key=lambda item: not history.is_protected(item[0], item[1].get("filename", "")))
+                    for user, file in available:
+                        queue_matches(user, [(track, file)])
+                        if track_key(track) in resolved_missing:
                             break
 
     if search_scope == "track":
@@ -404,6 +487,26 @@ def download_missing_tracks(
     else:
         search_album()
         search_tracks()
+
+    # Successful fallback should not surface an obsolete failure to callers.
+    queued_row_ids = {id(track) for track in queued_tracks}
+    peer_error_ids = {id(error) for error in peer_queue_errors}
+    for error in peer_queue_errors:
+        error["tracks"] = [track for track in error["tracks"] if id(track) not in queued_row_ids]
+    queue_errors = [error for error in queue_errors if id(error) not in peer_error_ids or error["tracks"]]
+    unrecovered_tracks = [
+        requested_by_key[track_key(track)] for track in missing_tracks
+        if track_key(track) in failed_source_tracks and track_key(track) not in resolved_missing
+    ]
+    if unrecovered_tracks:
+        unrecovered_sources = set().union(*(
+            sources for key, sources in failed_source_tracks.items() if key not in resolved_missing
+        ))
+        queue_errors.append({
+            "stage": "recovery",
+            "error": f"No alternative sources found. {history.failure_summary(unrecovered_sources)}",
+            "tracks": unrecovered_tracks,
+        })
 
     verb, count = ("Matched", len(matched_tracks)) if dry_run else ("Queued", len(queued_tracks))
     report_progress(f"Completed: {verb} {count} missing track files.")
@@ -414,7 +517,7 @@ def download_missing_tracks(
         "total_missing": len(missing_tracks),
         "queued_count": len(queued_tracks),
         "matched_count": len(matched_tracks),
-        "resolved_count": len(resolved_missing),
+        "resolved_count": len(matched_missing),
         "dry_run": dry_run,
         "queued_files": queued_files,
         "matched_tracks": matched_tracks,
@@ -434,6 +537,7 @@ def download_single_missing_track(
     preferred_format: str = "flac",
     search_timeout: float = 28.0,
     dry_run: bool = False,
+    excluded_sources: Optional[Set[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Download one track using the same matching and fallback rules as release downloads."""
     track = {"title": track_title, "artist": track_artist, "track_number": track_number, "status": "missing"}
@@ -444,8 +548,9 @@ def download_single_missing_track(
             artist=artist, release_title=release_title, missing_tracks=[track],
             preferred_format=preferred_format, search_timeout=search_timeout,
             dry_run=dry_run, search_scope="track",
+            excluded_sources=excluded_sources,
         )
-    except ValueError as error:
+    except (ValueError, SlskdAPIError) as error:
         return {"success": False, "message": str(error), "artist": display_artist, "track": track_title}
 
     if not result["queued_files"]:

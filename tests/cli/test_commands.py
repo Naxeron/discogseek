@@ -8,7 +8,7 @@ import pytest
 from discogseek.cli.main import build_parser, main
 from discogseek.clients.musicbrainz import MusicBrainzClient
 from discogseek.clients.navidrome import NavidromeScanner
-from discogseek.clients.slskd import SlskdClient
+from discogseek.clients.slskd import SlskdClient, SlskdPeerUnavailableError
 from discogseek.config import Config
 from discogseek.core.audio import AudioMetadata, AudioQualityAnalyzer
 from discogseek.services.library import LibraryReleaseService
@@ -61,6 +61,7 @@ def workflow(tmp_path, monkeypatch):
     responses = {"responses": [{"username": "peer", "files": files, "uploadSpeed": 10000}]}
     monkeypatch.setattr(SlskdClient, "get_application", lambda s: {})
     monkeypatch.setattr(SlskdClient, "get_queued_filenames", lambda s: set())
+    monkeypatch.setattr(SlskdClient, "get_downloads", lambda s: [])
     monkeypatch.setattr(SlskdClient, "get_queued_track_fingerprints", lambda s: {
         "base_filenames": set(), "clean_titles": set(), "full_paths": set(),
     })
@@ -123,6 +124,40 @@ def test_queue_failure_is_not_success(workflow, monkeypatch, capsys, scope):
     output = capsys.readouterr()
     assert "slskd unavailable" in output.err
     assert "1 files queued" not in output.out
+
+
+@pytest.mark.parametrize("export_json", [False, True])
+def test_artist_download_reports_accepted_fallback_source(workflow, monkeypatch, capsys, export_json):
+    titles = ["Track One", "Track Two", "Track Three"]
+    responses = {"responses": [{
+        "username": user,
+        "files": [{"filename": f"{user}\\Target Artist - Three Track EP\\{i:02d} {title}.{ext}", "size": 1000}
+                  for i, title in enumerate(titles, 1)],
+    } for user, ext in [("offline-peer", "flac"), ("available-peer", "mp3")]]}
+    monkeypatch.setattr(SlskdClient, "batch_search", lambda s, queries, **k: {q: responses for q in queries})
+
+    def enqueue(client, user, files):
+        if user == "offline-peer":
+            raise SlskdPeerUnavailableError(user, "offline")
+        workflow.extend(files)
+
+    monkeypatch.setattr(SlskdClient, "enqueue_download", enqueue)
+    args = ["download", "Target Artist", "--quiet"] + (["--json", "-"] if export_json else [])
+    assert main(args) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert len(workflow) == 1
+    assert workflow[0]["filename"].endswith("03 Track Three.mp3")
+    if export_json:
+        result = json.loads(output.out)
+        assert result["queued_files"] == [{**workflow[0], "user": "available-peer"}]
+        assert result["enqueued_count"] == 1
+        assert result["queue_errors"] == []
+    else:
+        assert "1 files queued" in output.out
+        assert "MATCH | available-peer" in output.out
+        assert "offline-peer" not in output.out
+
 
 def test_unknown_release_is_unverified(workflow, monkeypatch, capsys):
     monkeypatch.setattr(MusicBrainzClient, "get_release_by_id", lambda *a, **k: None)

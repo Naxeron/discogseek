@@ -76,7 +76,10 @@ def tui(clock):
 @pytest.fixture
 def service():
     return SimpleNamespace(
-        release_service=SimpleNamespace(slskd_client=SimpleNamespace(get_downloads=Mock(return_value=[]))),
+        release_service=SimpleNamespace(
+            slskd_client=SimpleNamespace(get_downloads=Mock(return_value=[]), cancel_download=Mock()),
+            download_missing_tracks=Mock(return_value={}),
+        ),
         refresh_release=Mock(),
     )
 
@@ -164,15 +167,18 @@ def test_finished_download_refreshes_real_audit_with_string_discs_and_local_bonu
     assert tui.model.visible() == []
 
 
-@pytest.mark.parametrize("state", ["Queued, Remotely", "InProgress", "Completed"])
+@pytest.mark.parametrize("state", ["Queued, Remotely", "Queued, Locally", "InProgress", "Completed"])
 def test_active_and_unknown_transfers_remain_queued_without_claiming_success(tui, service, state):
     row = release()
     remember(tui, row)
-    service.release_service.slskd_client.get_downloads.return_value = transfers(transfer(state=state))
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state=state, id="healthy-id", attempts=100),
+    )
 
     check(tui, service)
 
     service.refresh_release.assert_not_called()
+    service.release_service.slskd_client.cancel_download.assert_not_called()
     assert tui.model.track_status(row, row["tracks"][1]) == "queued"
     assert tui.model.pending(row) == [row["tracks"][2]]
 
@@ -405,3 +411,231 @@ def test_live_refresh_survives_stale_release_from_background_scan(tui, service):
     assert tui.model.releases[release_key(row)]["missing_count"] == 0
     assert tui.scanning and tui.busy
     assert tui.operation == "scan"
+
+
+def run_recovery(tui, service, row, result=None):
+    """Run the already scheduled FIFO job, then stop the worker without real waiting."""
+    tui.service_factory.return_value = service
+    service.refresh_release.return_value = deepcopy(row)
+    service.release_service.download_missing_tracks.return_value = result or {
+        "total_missing": 1, "resolved_count": 0, "queued_count": 0, "queued_tracks": [],
+    }
+    tui.jobs.put(None)
+    tui._worker()
+    tui._drain_events()
+
+
+@pytest.mark.parametrize("state", ["Rejected", "TimedOut", "Errored"])
+def test_failed_transfer_is_stopped_then_only_its_track_tries_another_source(tui, service, state):
+    row = release(missing=3)
+    remember(tui, row, queued_result(row, positions=(1, 2)))
+    client = service.release_service.slskd_client
+    client.get_downloads.return_value = transfers(
+        transfer(2, f"Completed, {state}", id="failed-id", attempts=100, exception="Upload unavailable"),
+        transfer(3, "Queued, Remotely", id="healthy-id", attempts=100),
+        transfer(4, "Completed, Errored", id="unrelated-id", attempts=100),
+    )
+
+    check(tui, service)
+
+    client.cancel_download.assert_called_once_with("peer", "failed-id")
+    assert state in tui.last_result and "100" in tui.last_result
+    assert "Upload unavailable" in tui.last_result and "1/2" in tui.last_result
+    assert tui.active_download.recovery
+    result = queued_result(row, user="other-peer")
+    run_recovery(tui, service, row, result)
+
+    call = service.release_service.download_missing_tracks.call_args.kwargs
+    assert call["missing_tracks"] == [row["tracks"][1]]
+    assert call["search_scope"] == "track"
+    assert call["excluded_sources"] == {("peer", "Music/Album/2 song.flac")}
+    assert tui.model.track_status(row, row["tracks"][1]) == "queued"
+    assert tui.model.track_status(row, row["tracks"][2]) == "queued"
+    assert tui.model.track_status(row, row["tracks"][3]) == "missing"
+    assert tui.jobs.empty() and not tui.pending_downloads
+
+
+@pytest.mark.parametrize("state", ["Cancelled", "Aborted"])
+def test_explicitly_stopped_transfer_is_never_cancelled_or_recovered(tui, service, state):
+    row = release(missing=1)
+    remember(tui, row)
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state=f"Completed, {state}", id="transfer-id", attempts=100),
+    )
+
+    check(tui, service)
+
+    service.release_service.slskd_client.cancel_download.assert_not_called()
+    assert tui.jobs.empty() and not tui.pending_downloads
+    assert tui.model.track_status(row, row["tracks"][1]) == "missing"
+    assert not tui._failed_sources
+
+
+@pytest.mark.parametrize("with_id", [False, True])
+def test_unsafe_to_stop_transfer_leaves_actionable_error_without_auto_fallback(tui, service, with_id):
+    row = release(missing=1)
+    remember(tui, row)
+    client = service.release_service.slskd_client
+    client.get_downloads.return_value = transfers(transfer(
+        state="Completed, Rejected", **({"id": "failed-id"} if with_id else {}),
+    ))
+    if with_id:
+        client.cancel_download.side_effect = RuntimeError("slskd unavailable")
+
+    check(tui, service)
+    check(tui, service)
+
+    assert "slskd unavailable" in tui.error if with_id else "transfer ID unavailable" in tui.error
+    assert "Press d or t" in tui.error
+    assert client.cancel_download.call_count == int(with_id)
+    assert tui.jobs.empty() and not tui.pending_downloads
+    assert tui.model.track_status(row, row["tracks"][1]) == "missing"
+    assert tui._failed_sources[release_key(row)] == {("peer", "Music/Album/2 song.flac")}
+
+
+def test_recovery_budget_stops_after_two_alternative_searches_and_keeps_source_history(tui, service):
+    row = release(missing=1)
+    remember(tui, row, queued_result(row, user="peer-0"))
+    client = service.release_service.slskd_client
+    for number in range(3):
+        client.get_downloads.return_value = transfers(
+            transfer(state="Completed, TimedOut", id=f"failed-{number}"), user=f"peer-{number}",
+        )
+        check(tui, service)
+        if number < 2:
+            run_recovery(tui, service, row, queued_result(row, user=f"peer-{number + 1}"))
+
+    assert service.release_service.download_missing_tracks.call_count == 2
+    assert client.cancel_download.call_count == 3
+    assert tui._recovery_attempts[release_key(row)][track_key(row["tracks"][1])] == 2
+    assert len(tui._failed_sources[release_key(row)]) == 3
+    assert "stopped after 2 searches" in tui.last_result
+    assert tui.model.track_status(row, row["tracks"][1]) == "missing"
+    assert tui.jobs.empty() and not tui._downloads
+
+
+def test_no_alternative_stops_recovery_and_manual_retry_keeps_exclusions(tui, service):
+    row = release(missing=1)
+    remember(tui, row)
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state="Completed, Rejected", id="failed-id"),
+    )
+    check(tui, service)
+
+    run_recovery(tui, service, row)
+    check(tui, service)
+
+    assert "No alternative queued" in tui.last_result
+    assert tui.jobs.empty() and not tui._downloads
+    assert service.release_service.download_missing_tracks.call_count == 1
+    tui._download()
+    run_recovery(tui, service, row, queued_result(row, user="other-peer"))
+
+    assert service.release_service.download_missing_tracks.call_count == 2
+    assert service.release_service.download_missing_tracks.call_args.kwargs["excluded_sources"] == {
+        ("peer", "Music/Album/2 song.flac"),
+    }
+    assert tui._recovery_attempts[release_key(row)][track_key(row["tracks"][1])] == 1
+
+
+def test_library_import_before_recovery_suppresses_search(tui, service):
+    row = release(missing=1)
+    remember(tui, row)
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state="Completed, Errored", id="failed-id"),
+    )
+    check(tui, service)
+
+    run_recovery(tui, service, imported(row, 1))
+
+    service.release_service.download_missing_tracks.assert_not_called()
+    fresh = tui.model.releases[release_key(row)]
+    assert tui.model.track_status(fresh, fresh["tracks"][1]) == "found"
+    assert tui.jobs.empty()
+
+
+def test_quit_after_failure_poll_discards_automatic_recovery(tui, service):
+    row = release(missing=1)
+    remember(tui, row)
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state="Completed, Errored", id="failed-id"),
+    )
+    tui._check_downloads(service)
+    tui._quit()
+    tui._drain_events()
+
+    assert tui.jobs.empty() and not tui.pending_downloads
+    service.release_service.download_missing_tracks.assert_not_called()
+
+
+def test_quit_before_failure_poll_does_not_touch_transfers(tui, service):
+    row = release(missing=1)
+    remember(tui, row)
+    tui._quit()
+
+    check(tui, service)
+
+    service.release_service.slskd_client.get_downloads.assert_not_called()
+    service.release_service.slskd_client.cancel_download.assert_not_called()
+    assert tui.jobs.empty()
+
+
+def test_recovery_state_migrates_with_release_identity(tui, service):
+    row = release(missing=1)
+    remember(tui, row)
+    old_key = release_key(row)
+    identity = track_key(row["tracks"][1])
+    tui._failed_sources[old_key] = {("old-peer", "old/file.flac")}
+    tui._recovery_attempts[old_key] = {identity: 1}
+    fresh = dict(deepcopy(row), mb_release_id="new-edition")
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state="Completed, Rejected", id="failed-id"),
+    )
+    check(tui, service)
+
+    tui._update_download_watch(fresh, old_key)
+    tui._update_release(fresh, old_key)
+
+    assert old_key not in tui._recovery_attempts and old_key not in tui._failed_sources
+    assert tui._failed_sources[release_key(fresh)] == {
+        ("old-peer", "old/file.flac"), ("peer", "Music/Album/2 song.flac"),
+    }
+    assert tui._recovery_attempts[release_key(fresh)] == {identity: 1}
+    run_recovery(tui, service, fresh)
+
+    assert tui._recovery_attempts[release_key(fresh)] == {identity: 2}
+    assert len(service.release_service.download_missing_tracks.call_args.kwargs["excluded_sources"]) == 2
+
+
+@pytest.mark.parametrize("failure_first", [False, True])
+def test_healthy_copy_of_tracked_source_wins_over_older_failure(tui, service, failure_first):
+    row = release(missing=1)
+    remember(tui, row)
+    failed = transfer(state="Completed, TimedOut", id="old-id")
+    healthy = transfer(state="Queued, Remotely", id="live-id", attempts=100)
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        *([failed, healthy] if failure_first else [healthy, failed]),
+    )
+
+    check(tui, service)
+
+    service.release_service.slskd_client.cancel_download.assert_not_called()
+    assert tui.jobs.empty()
+    assert tui.model.track_status(row, row["tracks"][1]) == "queued"
+
+
+def test_recovery_search_error_stops_without_a_polling_loop(tui, service):
+    row = release(missing=1)
+    remember(tui, row)
+    service.release_service.slskd_client.get_downloads.return_value = transfers(
+        transfer(state="Completed, Errored", id="failed-id"),
+    )
+    check(tui, service)
+    service.release_service.download_missing_tracks.side_effect = RuntimeError("Search unavailable")
+
+    run_recovery(tui, service, row)
+    check(tui, service)
+
+    assert tui.error == "Search unavailable"
+    assert tui.jobs.empty() and not tui.pending_downloads and not tui._downloads
+    service.release_service.download_missing_tracks.assert_called_once()

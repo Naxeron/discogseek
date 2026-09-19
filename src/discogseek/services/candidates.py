@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from discogseek.core.audio import AudioQualityAnalyzer
 from discogseek.core.constants import AUDIO_EXTENSIONS, DIR_STOP_WORDS, SUPPORTING_EXTENSIONS
+from discogseek.core.transfers import source_key
 from discogseek.core.text import (
     _tokenize_words_cached,
     are_versions_compatible,
@@ -295,19 +296,22 @@ def is_dir_name_match_fast(clean_rel: str, rel_sig_words: Set[str], cd: Candidat
     return matches >= min(2, len(rel_sig_words))
 
 
-def find_best_track_candidate(
+def find_track_candidates(
     index: PeerCandidateIndex,
     track_title: str,
     artist_aliases: Set[str],
-    preferred_format: str = "flac",
     rel_title: str = "",
-) -> Optional[CandidateFile]:
-    """Choose the best matching file by format preference and peer queue length."""
+    excluded_users: Optional[Set[str]] = None,
+    excluded_sources: Optional[Set[Tuple[str, str]]] = None,
+) -> List[CandidateFile]:
+    """Return compatible files, preserving source identities for recovery."""
     parsed = pre_parse_single_track(track_title)
-    matches = [
+    return [
         candidate
         for candidate in index.get_candidate_files_for_track(parsed)
-        if is_track_title_match_fast(
+        if (not excluded_users or candidate.user not in excluded_users)
+        and (not excluded_sources or source_key(candidate.user, candidate.full_filename) not in excluded_sources)
+        and is_track_title_match_fast(
             parsed["p_struct"],
             parsed["words"],
             parsed["clean_words"],
@@ -319,8 +323,20 @@ def find_best_track_candidate(
             candidate.dir_name,
         )
     ]
+
+
+def find_best_track_candidate(
+    index: PeerCandidateIndex,
+    track_title: str,
+    artist_aliases: Set[str],
+    preferred_format: str = "flac",
+    rel_title: str = "",
+    excluded_users: Optional[Set[str]] = None,
+    excluded_sources: Optional[Set[Tuple[str, str]]] = None,
+) -> Optional[CandidateFile]:
+    """Choose the best matching file by format preference and peer queue length."""
     return max(
-        matches,
+        find_track_candidates(index, track_title, artist_aliases, rel_title, excluded_users, excluded_sources),
         key=lambda candidate: (
             candidate.fmt_score
             + (25 if preferred_format == "flac" and "FLAC" in candidate.fmt_label else 0)
@@ -347,7 +363,7 @@ def evaluate_directory(
     matched_tracks: List[Dict[str, Any]] = []
     unmatched_expected: List[Dict[str, Any]] = []
 
-    for pe, exp in zip(parsed_expected, expected_tracks):
+    for expected_index, (pe, exp) in enumerate(zip(parsed_expected, expected_tracks)):
         exp_title = exp.get("title", "")
         matched_file = None
 
@@ -362,6 +378,7 @@ def evaluate_directory(
         if matched_file:
             matched_tracks.append({
                 "expected": exp_title,
+                "expected_index": expected_index,
                 "matched_file": matched_file.base_filename,
                 "full_filename": matched_file.full_filename,
                 "size": matched_file.size

@@ -2,6 +2,7 @@
 Robust Python client for interacting with slskd's REST API (v0).
 """
 
+import logging
 import os
 import re
 import time
@@ -15,6 +16,7 @@ import requests
 
 from discogseek.config import Config
 from discogseek.clients.http import create_resilient_session
+from discogseek.core.transfers import DownloadHistory
 
 MAX_DIRECTORY_CACHE_SIZE: int = 500
 
@@ -22,6 +24,31 @@ MAX_DIRECTORY_CACHE_SIZE: int = 500
 class SlskdAPIError(Exception):
     """Base exception for slskd API errors."""
     pass
+
+
+class SlskdEnqueueError(SlskdAPIError):
+    """A failed submission, retaining any earlier chunks accepted by slskd."""
+
+    def __init__(self, message: str, queued_files: Optional[List[Dict[str, Any]]] = None):
+        super().__init__(message)
+        self.queued_files = list(queued_files or [])
+
+
+class SlskdPeerUnavailableError(SlskdEnqueueError):
+    """slskd could not contact a peer; another source may still work."""
+
+    def __init__(
+        self, username: str, reason: str,
+        queued_files: Optional[List[Dict[str, Any]]] = None,
+    ):
+        self.username = username
+        self.reason = reason
+        detail = "is offline" if reason == "offline" else "could not be reached after 3 attempts"
+        super().__init__(f"Soulseek user {username} {detail}.", queued_files)
+
+
+class SlskdTransferFailedError(SlskdEnqueueError):
+    """A previously failed file must be obtained from another source."""
 
 
 class SlskdClient:
@@ -425,7 +452,11 @@ class SlskdClient:
         return results
 
     def enqueue_download(self, username: str, files: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Enqueues files from a peer for download."""
+        """Enqueue files, retrying explicit peer connection failures up to 3 times.
+
+        Offline peers fail immediately. Other POST failures are not replayed: an
+        unknown server/transport error may occur after a submission was accepted.
+        """
         if not files:
             return {"status": "skipped", "count": 0}
 
@@ -444,11 +475,37 @@ class SlskdClient:
             return {"status": "skipped", "count": 0}
 
         chunk_size = 50
+        queued_files = []
         for i in range(0, len(payload), chunk_size):
             chunk = payload[i:i + chunk_size]
-            resp = self._request("POST", f"/api/v0/transfers/downloads/{encoded_user}", json=chunk, timeout=30.0)
-            if resp.status_code not in (200, 201, 202):
-                raise SlskdAPIError(f"Failed to enqueue download from {clean_user} (HTTP {resp.status_code}): {resp.text}")
+            for attempt in range(3):
+                try:
+                    resp = self._request("POST", f"/api/v0/transfers/downloads/{encoded_user}", json=chunk, timeout=30.0)
+                except SlskdAPIError as error:
+                    raise SlskdEnqueueError(str(error), queued_files) from error
+                if resp.status_code in (200, 201, 202):
+                    queued_files.extend(chunk)
+                    break
+
+                message = resp.text.casefold()
+                if 500 <= resp.status_code < 600:
+                    if "appears to be offline" in message:
+                        raise SlskdPeerUnavailableError(clean_user, "offline", queued_files)
+                    if ("failed to connect to user" in message
+                            or "failed to establish a direct or indirect message connection" in message):
+                        if attempt == 2:
+                            raise SlskdPeerUnavailableError(clean_user, "unreachable", queued_files)
+                        delay = 2 ** attempt
+                        logging.getLogger(__name__).info(
+                            "Cannot reach Soulseek user %s; retrying in %ss (attempt %s/3)…",
+                            clean_user, delay, attempt + 2,
+                        )
+                        time.sleep(delay)
+                        continue
+                raise SlskdEnqueueError(
+                    f"Failed to enqueue download from {clean_user} (HTTP {resp.status_code}): {resp.text}",
+                    queued_files,
+                )
 
         return {"status": "enqueued", "username": clean_user, "files_count": len(payload)}
 
@@ -459,41 +516,37 @@ class SlskdClient:
             raise SlskdAPIError(f"Failed to get downloads (HTTP {resp.status_code}): {resp.text}")
         return resp.json()
 
+    def cancel_download(self, username: str, transfer_id: str) -> None:
+        """Stop a failed transfer's retries, retaining its record in slskd."""
+        user = urllib.parse.quote(username, safe="")
+        identity = urllib.parse.quote(str(transfer_id), safe="")
+        resp = self._request("DELETE", f"/api/v0/transfers/downloads/{user}/{identity}", params={"remove": "false"})
+        if resp.status_code not in (200, 204):
+            raise SlskdAPIError(
+                f"Could not stop retries for {username} (HTTP {resp.status_code}): {resp.text}. "
+                "No replacement was submitted."
+            )
+
     def get_queued_filenames(self) -> Set[str]:
-        """Returns a set of all currently active, queued, or completed filenames in slskd."""
-        downloads = self.get_downloads()
-        queued: Set[str] = set()
-        for user_transfers in downloads:
-            for d in user_transfers.get("directories", []):
-                for f in d.get("files", []):
-                    fn = f.get("filename")
-                    if fn:
-                        queued.add(fn)
-        return queued
+        """Return active, successful, or unknown transfers, excluding terminal failures."""
+        return DownloadHistory(self.get_downloads()).queued_filenames
 
     def get_queued_track_fingerprints(self) -> Dict[str, Set[str]]:
-        """Returns fingerprint sets of active, queued, and completed downloads."""
-        downloads = self.get_downloads()
-        full_paths: Set[str] = set()
+        """Return fingerprints that protect healthy transfers from duplicate downloads."""
+        full_paths = self.get_queued_filenames()
         base_filenames: Set[str] = set()
         clean_titles: Set[str] = set()
 
-        for user_transfers in downloads:
-            for d in user_transfers.get("directories", []):
-                for f in d.get("files", []):
-                    fn = f.get("filename")
-                    if not fn:
-                        continue
-                    full_paths.add(fn)
-                    clean_p = fn.replace("/", "\\").split("\\")[-1]
-                    if clean_p:
-                        base_filenames.add(clean_p.lower())
-                        no_ext = os.path.splitext(clean_p)[0]
-                        clean_t = re.sub(r"^(\d+[\-_.]|\d+[\-_.]\d+|\d+)\s*[-_.]*\s*", "", no_ext).strip().lower()
-                        if " - " in clean_t:
-                            clean_t = clean_t.split(" - ", 1)[1].strip()
-                        if clean_t:
-                            clean_titles.add(clean_t)
+        for fn in full_paths:
+            clean_p = fn.replace("/", "\\").split("\\")[-1]
+            if clean_p:
+                base_filenames.add(clean_p.lower())
+                no_ext = os.path.splitext(clean_p)[0]
+                clean_t = re.sub(r"^(\d+[\-_.]|\d+[\-_.]\d+|\d+)\s*[-_.]*\s*", "", no_ext).strip().lower()
+                if " - " in clean_t:
+                    clean_t = clean_t.split(" - ", 1)[1].strip()
+                if clean_t:
+                    clean_titles.add(clean_t)
 
         return {
             "full_paths": full_paths,

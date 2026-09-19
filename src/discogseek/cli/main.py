@@ -172,6 +172,8 @@ def _download(args):
                    for f in directory["all_dir_files"]]
         matches += [t["file"] for t in result.get("verified_compilation_tracks", [])
                     + result.get("verified_standalone_tracks", [])]
+        if not args.dry_run and "queued_files" in result:
+            matches = result["queued_files"]
     if args.export_json:
         _write_json(result, args.export_json)
     if args.export_json != "-":

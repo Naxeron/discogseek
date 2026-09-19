@@ -78,6 +78,7 @@ def test_directory_evaluation_keeps_partial_coverage_and_supporting_files():
     assert result["total_score"] == 190
     assert result["matched_tracks"] == [{
         "expected": "Deep Signal",
+        "expected_index": 0,
         "matched_file": "Deep Signal.flac",
         "full_filename": "Atlas\\Archive\\Deep Signal.flac",
         "size": 1000,

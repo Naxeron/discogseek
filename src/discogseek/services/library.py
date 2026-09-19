@@ -6,7 +6,7 @@ here for compatibility with existing callers.
 """
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from discogseek.clients.musicbrainz import ArtistCatalog, MusicBrainzClient
 from discogseek.clients.slskd import SlskdClient
@@ -146,6 +146,7 @@ class LibraryReleaseService:
         dry_run: bool = False,
         on_progress: Optional[Callable[[int, int, str], None]] = None,
         search_scope: str = "release",
+        excluded_sources: Optional[Set[Tuple[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Find requested missing tracks, starting with a release or selected-track search."""
         return library_download.download_missing_tracks(
@@ -159,6 +160,7 @@ class LibraryReleaseService:
             dry_run=dry_run,
             on_progress=on_progress,
             search_scope=search_scope,
+            excluded_sources=excluded_sources,
         )
 
     def download_single_missing_track(
@@ -171,6 +173,7 @@ class LibraryReleaseService:
         preferred_format: str = "flac",
         search_timeout: float = 28.0,
         dry_run: bool = False,
+        excluded_sources: Optional[Set[Tuple[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Resolve a missing track's title, search Soulseek, and queue a match."""
         return library_download.download_single_missing_track(
@@ -184,4 +187,5 @@ class LibraryReleaseService:
             preferred_format=preferred_format,
             search_timeout=search_timeout,
             dry_run=dry_run,
+            excluded_sources=excluded_sources,
         )

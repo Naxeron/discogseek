@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from discogseek.clients.slskd import SlskdAPIError, SlskdPeerUnavailableError
 from discogseek.services.library import LibraryReleaseService
 from discogseek.services.library_download import download_missing_tracks
 
@@ -354,6 +355,101 @@ def test_download_missing_tracks_reports_successful_rows_after_enqueue_failure()
     assert client.enqueue_download.call_args.args[1][0]["title"] == "Ageispolis"
 
 
+@pytest.mark.parametrize("search_scope", ["release", "track"])
+@pytest.mark.parametrize("reason", ["offline", "unreachable"])
+def test_unavailable_peer_falls_back_without_duplicate_matches(search_scope, reason):
+    client = MagicMock()
+    tracks = [{"title": "Pulsewidth", "track_number": 3}, {"title": "Ageispolis", "track_number": 4}]
+    responses = [{
+        "username": user,
+        "files": [{"filename": f"Artist/Album/{track['track_number']:02d} {track['title']}.{extension}"}
+                  for track in tracks],
+    } for user, extension in [("offline-peer", "flac"), ("available-peer", "mp3")]]
+    client.search.return_value = {"responses": responses}
+    client.batch_search.side_effect = lambda queries, **kwargs: {
+        query: {"responses": responses} for query in queries
+    }
+
+    def enqueue(user, files):
+        if user == "offline-peer":
+            raise SlskdPeerUnavailableError(user, reason)
+        return {"status": "enqueued"}
+
+    client.enqueue_download.side_effect = enqueue
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", tracks,
+                                     search_scope=search_scope)
+
+    attempted_users = [call.args[0] for call in client.enqueue_download.call_args_list]
+    assert attempted_users.count("offline-peer") == 1
+    assert result["matched_count"] == result["queued_count"] == result["resolved_count"] == 2
+    assert result["matched_tracks"] == result["queued_tracks"] == tracks
+    assert {file["user"] for file in result["queued_files"]} == {"available-peer"}
+    assert result["queue_errors"] == []
+
+
+def test_unavailable_peer_preserves_successful_chunks_and_falls_back_for_unsent_tracks():
+    client = MagicMock()
+    tracks = [{"title": "Introduction", "track_number": number} for number in range(1, 102)]
+    files = [{"filename": f"Artist/Album/{number:03d} Introduction.flac"} for number in range(1, 102)]
+    client.search.return_value = {"responses": [
+        {"username": "a-unavailable", "files": files},
+        {"username": "b-available", "files": files},
+    ]}
+    attempts = []
+
+    def enqueue(user, chunk):
+        attempts.append((user, chunk))
+        if user == "a-unavailable" and len(attempts) == 2:
+            raise SlskdPeerUnavailableError(user, "unreachable")
+        return {"status": "enqueued"}
+
+    client.enqueue_download.side_effect = enqueue
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", tracks)
+
+    assert [(user, len(chunk)) for user, chunk in attempts] == [
+        ("a-unavailable", 50), ("a-unavailable", 50), ("b-available", 50), ("b-available", 1),
+    ]
+    assert [file["track_number"] for file in result["queued_files"]] == list(range(1, 102))
+    assert result["queued_tracks"] == result["matched_tracks"] == tracks
+    assert result["matched_count"] == result["queued_count"] == 101
+    assert result["queue_errors"] == []
+
+
+def test_unavailable_peer_errors_only_include_tracks_without_successful_fallback():
+    client = MagicMock()
+    tracks = [{"title": "Pulsewidth", "track_number": 3}, {"title": "Ageispolis", "track_number": 4}]
+    responses = [
+        {"username": "offline-peer", "files": [
+            {"filename": "Artist/Album/03 Pulsewidth.flac"},
+            {"filename": "Artist/Album/04 Ageispolis.flac"},
+        ]},
+        {"username": "available-peer", "files": [{"filename": "Artist/Album/03 Pulsewidth.mp3"}]},
+    ]
+    client.search.return_value = {"responses": responses}
+    client.batch_search.side_effect = lambda queries, **kwargs: {
+        query: {"responses": responses} for query in queries
+    }
+    failure = SlskdPeerUnavailableError("offline-peer", "offline")
+
+    def enqueue(user, files):
+        if user == "offline-peer":
+            raise failure
+        return {"status": "enqueued"}
+
+    client.enqueue_download.side_effect = enqueue
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", tracks)
+
+    assert [call.args[0] for call in client.enqueue_download.call_args_list] == [
+        "offline-peer", "available-peer",
+    ]
+    assert result["queued_tracks"] == [tracks[0]]
+    assert result["matched_tracks"] == tracks
+    assert result["queue_errors"] == [{"user": "offline-peer", "error": str(failure), "tracks": [tracks[1]]}]
+
+
 def test_download_missing_tracks_retains_successes_when_individual_search_fails():
     client = MagicMock()
     tracks = [{"title": "Pulsewidth", "track_number": 3}, {"title": "Ageispolis", "track_number": 4}]
@@ -659,3 +755,256 @@ def test_selected_track_progress_reports_match_even_when_queue_fails():
     assert events[0] == (0, 1, "Track search round 1: Artist First Song…")
     assert events[-1] == (1, 1, "Completed: Queued 0 missing track files.")
     assert result["matched_count"] == 1 and result["queued_count"] == 0
+
+
+def failed_download_history(user, filename, state="Completed, Rejected", transfer_id="old-transfer"):
+    return [{"username": user, "directories": [{"files": [{
+        "id": transfer_id, "filename": filename, "state": state,
+    }]}]}]
+
+
+@pytest.mark.parametrize("search_scope", ["release", "track"])
+@pytest.mark.parametrize("state", ["Completed, Rejected", "Completed, TimedOut", "Completed, Errored"])
+def test_failed_download_source_is_canceled_before_queueing_alternative(search_scope, state):
+    client = MagicMock()
+    track = {"title": "Pulsewidth", "track_number": 3}
+    filename = "Artist/Album/03 Pulsewidth.flac"
+    client.get_downloads.return_value = failed_download_history("a-failed", filename, state)
+    responses = [
+        {"username": "a-failed", "files": [{"filename": filename}]},
+        {"username": "b-available", "files": [{"filename": filename}]},
+    ]
+    client.search.return_value = {"responses": responses}
+    client.batch_search.side_effect = lambda queries, **kwargs: {
+        query: {"responses": responses} for query in queries
+    }
+    operations = []
+    client.cancel_download.side_effect = lambda *args: operations.append(("cancel", args))
+    client.enqueue_download.side_effect = lambda user, files: operations.append(("enqueue", user))
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", [track],
+                                     search_scope=search_scope)
+
+    assert operations == [("cancel", ("a-failed", "old-transfer")), ("enqueue", "b-available")]
+    assert result["matched_tracks"] == result["queued_tracks"] == [track]
+    assert result["matched_count"] == result["queued_count"] == result["resolved_count"] == 1
+    assert result["queue_errors"] == []
+    client.get_downloads.assert_called_once_with()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_only_failed_source_reports_reason_without_retrying_or_canceling(dry_run):
+    client = MagicMock()
+    track = {"title": "Pulsewidth", "track_number": 3}
+    filename = "Artist/Album/03 Pulsewidth.flac"
+    client.get_downloads.return_value = failed_download_history("peer", filename)
+    responses = [{"username": "peer", "files": [{"filename": filename}]}]
+    client.search.return_value = {"responses": responses}
+    client.batch_search.side_effect = lambda queries, **kwargs: {
+        query: {"responses": responses} for query in queries
+    }
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", [track], dry_run=dry_run)
+
+    assert result["matched_count"] == result["queued_count"] == 0
+    assert len(result["queue_errors"]) == 1
+    assert result["queue_errors"][0]["tracks"] == [track]
+    assert "rejected" in result["queue_errors"][0]["error"].lower()
+    assert "alternative" in result["queue_errors"][0]["error"].lower()
+    client.enqueue_download.assert_not_called()
+    client.cancel_download.assert_not_called()
+
+
+def test_dry_run_finds_alternative_without_canceling_failed_download():
+    client = MagicMock()
+    filename = "Artist/Album/03 Pulsewidth.flac"
+    client.get_downloads.return_value = failed_download_history("a-failed", filename)
+    client.search.return_value = {"responses": [
+        {"username": user, "files": [{"filename": filename}]} for user in ["a-failed", "b-available"]
+    ]}
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album",
+                                     [{"title": "Pulsewidth", "track_number": 3}], dry_run=True)
+
+    assert result["matched_count"] == 1
+    assert result["queued_count"] == 0
+    assert result["queued_files"][0]["user"] == "b-available"
+    assert result["queue_errors"] == []
+    client.enqueue_download.assert_not_called()
+    client.cancel_download.assert_not_called()
+
+
+def test_failed_source_does_not_exclude_other_files_from_same_peer():
+    client = MagicMock()
+    tracks = [{"title": "Pulsewidth", "track_number": 3}, {"title": "Ageispolis", "track_number": 4}]
+    failed_filename = "Artist/Album/03 Pulsewidth.flac"
+    client.get_downloads.return_value = failed_download_history("peer", failed_filename)
+    client.search.return_value = {"responses": [{"username": "peer", "files": [
+        {"filename": failed_filename},
+        {"filename": "Artist/Album/04 Ageispolis.flac"},
+        {"filename": "Artist/Alternate Album/03 Pulsewidth.flac"},
+    ]}]}
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", tracks)
+
+    assert result["queued_count"] == 2
+    assert all(file["filename"] != failed_filename for file in result["queued_files"])
+    assert {file["user"] for file in result["queued_files"]} == {"peer"}
+    assert result["queue_errors"] == []
+    client.cancel_download.assert_called_once_with("peer", "old-transfer")
+
+
+def test_unrelated_failed_download_is_not_canceled():
+    client = MagicMock()
+    failed_filename = "Artist/Album/04 Ageispolis.flac"
+    client.get_downloads.return_value = failed_download_history("peer", failed_filename)
+    client.search.return_value = {"responses": [{"username": "peer", "files": [
+        {"filename": "Artist/Album/03 Pulsewidth.flac"}, {"filename": failed_filename},
+    ]}]}
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album",
+                                     [{"title": "Pulsewidth", "track_number": 3}])
+
+    assert result["queued_count"] == 1
+    assert result["queue_errors"] == []
+    client.cancel_download.assert_not_called()
+
+
+def test_failed_source_cancellation_error_prevents_alternative_enqueue():
+    client = MagicMock()
+    track = {"title": "Pulsewidth", "track_number": 3}
+    filename = "Artist/Album/03 Pulsewidth.flac"
+    client.get_downloads.return_value = failed_download_history("a-failed", filename)
+    client.search.return_value = {"responses": [
+        {"username": user, "files": [{"filename": filename}]} for user in ["a-failed", "b-available"]
+    ]}
+    client.cancel_download.side_effect = SlskdAPIError("Cannot cancel transfer")
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", [track])
+
+    assert result["queued_count"] == 0
+    assert result["queue_errors"][0]["tracks"] == [track]
+    assert "cancel" in result["queue_errors"][0]["error"].lower()
+    client.enqueue_download.assert_not_called()
+
+
+def test_library_history_read_failure_stops_search_and_enqueue():
+    client = MagicMock()
+    client.get_downloads.side_effect = SlskdAPIError("history unavailable")
+
+    with pytest.raises(SlskdAPIError, match="history unavailable"):
+        download_missing_tracks(client, MagicMock(), "Artist", "Album", [{"title": "Pulsewidth"}])
+
+    client.search.assert_not_called()
+    client.enqueue_download.assert_not_called()
+
+
+def test_library_wrapper_forwards_previously_excluded_source():
+    client = MagicMock()
+    filename = "Artist/Album/03 Pulsewidth.flac"
+    client.get_downloads.return_value = []
+    client.search.return_value = {"responses": [
+        {"username": user, "files": [{"filename": filename}]} for user in ["a-failed", "b-available"]
+    ]}
+    service = LibraryReleaseService(mb_client=MagicMock(), slskd_client=client)
+
+    result = service.download_single_missing_track(
+        "Artist", "Album", "Pulsewidth", track_number=3,
+        excluded_sources={("a-failed", filename)},
+    )
+
+    assert result["success"] is True
+    assert result["user"] == "b-available"
+    client.cancel_download.assert_not_called()
+
+
+@pytest.mark.parametrize("search_scope", ["release", "track"])
+def test_lower_ranked_failed_source_is_canceled_before_better_match(search_scope):
+    client = MagicMock()
+    failed_filename = "Artist/Album/03 Pulsewidth.mp3"
+    client.get_downloads.return_value = failed_download_history("peer", failed_filename)
+    client.search.return_value = {"responses": [{"username": "peer", "files": [
+        {"filename": "Artist/Album/03 Pulsewidth.flac"}, {"filename": failed_filename},
+    ]}]}
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album",
+                                     [{"title": "Pulsewidth", "track_number": 3}], search_scope=search_scope)
+
+    assert result["queued_count"] == 1
+    assert result["queued_files"][0]["filename"].endswith(".flac")
+    client.cancel_download.assert_called_once_with("peer", "old-transfer")
+
+
+def test_history_errors_only_describe_sources_for_unrecovered_tracks():
+    client = MagicMock()
+    tracks = [{"title": "Pulsewidth", "track_number": 3}, {"title": "Ageispolis", "track_number": 4}]
+    first_filename = "Artist/Album/03 Pulsewidth.flac"
+    second_filename = "Artist/Album/04 Ageispolis.flac"
+    client.get_downloads.return_value = (
+        failed_download_history("a-recovered", first_filename)
+        + failed_download_history("b-unrecovered", second_filename, "Completed, TimedOut", "second-transfer")
+    )
+    responses = [
+        {"username": "a-recovered", "files": [{"filename": first_filename}]},
+        {"username": "b-unrecovered", "files": [{"filename": second_filename}]},
+        {"username": "c-available", "files": [{"filename": first_filename}]},
+    ]
+    client.search.return_value = {"responses": responses}
+    client.batch_search.side_effect = lambda queries, **kwargs: {
+        query: {"responses": responses} for query in queries
+    }
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", tracks)
+
+    assert result["queued_tracks"] == [tracks[0]]
+    assert len(result["queue_errors"]) == 1
+    assert result["queue_errors"][0]["tracks"] == [tracks[1]]
+    assert "b-unrecovered" in result["queue_errors"][0]["error"]
+    assert "a-recovered" not in result["queue_errors"][0]["error"]
+
+
+@pytest.mark.parametrize("search_scope", ["release", "track"])
+@pytest.mark.parametrize("state", ["Queued, Remotely", "InProgress", "Completed, Succeeded", "Unknown"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_existing_healthy_download_prevents_preferred_alternative_duplicate(search_scope, state, dry_run):
+    client = MagicMock()
+    track = {"title": "Pulsewidth", "track_number": 3}
+    filename = "Artist/Album/03 Pulsewidth.mp3"
+    history = failed_download_history("z-existing", filename, state)
+    history[0]["directories"][0]["files"][0].update({
+        "attempts": 100, "nextAttemptAt": "2099-01-01T00:00:00Z",
+    })
+    client.get_downloads.return_value = history
+    client.search.return_value = {"responses": [
+        {"username": "a-better", "files": [{"filename": "Artist/Album/03 Pulsewidth.flac"}]},
+        {"username": "z-existing", "files": [{"filename": filename}]},
+    ]}
+
+    result = download_missing_tracks(
+        client, MagicMock(), "Artist", "Album", [track], search_scope=search_scope, dry_run=dry_run,
+        excluded_sources={("z-existing", filename)},
+    )
+
+    assert result["matched_count"] == result["resolved_count"] == 1
+    assert result["queued_count"] == (0 if dry_run else 1)
+    assert result["queued_tracks"] == ([] if dry_run else [track])
+    assert result["queued_files"][0]["user"] == "z-existing"
+    assert result["queue_errors"] == []
+    client.enqueue_download.assert_not_called()
+    client.cancel_download.assert_not_called()
+
+
+def test_same_directory_healthy_file_has_precedence_over_new_preferred_format():
+    client = MagicMock()
+    filename = "Artist/Album/03 Pulsewidth.mp3"
+    client.get_downloads.return_value = failed_download_history("peer", filename, "Queued, Remotely")
+    client.search.return_value = {"responses": [{"username": "peer", "files": [
+        {"filename": "Artist/Album/03 Pulsewidth.flac"}, {"filename": filename},
+    ]}]}
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album",
+                                     [{"title": "Pulsewidth", "track_number": 3}])
+
+    assert result["queued_count"] == 1
+    assert result["queued_files"][0]["filename"] == filename
+    client.enqueue_download.assert_not_called()

@@ -18,7 +18,10 @@ from discogseek.core.text import (
     clean_search_phrase,
     extract_dir_and_filename,
 )
-from discogseek.clients.slskd import SlskdClient
+from discogseek.clients.slskd import (
+    SlskdClient, SlskdEnqueueError, SlskdPeerUnavailableError, SlskdTransferFailedError,
+)
+from discogseek.core.transfers import DownloadHistory, source_key
 from discogseek.clients.musicbrainz import MusicBrainzClient, ArtistCatalog
 from discogseek.services.auditor import AuditorService
 from discogseek.services.candidates import (
@@ -27,6 +30,7 @@ from discogseek.services.candidates import (
     PeerCandidateIndex,
     evaluate_directory,
     find_best_track_candidate,
+    find_track_candidates,
     is_dir_name_match_fast,
     is_track_title_match_fast,
     pre_parse_expected_tracks,
@@ -75,6 +79,7 @@ class SlskdArtistScraper:
         self.full_scan = full_scan
         self.force_refresh = force_refresh
         self.enqueued_count = 0
+        self.enqueued_files: List[Dict[str, Any]] = []
         self.queue_errors: List[str] = []
 
         self.mb_client = MusicBrainzClient()
@@ -93,6 +98,7 @@ class SlskdArtistScraper:
         self.covered_track_titles: Set[str] = set()
 
         self.queued_directories: List[Dict[str, Any]] = []
+        self._release_candidates: Dict[str, List[Dict[str, Any]]] = {}
         self.already_downloading_files: Set[str] = set()
         self.verified_releases: List[Dict[str, Any]] = []
         self.unresolved_releases: List[Dict[str, Any]] = []
@@ -158,6 +164,7 @@ class SlskdArtistScraper:
             "unresolved_compilation_tracks": self.unresolved_compilation_tracks,
             "unresolved_standalone_tracks": self.unresolved_standalone_tracks,
             "enqueued_count": self.enqueued_count,
+            "queued_files": self.enqueued_files,
             "queue_errors": self.queue_errors,
             "dry_run": self.dry_run,
         }
@@ -406,16 +413,20 @@ class SlskdArtistScraper:
                     pass
 
             if candidate_matches:
-                best = max(candidate_matches, key=lambda x: x["total_score"])
-                missing_filenames = {
-                    m["full_filename"] for m in best["matched_tracks"]
-                    if normalize_text(m["expected"]) not in self.local_found_map
-                }
-                best["all_dir_files"] = [
-                    f for f in best["all_dir_files"] if f.get("filename") in missing_filenames
-                ]
+                candidate_matches.sort(key=lambda x: x["total_score"], reverse=True)
+                for candidate in candidate_matches:
+                    missing_filenames = {
+                        m["full_filename"] for m in candidate["matched_tracks"]
+                        if normalize_text(m["expected"]) not in self.local_found_map
+                    }
+                    candidate["all_dir_files"] = [
+                        f for f in candidate["all_dir_files"] if f.get("filename") in missing_filenames
+                    ]
+                    candidate["release"] = rel_title
+                best = candidate_matches[0]
                 if not best["all_dir_files"]:
                     continue
+                self._release_candidates[norm_rel] = candidate_matches
                 self.verified_releases.append({
                     "release": rel_title,
                     "user": best["user"],
@@ -526,60 +537,173 @@ class SlskdArtistScraper:
             logging.getLogger(__name__).info("No releases or tracks to enqueue.")
             return
 
-        try:
-            self.already_downloading_files = self.client.get_queued_filenames()
-            queued_fps = self.client.get_queued_track_fingerprints()
-        except Exception:
-            queued_fps = {"base_filenames": set(), "clean_titles": set(), "full_paths": set()}
+        history = DownloadHistory(self.client.get_downloads())
+        self.already_downloading_files = history.queued_filenames
+        queued_fps = {"base_filenames": history.queued_base_filenames}
 
-        if self.queued_directories:
-            logging.getLogger(__name__).info(f"\nEnqueuing {len(self.queued_directories)} verified releases into slskd...")
-            for d in self.queued_directories:
-                try:
-                    files_to_download = []
-                    for f in d["all_dir_files"]:
-                        fn = f.get("filename", "")
-                        if not fn:
-                            continue
-                        clean_p = fn.replace("/", "\\").split("\\")[-1].lower()
-                        if fn in self.already_downloading_files or clean_p in queued_fps["base_filenames"]:
-                            continue
+        logger = logging.getLogger(__name__)
+        self.queue_errors.clear()
+        unavailable: Dict[str, SlskdPeerUnavailableError] = {}
+        unresolved_peers: Dict[str, Tuple[Exception, List[Dict[str, Any]]]] = {}
 
-                        files_to_download.append(f)
-                        self.already_downloading_files.add(fn)
-                        queued_fps["base_filenames"].add(clean_p)
+        def basename(filename: str) -> str:
+            return filename.replace("/", "\\").split("\\")[-1].lower()
 
-                    if not files_to_download:
-                        logging.getLogger(__name__).info(f"↷ Skipping already queued folder: {d['directory']} from {d['user']}")
+        def is_queued(filename: str) -> bool:
+            return filename in self.already_downloading_files or basename(filename) in queued_fps["base_filenames"]
+
+        def remember(user: str, files: List[Dict[str, Any]]) -> None:
+            for file in files:
+                filename = file["filename"]
+                self.already_downloading_files.add(filename)
+                queued_fps["base_filenames"].add(basename(filename))
+            self.enqueued_count += len(files)
+            self.enqueued_files.extend({**file, "user": user} for file in files)
+
+        def queue_files(user: str, files: List[Dict[str, Any]]) -> Tuple[Set[str], Optional[Exception]]:
+            pending = []
+            seen = set()
+            excluded = set()
+            for file in files:
+                filename = file.get("filename", "")
+                if filename and not is_queued(filename) and basename(filename) not in seen:
+                    if history.excludes(user, filename):
+                        excluded.add(source_key(user, filename))
                         continue
+                    pending.append(file)
+                    seen.add(basename(filename))
+            error = SlskdTransferFailedError(history.failure_summary(excluded)) if excluded else None
+            if pending:
+                if user in unavailable:
+                    error = unavailable[user]
+                else:
+                    try:
+                        history.prepare_recovery(self.client)
+                        self.client.enqueue_download(user, pending)
+                    except Exception as exc:
+                        error = exc
+                        if isinstance(exc, SlskdEnqueueError):
+                            remember(user, exc.queued_files)
+                        if isinstance(exc, SlskdPeerUnavailableError):
+                            unavailable[user] = exc
+                            logger.info("%s Skipping this peer for the rest of this queue pass; trying other matches.", exc)
+                    else:
+                        remember(user, pending)
+                        logger.info("✔ Enqueued %s files from %s", len(pending), user)
+            return {f["filename"] for f in files if f.get("filename") and is_queued(f["filename"])}, error
 
-                    self.client.enqueue_download(d["user"], files_to_download)
-                    self.enqueued_count += len(files_to_download)
-                    logging.getLogger(__name__).info(f"✔ Enqueued folder: {d['directory']} from {d['user']} ({len(files_to_download)} files)")
-                except Exception as e:
-                    self.queue_errors.append(f"Failed to enqueue {d['directory']}: {e}")
+        def record_unavailable(error: Exception, files: List[Dict[str, Any]]) -> None:
+            identity = getattr(error, "username", str(error))
+            _, pending = unresolved_peers.setdefault(identity, (error, []))
+            pending.extend(files)
 
-        # Enqueue individual standalone / compilation tracks
+        def file_targets(directory: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                match["full_filename"]: match.get("expected_index", normalize_text(match["expected"]))
+                for match in directory.get("matched_tracks", [])
+            }
+
+        for directory in self.queued_directories:
+            targets = file_targets(directory)
+            remaining = {
+                targets.get(file["filename"], file["filename"])
+                for file in directory["all_dir_files"] if file.get("filename")
+            }
+            candidates = self._release_candidates.get(normalize_text(directory.get("release", "")), [directory])
+            protected_targets = set()
+            for candidate in candidates:
+                targets = file_targets(candidate)
+                for file in candidate["all_dir_files"]:
+                    filename = file.get("filename", "")
+                    target = targets.get(filename, filename)
+                    if not filename or target not in remaining:
+                        continue
+                    if is_queued(filename):
+                        protected_targets.add(target)
+                    else:
+                        history.excludes(candidate["user"], filename)
+            remaining.difference_update(protected_targets)
+            peer_error = None
+            for candidate in candidates:
+                if not remaining:
+                    break
+                targets = file_targets(candidate)
+                files = [
+                    file for file in candidate["all_dir_files"]
+                    if file.get("filename") and targets.get(file["filename"], file["filename"]) in remaining
+                ]
+                if not files:
+                    continue
+                done, error = queue_files(candidate["user"], files)
+                remaining.difference_update(targets.get(filename, filename) for filename in done)
+                if isinstance(error, (SlskdPeerUnavailableError, SlskdTransferFailedError)):
+                    peer_error = error
+                elif error is not None:
+                    self.queue_errors.append(f"Failed to enqueue {candidate['directory']}: {error}")
+                    peer_error = None
+                    break
+            if remaining and peer_error is not None:
+                targets = file_targets(directory)
+                record_unavailable(peer_error, [
+                    file for file in directory["all_dir_files"]
+                    if file.get("filename") and targets.get(file["filename"], file["filename"]) in remaining
+                ])
+
+        # Keep each user's initial submission batched, then try other sources only
+        # for tracks refused because that peer was unavailable.
         single_tracks_by_user: Dict[str, List[Dict[str, Any]]] = {}
         for item in self.verified_compilation_tracks + self.verified_standalone_tracks:
-            u = item["user"]
-            f = item["file"]
-            fn = f.get("filename", "")
-            if not fn:
-                continue
-            clean_p = fn.replace("/", "\\").split("\\")[-1].lower()
-            if fn in self.already_downloading_files or clean_p in queued_fps["base_filenames"]:
-                continue
-            if u not in single_tracks_by_user:
-                single_tracks_by_user[u] = []
-            single_tracks_by_user[u].append(f)
-            self.already_downloading_files.add(fn)
-            queued_fps["base_filenames"].add(clean_p)
+            if self.candidate_index is None:
+                self.candidate_index = PeerCandidateIndex(self.peer_directories)
+            for candidate in find_track_candidates(
+                self.candidate_index, item["track"], self.all_artist_aliases, item.get("release", ""),
+            ):
+                if history.is_protected(candidate.user, candidate.full_filename):
+                    item.update(user=candidate.user, format_label=candidate.fmt_label,
+                                file={**candidate.raw_file, "filename": candidate.full_filename})
+                    break
+                history.excludes(candidate.user, candidate.full_filename)
+            single_tracks_by_user.setdefault(item["user"], []).append(item)
 
-        for u, files in single_tracks_by_user.items():
-            try:
-                self.client.enqueue_download(u, files)
-                self.enqueued_count += len(files)
-                logging.getLogger(__name__).info(f"✔ Enqueued {len(files)} standalone/compilation tracks from {u}")
-            except Exception as e:
-                self.queue_errors.append(f"Failed to enqueue tracks from {u}: {e}")
+        for user, items in single_tracks_by_user.items():
+            done, error = queue_files(user, [item["file"] for item in items])
+            if error is None:
+                continue
+            if not isinstance(error, (SlskdPeerUnavailableError, SlskdTransferFailedError)):
+                self.queue_errors.append(f"Failed to enqueue tracks from {user}: {error}")
+                continue
+            if self.candidate_index is None:
+                self.candidate_index = PeerCandidateIndex(self.peer_directories)
+            for item in items:
+                if item["file"].get("filename") in done:
+                    continue
+                peer_error = error
+                while True:
+                    candidate = find_best_track_candidate(
+                        self.candidate_index, item["track"], self.all_artist_aliases,
+                        self.preferred_format, item.get("release", ""),
+                        excluded_users=set(unavailable),
+                        excluded_sources=history.excluded_sources,
+                    )
+                    if candidate is None:
+                        record_unavailable(peer_error, [item["file"]])
+                        break
+                    file = {**candidate.raw_file, "filename": candidate.full_filename}
+                    accepted, fallback_error = queue_files(candidate.user, [file])
+                    if candidate.full_filename in accepted:
+                        item.update(user=candidate.user, file=file, format_label=candidate.fmt_label)
+                        break
+                    if isinstance(fallback_error, (SlskdPeerUnavailableError, SlskdTransferFailedError)):
+                        peer_error = fallback_error
+                        continue
+                    self.queue_errors.append(f"Failed to enqueue {item['track']}: {fallback_error}")
+                    break
+
+        for error, files in unresolved_peers.values():
+            count = len({basename(file["filename"]) for file in files
+                         if file.get("filename") and not is_queued(file["filename"])})
+            if count:
+                self.queue_errors.append(
+                    f"{error} {count} matched files could not be queued from the available sources. "
+                    "Run the download again later to retry."
+                )

@@ -4,7 +4,6 @@ import copy
 import locale
 import logging
 import queue
-import re
 import sys
 import threading
 import time
@@ -14,12 +13,14 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from discogseek.core.text import normalize_text
+from discogseek.core.transfers import source_key, terminal_failure, transfer_states
 from discogseek.services.library_browser import LibraryBrowserService
 
 
 DOWNLOAD_POLL_INTERVAL = 3.0
 DOWNLOAD_IMPORT_RETRY_INTERVAL = 15.0
-DOWNLOAD_FAILURE_STATES = {"Cancelled", "TimedOut", "Errored", "Rejected", "Aborted"}
+DOWNLOAD_RECOVERY_STATES = {"TimedOut", "Errored", "Rejected"}
+DOWNLOAD_RECOVERY_LIMIT = 2
 
 
 class _ScanStopped(Exception):
@@ -131,7 +132,7 @@ class BrowserModel:
 
 def download_release(service, release, library_dir, queued=(), only_track=None,
                      preferred_format="flac", search_timeout=30.0, dry_run=False,
-                     on_progress=None):
+                     on_progress=None, excluded_sources=None):
     """Recheck both libraries before submitting a selected release's remaining tracks."""
     fresh = service.refresh_release(release, library_dir=library_dir)
     if not fresh.get("is_audited"):
@@ -148,6 +149,7 @@ def download_release(service, release, library_dir, queued=(), only_track=None,
         missing_tracks=pending, preferred_format=preferred_format,
         search_timeout=search_timeout, dry_run=dry_run, on_progress=on_progress,
         search_scope="track" if only_track is not None else "release",
+        **({"excluded_sources": excluded_sources} if excluded_sources else {}),
     )
     return fresh, result
 
@@ -171,6 +173,7 @@ class DownloadRequest:
     release: Dict[str, Any]
     only_track: Any = None
     dry_run: bool = False
+    recovery: bool = False
 
 
 class ReleaseBrowser:
@@ -200,14 +203,31 @@ class ReleaseBrowser:
         # Only the worker touches transfer watches and the service clients.
         self._downloads = {}
         self._submitted_tracks = {}
+        self._failed_sources = {}
+        self._recovery_attempts = {}
+        self._release_aliases = {}
 
     @staticmethod
     def _transfer_key(username, filename):
-        username = re.sub(r"\s*\(.*?\)$", "", username or "").strip()
-        return username, (filename or "").replace("\\", "/")
+        return source_key(username, filename)
+
+    def _download_key(self, key):
+        # A queued job can still contain the pre-audit release identity.
+        seen = set()
+        while key in self._release_aliases and key not in seen:
+            seen.add(key)
+            key = self._release_aliases[key]
+        return key
 
     def _update_download_watch(self, release, old_key=None):
         key = release_key(release)
+        if old_key is not None and old_key != key:
+            self._release_aliases[old_key] = key
+            if old_key in self._failed_sources:
+                self._failed_sources.setdefault(key, set()).update(self._failed_sources.pop(old_key))
+            for track, attempts in self._recovery_attempts.pop(old_key, {}).items():
+                counts = self._recovery_attempts.setdefault(key, {})
+                counts[track] = counts.get(track, 0) + attempts
         if old_key is not None and old_key != key and old_key in self._submitted_tracks:
             self._submitted_tracks.setdefault(key, set()).update(self._submitted_tracks.pop(old_key))
         if old_key is not None and old_key != key and old_key in self._downloads:
@@ -243,6 +263,36 @@ class ReleaseBrowser:
             watch["files"].update(files)
             self._update_download_watch(release)
 
+    def _recover_failed_transfer(self, service, key, watch, source, file):
+        """Stop this session's failed transfer before considering another source."""
+        state = terminal_failure(file)
+        user = file.get("username") or source[0]
+        details = f"{user}: {state}"
+        if file.get("attempts") is not None:
+            details += f" (slskd attempts: {file['attempts']})"
+        if file.get("exception"):
+            details += f" — {clipped(str(file['exception']), 240)}"
+        if state not in DOWNLOAD_RECOVERY_STATES:
+            return details + "; press d or t to retry.", False
+        self._failed_sources.setdefault(key, set()).add(source)
+        if self.stopping.is_set() or self.args.dry_run:
+            return details + "; automatic recovery stopped.", False
+        transfer_id = file.get("id")
+        if not transfer_id:
+            message = details + "; transfer ID unavailable, so automatic recovery cannot stop slskd retries. Press d or t to retry."
+            self.events.put(("recovery_error", message))
+            return message, False
+        try:
+            service.release_service.slskd_client.cancel_download(user, transfer_id)
+        except Exception as exc:
+            message = details + f"; could not stop slskd retries: {exc}. Press d or t to retry."
+            self.events.put(("recovery_error", message))
+            return message, False
+        count = self._recovery_attempts.get(key, {}).get(watch["files"][source], 0)
+        if count >= DOWNLOAD_RECOVERY_LIMIT:
+            return details + f"; automatic recovery stopped after {count} searches. Press d or t to retry.", False
+        return details + f"; trying another source ({count + 1}/{DOWNLOAD_RECOVERY_LIMIT}).", True
+
     def _check_downloads(self, service):
         if not self._downloads or self.stopping.is_set():
             return
@@ -253,7 +303,10 @@ class ReleaseBrowser:
                     for directory in user.get("directories", []):
                         for file in directory.get("files", []):
                             key = self._transfer_key(user.get("username"), file.get("filename"))
-                            transfers[key] = {part.strip() for part in (file.get("state") or "").split(",")}
+                            previous = transfers.get(key)
+                            if previous and not terminal_failure(previous) and terminal_failure(file):
+                                continue
+                            transfers[key] = dict(file, username=user.get("username"))
         except Exception as exc:
             self.events.put(("download_error", f"Download updates: {exc}; retrying automatically."))
             return
@@ -261,18 +314,29 @@ class ReleaseBrowser:
         for key, watch in list(self._downloads.items()):
             if self.stopping.is_set():
                 break
-            completed = {file for file in watch["files"] if "Succeeded" in transfers.get(file, set())}
+            completed = {file for file in watch["files"]
+                         if "Succeeded" in transfer_states(transfers.get(file, {}))}
             newly_completed = completed - watch["completed"]
             watch["completed"].update(completed)
             if newly_completed:
                 self.events.put(("downloaded", (key, {watch["files"][file] for file in newly_completed})))
             failed = {file for file in watch["files"] if file not in watch["completed"]
-                      and "Completed" in transfers.get(file, set())
-                      and DOWNLOAD_FAILURE_STATES.intersection(transfers.get(file, set()))}
+                      and terminal_failure(transfers.get(file, {}))}
             if failed:
+                recover = set()
+                details = []
+                for source in sorted(failed):
+                    message, should_recover = self._recover_failed_transfer(
+                        service, key, watch, source, transfers[source],
+                    )
+                    details.append(message)
+                    if should_recover:
+                        recover.add(watch["files"][source])
                 tracks = {watch["files"].pop(file) for file in failed}
                 self._submitted_tracks.get(key, set()).difference_update(tracks)
-                self.events.put(("failed", (key, tracks)))
+                self.events.put(("failed", (key, tracks, "; ".join(dict.fromkeys(details)))))
+                if recover:
+                    self.events.put(("recover", (copy.deepcopy(watch["release"]), recover)))
                 if not watch["files"]:
                     del self._downloads[key]
                     continue
@@ -347,11 +411,24 @@ class ReleaseBrowser:
                 else:
                     release, queued, only_track, dry_run = payload
                     # A failure poll may have invalidated the UI's queued snapshot.
-                    queued = self._submitted_tracks.get(release_key(release), queued)
+                    key = self._download_key(release_key(release))
+                    queued = self._submitted_tracks.get(key, queued)
+                    attempts = None
+                    if kind == "recover":
+                        if self.stopping.is_set():
+                            continue
+                        counts = self._recovery_attempts.setdefault(key, {})
+                        if counts.get(only_track, 0) >= DOWNLOAD_RECOVERY_LIMIT:
+                            continue
+                        counts[only_track] = counts.get(only_track, 0) + 1
+                        attempts = counts[only_track]
                     fresh, result = download_release(
                         service, release, self.args.music_dir, queued, only_track,
                         self.args.format, self.args.timeout, dry_run, self._download_progress,
+                        excluded_sources=self._failed_sources.get(key),
                     )
+                    if kind == "recover":
+                        result = dict(result, recovery_attempt=attempts)
                     self._update_download_watch(fresh, release_key(release))
                     self._remember_downloads(fresh, result)
                     self.events.put(("result", (release_key(release), fresh, result)))
@@ -397,7 +474,8 @@ class ReleaseBrowser:
         if clear_error:
             self.error = ""
         self.message = {"scan": "Scanning the library and loading saved audits…", "refresh": "Refreshing selected release…",
-                        "download": "Checking the library, then searching for missing tracks…"}[kind]
+                        "download": "Checking the library, then searching for missing tracks…",
+                        "recover": "Checking the library, then searching for another source…"}[kind]
         self.jobs.put((kind, payload))
         return True
 
@@ -421,7 +499,8 @@ class ReleaseBrowser:
                 continue
             request.release = copy.deepcopy(release)
             self.active_download = request
-            self._start("download", (copy.deepcopy(release), set(self.model.queued.get(key, set())),
+            self._start("recover" if request.recovery else "download",
+                        (copy.deepcopy(release), set(self.model.queued.get(key, set())),
                                      request.only_track, request.dry_run), clear_error=False)
             action = "Previewing" if request.dry_run else "Downloading"
             self.message = f"{action} {release['title']}. Checking the library first…"
@@ -448,18 +527,33 @@ class ReleaseBrowser:
                 self.error = data
             elif kind == "download_error":
                 self.download_error = data
+            elif kind == "recovery_error":
+                self.error = data
             elif kind == "downloaded":
                 key, tracks = data
                 self.model.downloaded.setdefault(key, set()).update(tracks)
                 self.message = f"{len(tracks)} download(s) finished. Checking the library automatically…"
             elif kind == "failed":
-                key, tracks = data
+                key, tracks, detail = data
                 for history in (self.model.queued, self.model.matched, self.model.downloaded):
                     history.get(key, set()).difference_update(tracks)
                 release = self.model.releases.get(key, {})
-                self.last_result = (f"{release.get('title', 'Release')}: {len(tracks)} transfer(s) failed; "
-                                    "press d or t to retry.")
+                self.last_result = f"{release.get('title', 'Release')}: {detail}"
                 self.message = self.last_result
+            elif kind == "recover":
+                release, tracks = data
+                if not self.quit_requested:
+                    for track in sorted(tracks):
+                        requests = list(self.pending_downloads)
+                        if self.active_download is not None:
+                            requests.append(self.active_download)
+                        if not any(release_key(request.release) == release_key(release)
+                                   and not request.dry_run
+                                   and (request.only_track is None or request.only_track == track)
+                                   for request in requests):
+                            self.pending_downloads.append(DownloadRequest(
+                                copy.deepcopy(release), track, recovery=True,
+                            ))
             elif kind == "result":
                 old_key, release, result = data
                 if self.scanning:
@@ -470,6 +564,10 @@ class ReleaseBrowser:
                 count = result.get("matched_count", 0) if result.get("dry_run") else result.get("queued_count", 0)
                 action = "matched (preview; nothing queued)" if result.get("dry_run") else "queued in slskd"
                 self.last_result = f"{release['title']}: {count} {action}; {unresolved} unmatched."
+                if result.get("recovery_attempt"):
+                    self.last_result += f" Recovery {result['recovery_attempt']}/{DOWNLOAD_RECOVERY_LIMIT}."
+                    if not count and result.get("total_missing", 0):
+                        self.last_result += " No alternative queued; press d or t to retry."
                 errors = result.get("queue_errors", [])
                 if errors:
                     self.error = "; ".join(e.get("error", str(e)) if isinstance(e, dict) else str(e)
@@ -482,7 +580,7 @@ class ReleaseBrowser:
                         self.busy = False
                     self.message = f"Scan finished: {len(self.model.releases)} releases checked."
                 else:
-                    if data == "download":
+                    if data in ("download", "recover"):
                         self.active_download = None
                     self.busy = self.scanning
                     if self.scanning:

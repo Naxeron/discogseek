@@ -859,6 +859,7 @@ def test_whole_library_scan_to_download_uses_local_and_remote_tracks(tmp_path, m
         search_queries.extend(queries), {query: response for query in queries})[1])
     enqueued = []
     monkeypatch.setattr(SlskdClient, "enqueue_download", lambda self, username, files: enqueued.extend(files))
+    monkeypatch.setattr(SlskdClient, "get_downloads", lambda self: [])
     service = LibraryBrowserService()
 
     rows = list(service.iter_releases(library_dir=tmp_path))
