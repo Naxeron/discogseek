@@ -104,15 +104,19 @@ class SlskdArtistScraper:
     def run(self) -> Dict[str, Any]:
         """Runs the complete Soulseek discography discovery and queueing pipeline."""
         # 1. Check slskd Connection
+        logging.getLogger(__name__).info("Connecting to slskd...")
         app_info = self.client.get_application()
         slsk_user = app_info.get("user", {}).get("username", "Unknown")
         server_state = app_info.get("server", {}).get("state", "Unknown")
         logging.getLogger(__name__).info(f"✔ Connected to slskd (User: {slsk_user} | Server: {server_state})")
 
+        logging.getLogger(__name__).info("Checking existing slskd downloads...")
         self.already_downloading_files = self.client.get_queued_filenames()
 
         # 2. Resolve Artist & Catalog
+        logging.getLogger(__name__).info("Resolving artist on MusicBrainz: %s...", self.artist_query)
         mbid, canonical_name = self.mb_client.resolve_artist_mbid(self.artist_query)
+        logging.getLogger(__name__).info("Loading MusicBrainz discography for %s...", canonical_name)
         self.raw_mb_data = self.mb_client.fetch_full_discography(mbid, force_refresh=self.force_refresh)
         self.catalog = ArtistCatalog(self.raw_mb_data)
 
@@ -159,12 +163,15 @@ class SlskdArtistScraper:
         }
 
     def _prescan_library(self) -> None:
+        logging.getLogger(__name__).info("Scanning local and configured remote libraries...")
         local_tracks = AuditorService(mb_client=self.mb_client).scan_library(
             self.catalog, self.music_dir, full_scan=self.full_scan, threads=self.threads,
         )
         if not local_tracks:
+            logging.getLogger(__name__).info("No existing artist tracks found in the libraries.")
             return
 
+        logging.getLogger(__name__).info("Comparing %s library tracks with the discography...", len(local_tracks))
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=local_tracks)
         found_items, _ = reconciler.reconcile()
 
@@ -278,6 +285,9 @@ class SlskdArtistScraper:
 
         batch_results = self.client.batch_search(
             all_queries, timeout=self.search_timeout, poll_interval=1.0,
+            on_progress=lambda done, total, query: logging.getLogger(__name__).info(
+                "Soulseek searches: %s/%s checked — %s", done, total, query,
+            ),
         )
         total_files = 0
         for query_str, s_data in batch_results.items():
@@ -338,12 +348,13 @@ class SlskdArtistScraper:
         if self.candidate_index is None:
             self.candidate_index = PeerCandidateIndex(self.peer_directories)
 
-        for rel in primary_rels:
+        for index, rel in enumerate(primary_rels, 1):
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
             if norm_rel in self.local_found_releases or norm_rel in self.reconciled_release_keys:
                 continue
             self.reconciled_release_keys.add(norm_rel)
+            logging.getLogger(__name__).info("Checking release %s/%s: %s...", index, len(primary_rels), rel_title)
 
             expected_tracks = [
                 t for t in self.catalog.tracks
@@ -380,6 +391,7 @@ class SlskdArtistScraper:
             # Phase 2: If no candidate matched, batch browse the top candidate directories
             if not candidate_matches and dirs_needing_browse:
                 top_to_browse = [(cd.user, cd.dir_name) for cd in dirs_needing_browse[:6]]
+                logging.getLogger(__name__).info("Browsing %s peer directories for %s...", len(top_to_browse), rel_title)
                 try:
                     browse_res = self.client.browse_directories_batch(top_to_browse, max_workers=6)
                     for (u, d), remote_files in browse_res.items():

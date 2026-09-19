@@ -171,3 +171,58 @@ def test_dry_run_release_reports_zero_queued(workflow, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result["queued_count"] == 0
     assert result["matched_count"] == 1
+
+
+@pytest.mark.parametrize("command", ["download", "artist", "soulseek", "slsk"])
+def test_download_progress_is_visible_before_connecting(workflow, monkeypatch, capsys, command):
+    def connect(client):
+        output = capsys.readouterr()
+        assert "Starting dry run for Target Artist" in output.err
+        assert "Connecting to slskd" in output.err
+        assert output.out == ""
+        return {}
+
+    monkeypatch.setattr(SlskdClient, "get_application", connect)
+    assert main([command, "Target Artist", "--dry-run"]) == 0
+    output = capsys.readouterr()
+    assert "Scanning local and configured remote libraries" in output.err
+    assert "Executing parallel Soulseek searches" in output.err
+    assert "matched files (dry run" in output.out
+    assert "\x1b" not in output.err
+    assert workflow == []
+
+
+def test_download_reports_search_counts(workflow, monkeypatch, capsys):
+    def batch_search(client, queries, **kwargs):
+        kwargs["on_progress"](1, len(queries), queries[0])
+        assert "Soulseek searches: 1/" in capsys.readouterr().err
+        return {}
+
+    monkeypatch.setattr(SlskdClient, "batch_search", batch_search)
+    assert main(["download", "Target Artist", "--dry-run"]) == 0
+
+
+@pytest.mark.parametrize("scope", [[], ["--release", "Three Track EP"], ["--release-id", "release-1"]])
+@pytest.mark.parametrize("quiet", [False, True])
+def test_download_progress_preserves_json(workflow, capsys, scope, quiet):
+    flags = ["--quiet"] if quiet else []
+    assert main(["download", "Target Artist", *scope, "--dry-run", "--json", "-", *flags]) == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out)["dry_run"] is True
+    if quiet:
+        assert output.err == ""
+    else:
+        assert "Starting dry run for Target Artist" in output.err
+        assert "[00:00]" in output.err
+        if scope:
+            assert "Release search 1/" in output.err
+            assert "[1/1 tracks matched]" in output.err
+
+
+def test_quiet_download_still_reports_errors(workflow, monkeypatch, capsys):
+    def fail(*args):
+        raise RuntimeError("slskd unavailable")
+
+    monkeypatch.setattr(SlskdClient, "get_application", fail)
+    assert main(["download", "Target Artist", "--quiet"]) == 1
+    assert capsys.readouterr().err == "Error: slskd unavailable\n"

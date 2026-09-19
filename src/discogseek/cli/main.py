@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from discogseek.cli.progress import download_progress
 from discogseek.config import Config
 from discogseek.core.report import BaseReportExporter
 from discogseek.services.auditor import AuditorService
@@ -55,7 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--force-refresh", action="store_true", help="Refresh MusicBrainz metadata")
         command.add_argument("--full-scan", action="store_true", help="Inspect all local tags for artist audits")
         command.add_argument("--json", dest="export_json", help="Write results to JSON (use - for stdout)")
-        command.add_argument("--verbose", action="store_true", help="Log progress to stderr")
+        verbosity = command.add_mutually_exclusive_group()
+        verbosity.add_argument("--verbose", action="store_true", help="Log progress to stderr (default for downloads)")
+        if command is download:
+            verbosity.add_argument("-q", "--quiet", action="store_true", help="Hide download progress; still show results and errors")
     display = audit.add_mutually_exclusive_group()
     display.add_argument("--missing-only", action="store_true", help="Show only missing tracks")
     display.add_argument("--found-only", action="store_true", help="Show only found tracks")
@@ -139,16 +143,23 @@ def _audit(args):
 
 
 def _download(args):
+    logger = logging.getLogger(__name__)
+    logger.info("Starting %s for %s...", "dry run" if args.dry_run else "download", args.artist)
     if args.release or args.release_id:
+        logger.info("Checking MusicBrainz and local/remote libraries for %s...", args.release or args.release_id)
         service = LibraryReleaseService()
         audit = service.audit_named_release(
             args.artist, title=args.release, release_id=args.release_id,
             library_dir=args.music_dir, force_refresh=args.force_refresh,
         )
+        logger.info("Library: %s found, %s missing", audit["found_count"], audit["missing_count"])
         result = service.download_missing_tracks(
             artist=audit["artist"], release_title=audit["title"],
             missing_tracks=[t for t in audit["tracks"] if t["status"] == "missing"],
             preferred_format=args.format, search_timeout=args.timeout, dry_run=args.dry_run,
+            on_progress=lambda done, total, message: logger.info(
+                "%s [%s/%s tracks matched]", message, done, total,
+            ),
         )
         matches = result.get("queued_files", [])
     else:
@@ -189,7 +200,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "browse":
             from discogseek.cli.browser import run_browser
             return run_browser(args)
-        return _audit(args) if args.command == "audit" else _download(args)
+        if args.command == "audit":
+            return _audit(args)
+        with download_progress(quiet=args.quiet):
+            return _download(args)
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         return 130

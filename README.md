@@ -110,7 +110,9 @@ discogseek download "Artist" --release "Album" -f mp3-320
 
 Downloads pre-scan the local and configured remote libraries. Artist discovery covers primary releases, compilation appearances, and standalone tracks. Partial albums queue only matched missing tracks. `--dry-run` performs searches but never queues transfers. Candidate matching can leave unresolved items; inspect the result before assuming the discography is complete.
 
-Use `--timeout` to change the 30-second search timeout, `--min-match` to adjust the artist workflow's minimum album match ratio (default `0.70`), and `--verbose` for progress logs on stderr. `--json -` keeps stdout machine-readable. Queue failures return a nonzero exit status; a successful queue request does not mean the transfer has finished.
+Downloads show progress on stderr by default: MusicBrainz lookup, library scanning, Soulseek search counts, matching, and queueing. Messages include elapsed time, with a “still working” update during waits of 10 seconds or more. Use `--quiet` (`-q`) to hide progress while keeping the final results and errors. `--json -` keeps stdout machine-readable.
+
+Use `--timeout` to change the 30-second search timeout and `--min-match` to adjust the artist workflow's minimum album match ratio (default `0.70`). Queue failures return a nonzero exit status; a successful queue request does not mean the transfer has finished.
 
 `artist`, `soulseek`, and `slsk` are aliases for `download`. `ds`, `python -m discogseek`, and the repository's `python3 main.py` expose the same commands.
 

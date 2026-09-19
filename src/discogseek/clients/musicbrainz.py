@@ -419,19 +419,21 @@ class MusicBrainzClient:
     def fetch_full_discography(self, mbid: str, force_refresh: bool = False) -> Dict[str, Any]:
         """Fetches full artist details, aliases, releases, track-releases, and recordings."""
         cache_file = self.cache_dir / f"artist_{mbid}.json"
+        logger = logging.getLogger(__name__)
 
         if self.use_cache and not force_refresh and cache_file.exists():
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                logging.getLogger(__name__).info(f"Loaded MusicBrainz catalog from cache ({cache_file.name})")
+                logger.info(f"Loaded MusicBrainz catalog from cache ({cache_file.name})")
                 return data
             except Exception:
                 pass
 
-        logging.getLogger(__name__).info("Fetching artist discography from MusicBrainz API...")
+        logger.info("Fetching artist discography from MusicBrainz API...")
 
         # 1. Artist details & aliases
+        logger.info("Fetching MusicBrainz artist details and aliases...")
         artist_data = musicbrainzngs.get_artist_by_id(
             mbid,
             includes=['aliases', 'artist-rels', 'recording-rels', 'release-rels', 'release-group-rels', 'tags']
@@ -442,6 +444,7 @@ class MusicBrainzClient:
         offset = 0
         limit = 100
         while True:
+            logger.info("Fetching MusicBrainz primary releases (%d loaded)...", len(releases_artist))
             res = musicbrainzngs.browse_releases(
                 artist=mbid,
                 limit=limit,
@@ -453,6 +456,7 @@ class MusicBrainzClient:
                 break
             releases_artist.extend(rels)
             total_count = int(res.get('release-count', 0))
+            logger.info("Loaded %d/%d MusicBrainz primary releases", len(releases_artist), total_count)
             if len(releases_artist) >= total_count:
                 break
             offset += len(rels)
@@ -461,6 +465,7 @@ class MusicBrainzClient:
         releases_track_artist = []
         offset = 0
         while True:
+            logger.info("Fetching MusicBrainz compilation appearances (%d loaded)...", len(releases_track_artist))
             res = musicbrainzngs.browse_releases(
                 track_artist=mbid,
                 limit=limit,
@@ -472,6 +477,7 @@ class MusicBrainzClient:
                 break
             releases_track_artist.extend(rels)
             total_count = int(res.get('release-count', 0))
+            logger.info("Loaded %d/%d MusicBrainz compilation appearances", len(releases_track_artist), total_count)
             if len(releases_track_artist) >= total_count:
                 break
             offset += len(rels)
@@ -480,6 +486,7 @@ class MusicBrainzClient:
         recordings = []
         offset = 0
         while True:
+            logger.info("Fetching MusicBrainz recordings (%d loaded)...", len(recordings))
             res = musicbrainzngs.browse_recordings(
                 artist=mbid,
                 limit=limit,
@@ -491,6 +498,7 @@ class MusicBrainzClient:
                 break
             recordings.extend(recs)
             total_count = int(res.get('recording-count', 0))
+            logger.info("Loaded %d/%d MusicBrainz recordings", len(recordings), total_count)
             if len(recordings) >= total_count:
                 break
             offset += len(recs)
@@ -499,6 +507,7 @@ class MusicBrainzClient:
         release_groups = []
         offset = 0
         while True:
+            logger.info("Fetching MusicBrainz release groups (%d loaded)...", len(release_groups))
             res = musicbrainzngs.browse_release_groups(
                 artist=mbid,
                 limit=limit,
@@ -510,6 +519,7 @@ class MusicBrainzClient:
                 break
             release_groups.extend(rgs)
             total_count = int(res.get('release-group-count', 0))
+            logger.info("Loaded %d/%d MusicBrainz release groups", len(release_groups), total_count)
             if len(release_groups) >= total_count:
                 break
             offset += len(rgs)
@@ -527,7 +537,7 @@ class MusicBrainzClient:
             try:
                 with open(cache_file, "w", encoding="utf-8") as f:
                     json.dump(full_data, f, ensure_ascii=False, indent=2)
-                logging.getLogger(__name__).info(f"Cached MusicBrainz catalog to {cache_file.name}")
+                logger.info(f"Cached MusicBrainz catalog to {cache_file.name}")
             except Exception:
                 pass
 
@@ -592,4 +602,3 @@ class MusicBrainzClient:
                 pass
 
         return results
-
