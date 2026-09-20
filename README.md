@@ -68,6 +68,8 @@ discogseek browse --dry-run -f flac
 
 The left pane lists incomplete releases; the right shows every track in the selected release, including disc/track numbers and found, missing, matched, or queued status. The browser scans local files and every configured Navidrome/Subsonic album and reuses saved MusicBrainz audits for unchanged releases across launches. If an album is split across different edition tags, tracks with the same MusicBrainz recording ID and disc/track position count across editions with the same artist and album title. The first run builds this audit cache. New or changed releases are audited as needed; failed audits remain retryable. Use `r` to refresh a selected release from MusicBrainz or launch with `--force-refresh` to refresh all audits. It covers releases already represented in your library; use `download "Artist"` for entirely absent releases.
 
+Verified editions with the same artist, album title, and full recording list at the same disc/track positions share one browser row and download status. Editions with different tracklists or incomplete recording metadata remain separate.
+
 Press **Enter** for a menu offering **Download all missing tracks** and **Download selected track only**, with previews for either choice. To select an individual track, press **Tab**, then **↑ / ↓**; the arrow beside the track shows the selection. The download shortcuts also stay visible at the bottom of the screen.
 
 | Key | Action |

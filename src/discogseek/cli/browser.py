@@ -33,6 +33,28 @@ def release_key(release):
     )
 
 
+def equivalent_release_key(release):
+    # Editions can have different release/track MBIDs for the same recordings.
+    # Share their browser and download state only with a fully verified tracklist;
+    # keep the actual edition ID in the snapshot for audits and targeted refreshes.
+    artist = normalize_text(release.get("album_artist") or release.get("artist") or "")
+    title = normalize_text(release.get("mb_release_title") or release.get("title") or "")
+    tracks = release.get("tracks") or []
+    if release.get("is_audited") and release.get("mb_release_id") and artist and title and tracks:
+        positions = set()
+        recordings = []
+        for track in tracks:
+            disc, number, recording = track_key(track)
+            if (not track.get("mb_recording_id") or not disc.isdigit() or int(disc) < 1
+                    or number in ("", "-", "0") or (disc, number) in positions):
+                break
+            positions.add((disc, number))
+            recordings.append((disc, number, recording))
+        else:
+            return ("recordings", artist, title, tuple(sorted(recordings)))
+    return release_key(release)
+
+
 def track_key(track):
     def number(value):
         try:
@@ -41,7 +63,7 @@ def track_key(track):
             return str(value)
 
     return (number(track.get("disc_number") or 1), number(track.get("track_number") or ""),
-            track.get("mb_track_id") or track.get("mb_recording_id") or track.get("title", ""))
+            track.get("mb_recording_id") or track.get("mb_track_id") or track.get("title", ""))
 
 
 class BrowserModel:
@@ -56,11 +78,25 @@ class BrowserModel:
         self.queued = {}
         self.matched = {}
         self.downloaded = {}
+        self.preferred_editions = {}
+        self._history_releases = {}
 
     def visible(self):
         query = normalize_text(self.artist_filter)
+        groups = {}
+        for release in self.releases.values():
+            groups.setdefault(equivalent_release_key(release), []).append(release)
+        rows = []
+        for key, editions in groups.items():
+            # Explicit refreshes are freshest. During the initial scan use the
+            # best coverage, keeping the selected edition when coverage agrees.
+            preferred = self.preferred_editions.get(key)
+            rows.append(min(editions, key=lambda r: (
+                release_key(r) != preferred if preferred else False,
+                r.get("missing_count", 0), release_key(r) != self.selected_key,
+            )))
         return sorted(
-            [r for r in self.releases.values()
+            [r for r in rows
              if (not query or any(query in normalize_text(credit or "") for credit in
                                   [r.get("artist"), r.get("album_artist")]
                                   + [t.get("artist") for t in r.get("tracks", [])]))
@@ -89,7 +125,13 @@ class BrowserModel:
                     history.setdefault(key, set()).update(history.pop(old_key))
             if self.selected_key == old_key:
                 self.selected_key = key
+            self._history_releases.pop(old_key, None)
         self.releases[key] = release
+        if key in self._history_releases or any(key in history for history in
+                                               (self.queued, self.matched, self.downloaded)):
+            self._history_releases[key] = release
+        if old_key is not None:
+            self.preferred_editions[equivalent_release_key(release)] = key
 
     def move(self, delta, tracks=False):
         selected = self.selected()
@@ -105,27 +147,40 @@ class BrowserModel:
             self.track_index = 0
 
     def pending(self, release, only_track=None):
-        queued = self.queued.get(release_key(release), set())
+        queued = self.queued_tracks(release)
         return [t for t in release.get("tracks", []) if t.get("status") == "missing"
                 and track_key(t) not in queued
                 and (only_track is None or track_key(t) == only_track)]
 
     def record_result(self, release, result):
         key = release_key(release)
+        self._history_releases[key] = copy.deepcopy(release)
         self.matched[key] = {track_key(t) for t in result.get("matched_tracks", [])}
         self.queued.setdefault(key, set()).update(
             track_key(t) for t in result.get("queued_tracks", [])
         )
 
+    def _shared_history(self, release, history):
+        equivalent = equivalent_release_key(release)
+        keys = {release_key(release)}
+        for key in history:
+            row = self.releases.get(key, self._history_releases.get(key))
+            if row and equivalent_release_key(row) == equivalent:
+                keys.add(key)
+        return set().union(*(history.get(key, set()) for key in keys))
+
+    def queued_tracks(self, release):
+        return self._shared_history(release, self.queued)
+
     def track_status(self, release, track):
         if track.get("status") == "found":
             return "found"
-        key, identity = release_key(release), track_key(track)
-        if identity in self.downloaded.get(key, set()):
+        identity = track_key(track)
+        if identity in self._shared_history(release, self.downloaded):
             return "downloaded"
-        if identity in self.queued.get(key, set()):
+        if identity in self.queued_tracks(release):
             return "queued"
-        if identity in self.matched.get(key, set()):
+        if identity in self._shared_history(release, self.matched):
             return "matched"
         return "missing" if release.get("is_audited") else "unverified"
 
@@ -412,7 +467,10 @@ class ReleaseBrowser:
                     release, queued, only_track, dry_run = payload
                     # A failure poll may have invalidated the UI's queued snapshot.
                     key = self._download_key(release_key(release))
-                    queued = self._submitted_tracks.get(key, queued)
+                    queued = set(self._submitted_tracks.get(key, queued))
+                    for sibling_key, watch in self._downloads.items():
+                        if equivalent_release_key(watch["release"]) == equivalent_release_key(release):
+                            queued.update(self._submitted_tracks.get(sibling_key, set()))
                     attempts = None
                     if kind == "recover":
                         if self.stopping.is_set():
@@ -471,6 +529,7 @@ class ReleaseBrowser:
         if kind == "scan":
             self.scanning = True
             self.refreshed_during_scan.clear()
+            self.model.preferred_editions.clear()
         if clear_error:
             self.error = ""
         self.message = {"scan": "Scanning the library and loading saved audits…", "refresh": "Refreshing selected release…",
@@ -500,7 +559,7 @@ class ReleaseBrowser:
             request.release = copy.deepcopy(release)
             self.active_download = request
             self._start("recover" if request.recovery else "download",
-                        (copy.deepcopy(release), set(self.model.queued.get(key, set())),
+                        (copy.deepcopy(release), self.model.queued_tracks(release),
                                      request.only_track, request.dry_run), clear_error=False)
             action = "Previewing" if request.dry_run else "Downloading"
             self.message = f"{action} {release['title']}. Checking the library first…"
@@ -519,9 +578,11 @@ class ReleaseBrowser:
                 key = release_key(release)
                 if old_key is not None:
                     if self.scanning:
-                        self.refreshed_during_scan.add(key)
+                        self.refreshed_during_scan.update(identity for identity in
+                            (old_key, key, equivalent_release_key(release)) if identity is not None)
                     self._update_release(release, old_key)
-                elif key not in self.refreshed_during_scan:
+                elif (key not in self.refreshed_during_scan
+                      and equivalent_release_key(release) not in self.refreshed_during_scan):
                     self._update_release(release)
             elif kind == "error":
                 self.error = data
@@ -557,7 +618,8 @@ class ReleaseBrowser:
             elif kind == "result":
                 old_key, release, result = data
                 if self.scanning:
-                    self.refreshed_during_scan.add(release_key(release))
+                    self.refreshed_during_scan.update(identity for identity in
+                        (old_key, release_key(release), equivalent_release_key(release)) if identity is not None)
                 self._update_release(release, old_key)
                 self.model.record_result(release, result)
                 unresolved = result.get("total_missing", 0) - result.get("resolved_count", 0)
@@ -616,7 +678,8 @@ class ReleaseBrowser:
         requests = list(self.pending_downloads)
         if self.active_download is not None:
             requests.append(self.active_download)
-        if any(release_key(request.release) == release_key(release) and request.dry_run == dry_run
+        if any(equivalent_release_key(request.release) == equivalent_release_key(release)
+               and request.dry_run == dry_run
                and (request.only_track is None or request.only_track == only_track) for request in requests):
             self.message = f"{release['title']}: request already waiting or in progress."
             return
@@ -754,9 +817,11 @@ class ReleaseBrowser:
             counts = (f"{release.get('missing_count', 0)}/{len(release.get('tracks', []))} missing"
                       if release.get("is_audited") else "unverified")
             request_label = ""
-            if self.active_download and release_key(self.active_download.release) == release_key(release):
+            if (self.active_download
+                    and equivalent_release_key(self.active_download.release) == equivalent_release_key(release)):
                 request_label = "[searching] "
-            elif any(release_key(request.release) == release_key(release) for request in self.pending_downloads):
+            elif any(equivalent_release_key(request.release) == equivalent_release_key(release)
+                     for request in self.pending_downloads):
                 request_label = "[waiting] "
             put(y, 1, f"{'›' if active else ' '} {request_label}{release['title']}", split - 2,
                 curses.A_REVERSE if active else 0)
