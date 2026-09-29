@@ -3,6 +3,8 @@
 import re
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
+from discogseek.core.peer_policy import PeerPolicy, peer_key
+
 
 RECOVERABLE_FAILURES = {"Rejected", "TimedOut", "Errored"}
 TERMINAL_FAILURES = RECOVERABLE_FAILURES | {"Cancelled", "Aborted"}
@@ -39,18 +41,21 @@ def failure_description(file: Dict[str, Any]) -> str:
 
 
 class DownloadHistory:
-    """Protect healthy transfers and exclude exact failed sources from new searches.
+    """Protect healthy transfers and exclude failed sources and blocked peers.
 
     Matching code calls excludes only after matching a requested track. This
     scopes cancellation to that request, leaving unrelated history untouched.
     """
 
-    def __init__(self, downloads: Iterable[Dict[str, Any]], excluded_sources=None):
+    def __init__(self, downloads: Iterable[Dict[str, Any]], excluded_sources=None, peer_policy=None):
+        downloads = list(downloads)
+        self.peer_policy = peer_policy if peer_policy is not None else PeerPolicy()
+        self.blocked_peers = self.peer_policy.observe(downloads)
         self.excluded_sources = {source_key(*key) for key in (excluded_sources or ())}
         self.failed: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.protected: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._protected_sources: Set[Tuple[str, str]] = set()
         self.queued_filenames: Set[str] = set()
-        protected = set()
         for user in downloads:
             for directory in user.get("directories", []):
                 for file in directory.get("files", []):
@@ -61,13 +66,14 @@ class DownloadHistory:
                     if terminal_failure(file):
                         self.failed[key] = file
                     else:
-                        protected.add(key)
                         self.protected[key] = file
+                        self._protected_sources.add((peer_key(key[0]), key[1]))
                         self.queued_filenames.add(filename)
         # A live/successful copy of the same source takes precedence over an old
         # failed record, which must never cancel a currently healthy transfer.
-        for key in protected:
-            self.failed.pop(key, None)
+        for key in list(self.failed):
+            if (peer_key(key[0]), key[1]) in self._protected_sources:
+                self.failed.pop(key, None)
         self.excluded_sources.update(self.failed)
         self.queued_base_filenames = {
             filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -78,13 +84,19 @@ class DownloadHistory:
 
     def excludes(self, username: str, filename: str) -> bool:
         key = source_key(username, filename)
-        if key not in self.excluded_sources:
+        if self.is_protected(username, filename):
+            return False
+        if key not in self.excluded_sources and not self.is_peer_blocked(username):
             return False
         self._encountered.add(key)
         return True
 
+    def is_peer_blocked(self, username: str) -> bool:
+        return peer_key(username) in self.blocked_peers
+
     def is_protected(self, username: str, filename: str) -> bool:
-        return source_key(username, filename) in self.protected
+        user, path = source_key(username, filename)
+        return (peer_key(user), path) in self._protected_sources
 
     def prepare_recovery(self, client, sources: Optional[Iterable[Tuple[str, str]]] = None) -> None:
         # A terminal state can briefly be visible between slskd retries. Cancel
@@ -109,7 +121,8 @@ class DownloadHistory:
         keys = self._encountered if sources is None else self._encountered.intersection(sources)
         for key in sorted(keys):
             file = self.failed.get(key)
-            detail = failure_description(file) if file else "previously failed source"
+            detail = (failure_description(file) if file else
+                      self.blocked_peers.get(peer_key(key[0]), "previously failed source"))
             entry = f"{key[0]}: {detail}"
             if entry not in details:
                 details.append(entry)

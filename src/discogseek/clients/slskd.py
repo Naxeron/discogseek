@@ -16,6 +16,7 @@ import requests
 
 from discogseek.config import Config
 from discogseek.clients.http import create_resilient_session
+from discogseek.core.peer_policy import PeerPolicy, peer_key
 from discogseek.core.transfers import DownloadHistory
 
 MAX_DIRECTORY_CACHE_SIZE: int = 500
@@ -51,6 +52,15 @@ class SlskdTransferFailedError(SlskdEnqueueError):
     """A previously failed file must be obtained from another source."""
 
 
+class SlskdPeerBlockedError(SlskdEnqueueError):
+    """A persistent peer block prevents new downloads from this source."""
+
+    def __init__(self, username: str, reason: str, queued_files=None):
+        self.username = username
+        self.reason = reason
+        super().__init__(f"Soulseek user {username} is blocked: {reason}.", queued_files)
+
+
 class SlskdClient:
     """Client for communicating with the slskd REST API."""
 
@@ -69,6 +79,7 @@ class SlskdClient:
         self.password = password or Config.SLSKD_PASSWORD
         self.api_key = api_key or Config.SLSKD_API_KEY
         self.timeout = timeout
+        self.peer_policy = PeerPolicy()
 
         self.session = create_resilient_session()
         self.token: Optional[str] = None
@@ -507,6 +518,17 @@ class SlskdClient:
         for i in range(0, len(payload), chunk_size):
             chunk = payload[i:i + chunk_size]
             for attempt in range(3):
+                # A user may cancel a transfer while a long search is running.
+                # Recheck history at the final submission boundary, including
+                # between chunks/retries, and retain earlier accepted chunks.
+                try:
+                    blocked_reason = self.peer_policy.observe(self.get_downloads()).get(peer_key(clean_user))
+                except Exception as error:
+                    raise SlskdEnqueueError(
+                        f"Cannot verify blocked peers before queueing: {error}", queued_files,
+                    ) from error
+                if blocked_reason:
+                    raise SlskdPeerBlockedError(clean_user, blocked_reason, queued_files)
                 try:
                     resp = self._request("POST", f"/api/v0/transfers/downloads/{encoded_user}", json=chunk, timeout=30.0)
                 except SlskdAPIError as error:
@@ -548,8 +570,17 @@ class SlskdClient:
         """Stop a failed transfer's retries, retaining its record in slskd."""
         user = urllib.parse.quote(username, safe="")
         identity = urllib.parse.quote(str(transfer_id), safe="")
-        resp = self._request("DELETE", f"/api/v0/transfers/downloads/{user}/{identity}", params={"remove": "false"})
+        # Record intent before the request: the next history read may already
+        # show Cancelled, which must not turn automatic recovery into a user ban.
+        self.peer_policy.record_internal_cancel(username, transfer_id)
+        try:
+            resp = self._request("DELETE", f"/api/v0/transfers/downloads/{user}/{identity}", params={"remove": "false"})
+        except Exception:
+            # An unconfirmed attempt must not exempt a later manual stop.
+            self.peer_policy.forget_internal_cancel(username, transfer_id)
+            raise
         if resp.status_code not in (200, 204):
+            self.peer_policy.forget_internal_cancel(username, transfer_id)
             raise SlskdAPIError(
                 f"Could not stop retries for {username} (HTTP {resp.status_code}): {resp.text}. "
                 "No replacement was submitted."

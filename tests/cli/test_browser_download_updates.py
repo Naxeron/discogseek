@@ -9,6 +9,7 @@ import pytest
 from discogseek.cli import browser
 from discogseek.cli.browser import ReleaseBrowser, release_key, track_key
 from discogseek.cli.main import build_parser
+from discogseek.core.transfers import DownloadHistory
 from discogseek.services.library import LibraryReleaseService
 from discogseek.services.library_browser import LibraryBrowserService
 
@@ -468,7 +469,104 @@ def test_explicitly_stopped_transfer_is_never_cancelled_or_recovered(tui, servic
     service.release_service.slskd_client.cancel_download.assert_not_called()
     assert tui.jobs.empty() and not tui.pending_downloads
     assert tui.model.track_status(row, row["tracks"][1]) == "missing"
-    assert not tui._failed_sources
+    assert tui._failed_sources[release_key(row)] == {("peer", "Music/Album/2 song.flac")}
+    assert tui._peer_policy.blocked_reason("peer")
+
+
+@pytest.mark.parametrize("state", ["Rejected", "Aborted", "Cancelled"])
+def test_untracked_peer_failure_survives_cleared_history_and_a_new_browser(tui, service, state):
+    row = release(missing=1)
+    remember(tui, row)
+    client = service.release_service.slskd_client
+    client.get_downloads.return_value = (
+        transfers(transfer(state="InProgress", id="healthy-id"))
+        + transfers(transfer(state=f"Completed, {state}", id="old-id"), user="blocked-peer")
+    )
+
+    check(tui, service)
+
+    assert tui._peer_policy.blocked_reason("blocked-peer")
+    assert not tui._peer_policy.blocked_reason("peer")
+    client.cancel_download.assert_not_called()
+    assert tui.model.track_status(row, row["tracks"][1]) == "queued"
+    client.get_downloads.return_value = []
+    restarted = ReleaseBrowser(build_parser().parse_args(["browse"]), service_factory=Mock())
+    history = DownloadHistory(client.get_downloads())
+
+    assert restarted._peer_policy.blocked_reason("blocked-peer")
+    assert history.excludes("blocked-peer", "Other album/different song.flac")
+    assert not history.excludes("peer", "Other album/different song.flac")
+
+
+@pytest.mark.parametrize("state", ["TimedOut", "Errored"])
+def test_recovery_cancellation_does_not_blacklist_peer_on_later_poll(tui, service, state):
+    row = release(missing=2)
+    remember(tui, row, queued_result(row, positions=(1, 2)))
+    client = service.release_service.slskd_client
+    healthy = transfer(3, "InProgress", id="healthy-id")
+    client.get_downloads.return_value = transfers(
+        transfer(2, f"Completed, {state}", id="failed-id"), healthy,
+    )
+
+    check(tui, service)
+
+    client.cancel_download.assert_called_once_with("peer", "failed-id")
+    client.get_downloads.return_value = transfers(
+        transfer(2, "Completed, Cancelled", id="failed-id"), healthy,
+    )
+    check(tui, service)
+
+    assert not tui._peer_policy.blocked_reason("peer")
+    history = DownloadHistory(client.get_downloads())
+    assert not history.excludes("peer", "Other album/different song.flac")
+    assert history.excludes("peer", "Music/Album/2 song.flac")
+    assert tui.active_download.recovery
+    assert tui.model.track_status(row, row["tracks"][2]) == "queued"
+
+
+def test_failed_recovery_cancellation_does_not_exempt_later_manual_cancel(tui, service):
+    row = release(missing=2)
+    remember(tui, row, queued_result(row, positions=(1, 2)))
+    client = service.release_service.slskd_client
+    healthy = transfer(3, "InProgress", id="healthy-id")
+    client.get_downloads.return_value = transfers(
+        transfer(2, "Completed, TimedOut", id="failed-id"), healthy,
+    )
+    client.cancel_download.side_effect = RuntimeError("Cancellation timed out")
+
+    check(tui, service)
+
+    assert "Cancellation timed out" in tui.error
+    assert not tui._peer_policy.blocked_reason("peer")
+    assert tui.jobs.empty() and not tui.pending_downloads
+    client.get_downloads.return_value = transfers(
+        transfer(2, "Completed, Cancelled", id="failed-id"), healthy,
+    )
+    check(tui, service)
+
+    assert tui._peer_policy.blocked_reason("peer")
+    assert DownloadHistory([]).excludes("peer", "Other album/different song.flac")
+    client.cancel_download.assert_called_once_with("peer", "failed-id")
+
+
+def test_cancellation_marker_cleanup_error_preserves_original_failure(tui, service, monkeypatch):
+    row = release(missing=1)
+    remember(tui, row)
+    client = service.release_service.slskd_client
+    client.get_downloads.return_value = transfers(
+        transfer(2, "Completed, TimedOut", id="failed-id"),
+    )
+    client.cancel_download.side_effect = RuntimeError("Cancellation timed out")
+    monkeypatch.setattr(tui._peer_policy, "forget_internal_cancel", Mock(
+        side_effect=RuntimeError("Cache unavailable"),
+    ))
+
+    check(tui, service)
+
+    assert "Cancellation timed out" in tui.error
+    assert "Could not clear cancellation marker: Cache unavailable" in tui.error
+    assert tui.jobs.empty() and not tui.pending_downloads
+    assert tui.model.track_status(row, row["tracks"][1]) == "missing"
 
 
 @pytest.mark.parametrize("with_id", [False, True])

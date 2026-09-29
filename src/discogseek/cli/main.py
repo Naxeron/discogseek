@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
                         default=Config.DEFAULT_LIBRARY_DIR, help="Local music library")
     browse.add_argument("--force-refresh", action="store_true", help="Refresh MusicBrainz metadata")
     browse.add_argument("--verbose", action="store_true", help="Show service progress in the browser")
+    peers = commands.add_parser("peers", help="List or unblock persistently blocked Soulseek peers (offline)")
+    peers.set_defaults(verbose=False, quiet=False)
+    peer_commands = peers.add_subparsers(dest="peer_command")
+    peer_commands.add_parser("list", help="List blocked peers and their reasons")
+    unblock = peer_commands.add_parser("unblock", help="Allow a blocked peer again")
+    unblock.add_argument("username", help="Soulseek username to unblock")
     for command in (audit, download):
         command.add_argument("artist", help="Artist name (or artist MBID for a whole discography)")
         command.add_argument("-d", "--music-dir", "--library-dir", type=Path,
@@ -194,11 +200,34 @@ def _download(args):
     return 1 if result.get("queue_errors") else 0
 
 
+def _peers(args):
+    from discogseek.core.peer_policy import PeerPolicy
+
+    policy = PeerPolicy()
+    if args.peer_command == "unblock":
+        if policy.unblock(args.username):
+            print(f"Unblocked peer: {args.username}")
+        else:
+            print(f"Peer is not blocked: {args.username}")
+        return 0
+
+    blocked = policy.blocked_peers()
+    if not blocked:
+        print("No blocked peers.")
+    else:
+        print(f"Blocked peers: {len(blocked)}")
+        for username, reason in sorted(blocked.items()):
+            print(f"{username} | {reason}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(message)s", stream=sys.stderr)
     try:
+        if args.command == "peers":
+            return _peers(args)
         if args.command == "browse":
             from discogseek.cli.browser import run_browser
             return run_browser(args)

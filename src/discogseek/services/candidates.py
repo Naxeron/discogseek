@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from discogseek.core.audio import AudioQualityAnalyzer
 from discogseek.core.constants import AUDIO_EXTENSIONS, DIR_STOP_WORDS, SUPPORTING_EXTENSIONS
+from discogseek.core.peer_policy import peer_key
 from discogseek.core.transfers import source_key
 from discogseek.core.text import (
     _tokenize_words_cached,
@@ -306,10 +307,11 @@ def find_track_candidates(
 ) -> List[CandidateFile]:
     """Return compatible files, preserving source identities for recovery."""
     parsed = pre_parse_single_track(track_title)
+    excluded_peer_keys = {peer_key(user) for user in (excluded_users or ())}
     return [
         candidate
         for candidate in index.get_candidate_files_for_track(parsed)
-        if (not excluded_users or candidate.user not in excluded_users)
+        if peer_key(candidate.user) not in excluded_peer_keys
         and (not excluded_sources or source_key(candidate.user, candidate.full_filename) not in excluded_sources)
         and is_track_title_match_fast(
             parsed["p_struct"],

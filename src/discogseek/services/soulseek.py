@@ -22,8 +22,9 @@ from discogseek.core.text import (
 )
 from discogseek.core.release_metadata import parse_disc_and_track_number
 from discogseek.clients.slskd import (
-    SlskdClient, SlskdEnqueueError, SlskdPeerUnavailableError, SlskdTransferFailedError,
+    SlskdClient, SlskdEnqueueError, SlskdPeerBlockedError, SlskdPeerUnavailableError, SlskdTransferFailedError,
 )
+from discogseek.core.peer_policy import peer_key
 from discogseek.core.transfers import DownloadHistory, source_key
 from discogseek.clients.musicbrainz import MusicBrainzClient, ArtistCatalog
 from discogseek.services.auditor import AuditorService
@@ -618,7 +619,7 @@ class SlskdArtistScraper:
 
         logger = logging.getLogger(__name__)
         self.queue_errors.clear()
-        unavailable: Dict[str, SlskdPeerUnavailableError] = {}
+        unavailable: Dict[str, SlskdEnqueueError] = {}
         unresolved_peers: Dict[str, Tuple[Exception, List[Dict[str, Any]]]] = {}
         queued_titles: Set[str] = set()
 
@@ -650,8 +651,8 @@ class SlskdArtistScraper:
                     seen.add(basename(filename))
             error = SlskdTransferFailedError(history.failure_summary(excluded)) if excluded else None
             if pending:
-                if user in unavailable:
-                    error = unavailable[user]
+                if peer_key(user) in unavailable:
+                    error = unavailable[peer_key(user)]
                 else:
                     try:
                         history.prepare_recovery(self.client)
@@ -660,8 +661,8 @@ class SlskdArtistScraper:
                         error = exc
                         if isinstance(exc, SlskdEnqueueError):
                             remember(user, exc.queued_files)
-                        if isinstance(exc, SlskdPeerUnavailableError):
-                            unavailable[user] = exc
+                        if isinstance(exc, (SlskdPeerUnavailableError, SlskdPeerBlockedError)):
+                            unavailable[peer_key(user)] = exc
                             logger.info("%s Skipping this peer for the rest of this queue pass; trying other matches.", exc)
                     else:
                         remember(user, pending)
@@ -723,7 +724,7 @@ class SlskdArtistScraper:
                     continue
                 done, error = queue_files(candidate["user"], files)
                 remaining.difference_update(targets.get(filename, filename) for filename in done)
-                if isinstance(error, (SlskdPeerUnavailableError, SlskdTransferFailedError)):
+                if isinstance(error, (SlskdPeerUnavailableError, SlskdPeerBlockedError, SlskdTransferFailedError)):
                     peer_error = error
                 elif error is not None:
                     self.queue_errors.append(f"Failed to enqueue {candidate['directory']}: {error}")
@@ -769,7 +770,7 @@ class SlskdArtistScraper:
             done, error = queue_files(user, [item["file"] for item in items])
             if error is None:
                 continue
-            if not isinstance(error, (SlskdPeerUnavailableError, SlskdTransferFailedError)):
+            if not isinstance(error, (SlskdPeerUnavailableError, SlskdPeerBlockedError, SlskdTransferFailedError)):
                 self.queue_errors.append(f"Failed to enqueue tracks from {user}: {error}")
                 continue
             if self.candidate_index is None:
@@ -782,7 +783,7 @@ class SlskdArtistScraper:
                     candidate = find_best_track_candidate(
                         self.candidate_index, item["track"], self.all_artist_aliases,
                         self.preferred_format, item.get("release", ""),
-                        excluded_users=set(unavailable),
+                        excluded_users=set(unavailable) | set(history.blocked_peers),
                         excluded_sources=history.excluded_sources,
                     )
                     if candidate is None:
@@ -793,7 +794,7 @@ class SlskdArtistScraper:
                     if candidate.full_filename in accepted:
                         item.update(user=candidate.user, file=file, format_label=candidate.fmt_label)
                         break
-                    if isinstance(fallback_error, (SlskdPeerUnavailableError, SlskdTransferFailedError)):
+                    if isinstance(fallback_error, (SlskdPeerUnavailableError, SlskdPeerBlockedError, SlskdTransferFailedError)):
                         peer_error = fallback_error
                         continue
                     self.queue_errors.append(f"Failed to enqueue {item['track']}: {fallback_error}")

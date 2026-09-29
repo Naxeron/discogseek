@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from discogseek.clients.slskd import SlskdAPIError, SlskdClient, SlskdPeerUnavailableError
+from discogseek.clients.slskd import SlskdAPIError, SlskdClient, SlskdPeerBlockedError, SlskdPeerUnavailableError
 from discogseek.core.audio import AudioQualityAnalyzer
 from discogseek.core.constants import AUDIO_EXTENSIONS
 from discogseek.core.release_metadata import (
@@ -298,7 +298,7 @@ def download_missing_tracks(
                 report_progress(f"Queueing {len(chunk)} matched tracks from {user} in slskd…")
                 try:
                     slskd_client.enqueue_download(user, chunk)
-                except SlskdPeerUnavailableError as error:
+                except (SlskdPeerUnavailableError, SlskdPeerBlockedError) as error:
                     unavailable_users.add(user_key(user))
                     # A definite peer connection failure is safe to recover from
                     # by choosing another peer. Keep any accepted files, and free

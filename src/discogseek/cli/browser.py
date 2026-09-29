@@ -12,6 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict
 
+from discogseek.core.peer_policy import PeerPolicy
 from discogseek.core.text import normalize_text
 from discogseek.core.transfers import source_key, terminal_failure, transfer_states
 from discogseek.services.library_browser import LibraryBrowserService
@@ -261,6 +262,7 @@ class ReleaseBrowser:
         self._failed_sources = {}
         self._recovery_attempts = {}
         self._release_aliases = {}
+        self._peer_policy = PeerPolicy()
 
     @staticmethod
     def _transfer_key(username, filename):
@@ -327,9 +329,9 @@ class ReleaseBrowser:
             details += f" (slskd attempts: {file['attempts']})"
         if file.get("exception"):
             details += f" — {clipped(str(file['exception']), 240)}"
+        self._failed_sources.setdefault(key, set()).add(source)
         if state not in DOWNLOAD_RECOVERY_STATES:
             return details + "; press d or t to retry.", False
-        self._failed_sources.setdefault(key, set()).add(source)
         if self.stopping.is_set() or self.args.dry_run:
             return details + "; automatic recovery stopped.", False
         transfer_id = file.get("id")
@@ -338,9 +340,17 @@ class ReleaseBrowser:
             self.events.put(("recovery_error", message))
             return message, False
         try:
+            # Record before cancellation: a later poll must not mistake our
+            # retry cleanup for a user choosing to block this peer.
+            self._peer_policy.record_internal_cancel(user, transfer_id)
             service.release_service.slskd_client.cancel_download(user, transfer_id)
         except Exception as exc:
             message = details + f"; could not stop slskd retries: {exc}. Press d or t to retry."
+            try:
+                # An unsuccessful attempt must not exempt a later user cancel.
+                self._peer_policy.forget_internal_cancel(user, transfer_id)
+            except Exception as cleanup_exc:
+                message += f" Could not clear cancellation marker: {cleanup_exc}."
             self.events.put(("recovery_error", message))
             return message, False
         count = self._recovery_attempts.get(key, {}).get(watch["files"][source], 0)
@@ -354,7 +364,11 @@ class ReleaseBrowser:
         try:
             transfers = {}
             if any(set(w["files"]) - w["completed"] for w in self._downloads.values()):
-                for user in service.release_service.slskd_client.get_downloads():
+                downloads = service.release_service.slskd_client.get_downloads()
+                # Observe the complete history before retiring tracked failures,
+                # including rejected/cancelled downloads from earlier sessions.
+                self._peer_policy.observe(downloads)
+                for user in downloads:
                     for directory in user.get("directories", []):
                         for file in directory.get("files", []):
                             key = self._transfer_key(user.get("username"), file.get("filename"))

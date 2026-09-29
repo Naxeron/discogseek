@@ -9,6 +9,7 @@ from discogseek.clients.slskd import (
     SlskdAPIError,
     SlskdClient,
     SlskdEnqueueError,
+    SlskdPeerBlockedError,
     SlskdPeerUnavailableError,
 )
 
@@ -23,6 +24,7 @@ def enqueue_client(monkeypatch):
     request = MagicMock()
     sleep = MagicMock()
     monkeypatch.setattr(client, "_request", request)
+    monkeypatch.setattr(client, "get_downloads", MagicMock(return_value=[]))
     monkeypatch.setattr("discogseek.clients.slskd.time.sleep", sleep)
     return client, request, sleep
 
@@ -40,6 +42,84 @@ def test_slskd_enqueue_offline_peer_fails_without_retry(enqueue_client):
     assert str(raised.value) == "Soulseek user quobol is offline."
     request.assert_called_once()
     sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["Rejected", "Aborted", "Cancelled"])
+def test_enqueue_observes_new_peer_block_before_post(enqueue_client, state):
+    client, request, _ = enqueue_client
+    client.get_downloads.return_value = [{"username": "Peer", "directories": [{"files": [{
+        "id": "old", "filename": "Other Album/old.flac", "state": f"Completed, {state}",
+    }]}]}]
+
+    with pytest.raises(SlskdPeerBlockedError, match="blocked"):
+        client.enqueue_download("peer (FLAC)", [{"filename": "New Album/new.flac"}])
+
+    request.assert_not_called()
+    # Clearing server history and creating a new client cannot clear the block.
+    fresh = SlskdClient(base_url="http://mock:5030", api_key="dummy_key")
+    fresh.get_downloads = MagicMock(return_value=[])
+    fresh._request = request
+    with pytest.raises(SlskdPeerBlockedError):
+        fresh.enqueue_download("Peer", [{"filename": "Third Album/new.flac"}])
+    request.assert_not_called()
+
+
+def test_enqueue_retains_first_chunk_if_peer_is_canceled_between_chunks(enqueue_client):
+    client, request, _ = enqueue_client
+    request.return_value = enqueue_response(202)
+    files = [{"filename": f"Album/{number}.flac"} for number in range(51)]
+    client.get_downloads.side_effect = [[], [{"username": "peer", "directories": [{"files": [{
+        "id": "manual", "filename": "Album/0.flac", "state": "Completed, Cancelled",
+    }]}]}]]
+
+    with pytest.raises(SlskdPeerBlockedError) as raised:
+        client.enqueue_download("peer", files)
+
+    assert [file["filename"] for file in raised.value.queued_files] == [file["filename"] for file in files[:50]]
+    request.assert_called_once()
+
+
+def test_enqueue_does_not_submit_when_fresh_history_cannot_be_checked(enqueue_client):
+    client, request, _ = enqueue_client
+    client.get_downloads.side_effect = SlskdAPIError("History unavailable")
+
+    with pytest.raises(SlskdEnqueueError, match="Cannot verify blocked peers"):
+        client.enqueue_download("peer", [{"filename": "Album/Song.flac"}])
+
+    request.assert_not_called()
+
+
+def test_internal_client_cancel_is_not_later_treated_as_a_peer_block(enqueue_client):
+    client, request, _ = enqueue_client
+    request.return_value = enqueue_response(204)
+    client.cancel_download("peer", "automatic")
+    client.get_downloads.return_value = [{"username": "peer", "directories": [{"files": [{
+        "id": "automatic", "filename": "Old/song.flac", "state": "Completed, Cancelled",
+    }]}]}]
+    request.reset_mock()
+    request.return_value = enqueue_response(202)
+
+    client.enqueue_download("peer", [{"filename": "New/song.flac"}])
+
+    request.assert_called_once()
+    assert client.peer_policy.blocked_reason("peer") is None
+
+
+@pytest.mark.parametrize("failure", [500, "transport"])
+def test_failed_auto_cancel_does_not_exempt_later_manual_cancel(enqueue_client, failure):
+    client, request, _ = enqueue_client
+    if failure == "transport":
+        request.side_effect = SlskdAPIError("Connection lost")
+    else:
+        request.return_value = enqueue_response(failure, "Cancellation refused")
+    with pytest.raises(SlskdAPIError):
+        client.cancel_download("peer", "transfer")
+
+    client.peer_policy.observe([{"username": "peer", "directories": [{"files": [{
+        "id": "transfer", "filename": "Old/song.flac", "state": "Completed, Cancelled",
+    }]}]}])
+
+    assert client.peer_policy.blocked_reason("peer")
 
 
 @pytest.mark.parametrize("message", [
@@ -163,6 +243,7 @@ def test_slskd_enqueue_deduplication(monkeypatch):
         return mock_resp
 
     monkeypatch.setattr(client, "_request", mock_request)
+    monkeypatch.setattr(client, "get_downloads", lambda: [])
 
     files = [
         {"filename": "Album\\01 track.flac", "size": 1000},

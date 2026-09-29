@@ -77,7 +77,7 @@ def test_explicit_stop_takes_precedence_over_recoverable_failure(stop):
 
 def test_failed_source_exclusion_is_exact_not_peerwide_or_filenamewide():
     history = download_history({
-        "id": "failed", "filename": "Album\\Song.flac", "state": "Completed, Rejected",
+        "id": "failed", "filename": "Album\\Song.flac", "state": "Completed, TimedOut",
     })
 
     assert history.excludes("peer (FLAC)", "Album/Song.flac")
@@ -175,7 +175,7 @@ def test_explicit_exclusion_never_cancels_current_healthy_source(healthy_state):
     )
     client = MagicMock()
 
-    assert history.excludes("peer", "Album\\Song.flac")
+    assert not history.excludes("peer", "Album\\Song.flac")
     assert history.is_protected("peer", "Album\\Song.flac")
     assert history.queued_filenames == {"Album/Song.flac"}
     history.prepare_recovery(client)
@@ -215,3 +215,70 @@ def test_failure_summary_only_reports_encountered_failures():
     assert history.failure_summary() == ""
     assert history.excludes("peer", "Wanted\\Song.flac")
     assert history.failure_summary() == "peer: Rejected: File not shared"
+
+
+@pytest.mark.parametrize("failure", ["Rejected", "Aborted", "Cancelled"])
+def test_refusing_or_stopped_peer_is_excluded_for_other_files(failure):
+    history = download_history({
+        "id": "failed", "filename": "Album\\Song.flac", "state": f"Completed, {failure}",
+    })
+
+    assert history.is_peer_blocked("PEER (FLAC)")
+    assert history.excludes("PEER (FLAC)", "Different/Other Song.mp3")
+    assert not history.excludes("other-peer", "Album/Song.flac")
+    assert history.failure_summary() == f"PEER: {failure}"
+
+
+def test_peer_block_survives_empty_slskd_history():
+    download_history({"filename": "Album/Song.flac", "state": "Completed, Rejected"})
+    history = DownloadHistory([])
+    client = MagicMock()
+
+    assert history.excludes("peer", "Other/Unseen.flac")
+    history.prepare_recovery(client)
+    client.cancel_download.assert_not_called()
+    assert history.failure_summary() == "peer: Rejected"
+
+
+def test_blocked_peer_healthy_transfer_remains_protected():
+    history = download_history(
+        {"id": "failed", "filename": "Album/Bad.flac", "state": "Completed, Rejected"},
+        {"id": "healthy", "filename": "Album/Good.flac", "state": "Queued, Remotely"},
+    )
+    client = MagicMock()
+
+    assert history.is_peer_blocked("peer")
+    assert not history.excludes("peer", "Album/Good.flac")
+    assert history.excludes("peer", "Album/Another.flac")
+    history.prepare_recovery(client)
+    client.cancel_download.assert_not_called()
+
+
+def test_healthy_copy_overrides_failed_source_across_username_casing():
+    filename = "Album/Song.flac"
+    history = DownloadHistory([
+        {"username": "PEER", "directories": [{"files": [
+            {"id": "old", "filename": filename, "state": "Completed, Rejected"},
+        ]}]},
+        {"username": "peer (FLAC)", "directories": [{"files": [
+            {"id": "live", "filename": filename, "state": "InProgress"},
+        ]}]},
+    ])
+
+    assert not history.is_peer_blocked("peer")
+    assert history.failed == {}
+    assert history.is_protected("PEER", filename)
+    assert not history.excludes("PEER", filename)
+
+
+def test_download_history_uses_explicit_policy_and_one_shot_iterable(tmp_path):
+    from discogseek.core.peer_policy import PeerPolicy
+
+    policy = PeerPolicy(tmp_path / "custom-policy.db")
+    files = [{"filename": "Album/Song.flac", "state": "Completed, Rejected"}]
+    downloads = iter([{"username": "peer", "directories": [{"files": files}]}])
+    history = DownloadHistory(downloads, peer_policy=policy)
+
+    assert history.excludes("peer", "Other/Song.flac")
+    assert policy.blocked_peers() == {"peer": "Rejected"}
+    assert PeerPolicy().blocked_peers() == {}

@@ -3,7 +3,8 @@
 import pytest
 
 from discogseek.clients.musicbrainz import ArtistCatalog
-from discogseek.clients.slskd import SlskdAPIError, SlskdEnqueueError, SlskdPeerUnavailableError
+from discogseek.clients.slskd import SlskdAPIError, SlskdEnqueueError, SlskdPeerBlockedError, SlskdPeerUnavailableError
+from discogseek.core.peer_policy import PeerPolicy
 from discogseek.services.soulseek import SlskdArtistScraper
 
 
@@ -322,6 +323,36 @@ def test_failed_history_without_alternative_reports_reason_and_retries():
     assert len(scraper.queue_errors) == 1
     assert "retries: 100" in scraper.queue_errors[0]
     assert "Access to the path is denied" in scraper.queue_errors[0]
+
+
+@pytest.mark.parametrize("kind", ["album", "standalone", "compilation"])
+@pytest.mark.parametrize("new_block", [False, True])
+def test_artist_tries_other_peer_after_persisted_or_late_block(kind, new_block):
+    client = FakeSlskdClient()
+    blocked = "Blocked (FLAC)"
+    if new_block:
+        client.failures[blocked] = SlskdPeerBlockedError(blocked, "Cancelled")
+    else:
+        PeerPolicy().observe([{"username": "blocked", "directories": [{"files": [{
+            "id": "manual", "filename": "Unrelated/old.flac", "state": "Completed, Cancelled",
+        }]}]}])
+    scraper = artist_scraper(client, {"Night Signals": ["Neon Memory"]})
+    primary = add_peer_files(scraper, blocked, "Night Signals", ["Neon Memory"])
+    fallback = add_peer_files(scraper, "online", "Night Signals", ["Neon Memory"], "mp3")
+    if kind == "album":
+        scraper._reconcile_primary_releases()
+    else:
+        item = {"user": blocked, "track": "Neon Memory", "file": primary[0]}
+        if kind == "compilation":
+            item["release"] = "Night Signals"
+        setattr(scraper, f"verified_{kind}_tracks", [item])
+
+    scraper._queue_downloads()
+
+    assert [user for user, _ in client.calls] == ([blocked, "online"] if new_block else ["online"])
+    assert client.accepted == fallback
+    assert scraper.enqueued_count == 1
+    assert scraper.queue_errors == []
 
 
 @pytest.mark.parametrize("state", ["Queued, Remotely", "Queued, Locally", "InProgress", "Completed, Succeeded", "Completed"])
