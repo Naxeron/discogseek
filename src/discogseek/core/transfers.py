@@ -86,10 +86,13 @@ class DownloadHistory:
     def is_protected(self, username: str, filename: str) -> bool:
         return source_key(username, filename) in self.protected
 
-    def prepare_recovery(self, client) -> None:
+    def prepare_recovery(self, client, sources: Optional[Iterable[Tuple[str, str]]] = None) -> None:
         # A terminal state can briefly be visible between slskd retries. Cancel
         # the original before switching sources, without deleting its history.
-        for key in sorted(self._encountered - self._retired):
+        pending = (
+            self._encountered if sources is None else self._encountered.intersection(sources)
+        ) - self._retired
+        for key in sorted(pending):
             file = self.failed.get(key)
             if file and terminal_failure(file) in RECOVERABLE_FAILURES:
                 transfer_id = file.get("id")

@@ -1,5 +1,6 @@
 """Persistent audio metadata cache storage and retrieval."""
 
+import os
 import sqlite3
 
 import pytest
@@ -30,23 +31,63 @@ def test_batch_cache_storage_and_prefetch(tmp_path):
         for i, f in enumerate(files)
     ]
 
-    # Test batch storage if available, else store sequentially
-    if hasattr(cache, "store_audio_metadata_batch"):
-        cache.store_audio_metadata_batch(metas)
-    else:
-        for m in metas:
-            cache.store_audio_metadata(m)
+    cache.store_audio_metadata_batch(metas)
+    fetched = cache.get_audio_metadata_batch(files)
+    assert set(fetched) == set(files)
+    assert all(meta.artist == "Batch Artist" for meta in fetched.values())
 
-    # Test bulk pre-fetch if available, else get individually
-    if hasattr(cache, "get_cached_metadata_for_files"):
-        fetched = cache.get_cached_metadata_for_files(files)
-        assert len(fetched) == 20
-        assert str(files[0].resolve()) in fetched or str(files[0]) in fetched
-    else:
-        for f in files:
-            cached = cache.get_audio_metadata(f)
-            assert cached is not None
-            assert cached.artist == "Batch Artist"
+
+def test_batch_lookup_preserves_file_fingerprints_and_skips_bad_entries(tmp_path):
+    cache = UnifiedCacheManager(tmp_path / "cache.db")
+    names = ("unchanged", "retagged", "resized", "deleted", "corrupt", "new")
+    paths = {name: tmp_path / f"{name}.flac" for name in names}
+    for path in paths.values():
+        path.write_bytes(b"audio")
+    cache.store_audio_metadata_batch([
+        AudioMetadata(path=path, title=name) for name, path in paths.items() if name != "new"
+    ])
+    stat = paths["retagged"].stat()
+    os.utime(paths["retagged"], (stat.st_atime, stat.st_mtime + 10))
+    stat = paths["resized"].stat()
+    paths["resized"].write_bytes(b"longer audio")
+    os.utime(paths["resized"], (stat.st_atime, stat.st_mtime))
+    paths["deleted"].unlink()
+    with cache._get_conn() as connection:
+        connection.execute("UPDATE audio_cache SET genres = 'invalid json' WHERE path = ?", (str(paths["corrupt"]),))
+
+    fetched = cache.get_audio_metadata_batch(list(paths.values()))
+    assert set(fetched) == {paths["unchanged"]}
+    assert fetched[paths["unchanged"]].title == "unchanged"
+
+
+def test_batch_cache_uses_bounded_queries_and_transactions(tmp_path, monkeypatch):
+    cache = UnifiedCacheManager(tmp_path / "cache.db")
+    paths = [tmp_path / f"{number}.flac" for number in range(1001)]
+    for path in paths:
+        path.write_bytes(b"audio")
+    statements = []
+    connections = []
+    connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    cache.store_audio_metadata_batch([AudioMetadata(path=path, title=path.stem) for path in paths])
+    assert len(connections) == 3
+    assert sum(statement.startswith("COMMIT") for statement in statements) == 3
+    assert_connections_closed(connections)
+
+    connections.clear()
+    statements.clear()
+    fetched = cache.get_audio_metadata_batch(paths)
+    assert len(fetched) == len(paths)
+    assert len(connections) == 1
+    assert sum(statement.startswith("SELECT") for statement in statements) == 3
+    assert_connections_closed(connections)
 
 
 @pytest.fixture

@@ -418,3 +418,159 @@ def test_artist_stops_lower_ranked_failed_copy_before_new_submission(kind, monke
     assert client.calls == [("best", primary)]
     assert scraper.enqueued_count == 1
     assert scraper.queue_errors == []
+
+
+@pytest.mark.parametrize("kind", ["album", "standalone", "compilation"])
+@pytest.mark.parametrize("state", ["Queued, Remotely", "Completed, Succeeded"])
+def test_artist_protects_history_when_original_peer_is_absent_from_search(kind, state):
+    client = FakeSlskdClient()
+    scraper = artist_scraper(client, {"Night Signals": ["Neon Memory"]})
+    current = add_peer_files(scraper, "new-peer", "Night Signals", ["Neon Memory"])
+    old_file = {"filename": "Music\\Target Artist\\Night Signals\\01 - Neon Memory.mp3", "state": state}
+    client.history = [{"username": "old-peer", "directories": [{"files": [old_file]}]}]
+    if kind == "album":
+        scraper._reconcile_primary_releases()
+    else:
+        item = {"user": "new-peer", "track": "Neon Memory", "file": current[0]}
+        if kind == "compilation":
+            item["release"] = "Night Signals"
+        setattr(scraper, f"verified_{kind}_tracks", [item])
+
+    scraper._queue_downloads()
+
+    assert client.calls == []
+    assert client.cancelled == []
+    assert scraper.enqueued_count == 0
+    assert scraper.queue_errors == []
+
+
+@pytest.mark.parametrize("old_filename", [
+    "Music\\Other Artist\\Other Album\\01 - Neon Memory.mp3",
+    "Music\\Other Target Artistname\\Other Album\\01 - Neon Memory.mp3",
+    "Music\\Target Artist\\Night Signals\\01 - Neon Memory (Live).mp3",
+    "Music\\Target Artist\\Night Signals\\01 - Neon Memory Revisited.mp3",
+    "Music\\Target Artist\\Tribute\\01 - Other Artist - Neon Memory.mp3",
+    "Music\\Other Artist\\Other Album\\01 - Neon Memory (Target Artist).mp3",
+])
+def test_artist_history_does_not_suppress_unrelated_artist_or_version(old_filename):
+    client = FakeSlskdClient()
+    scraper = artist_scraper(client, {"Night Signals": ["Neon Memory"]})
+    current = add_peer_files(scraper, "new-peer", "Night Signals", ["Neon Memory"])
+    client.history = [{"username": "old-peer", "directories": [{"files": [
+        {"filename": old_filename, "state": "Completed, Succeeded"},
+    ]}]}]
+    scraper._reconcile_primary_releases()
+
+    scraper._queue_downloads()
+
+    assert client.calls == [("new-peer", current)]
+    assert scraper.enqueued_count == 1
+
+
+def test_artist_history_rejects_conflicting_track_artist_metadata():
+    client = FakeSlskdClient()
+    scraper = artist_scraper(client, {"Night Signals": ["Neon Memory"]})
+    current = add_peer_files(scraper, "new-peer", "Night Signals", ["Neon Memory"])
+    client.history = [{"username": "old-peer", "directories": [{"files": [
+        {"filename": "Target Artist\\Night Signals\\01 - Neon Memory.mp3", "artist": "Other Artist",
+         "state": "Completed, Succeeded"},
+    ]}]}]
+    scraper._reconcile_primary_releases()
+
+    scraper._queue_downloads()
+
+    assert client.calls == [("new-peer", current)]
+
+
+def test_artist_history_recognizes_filename_artist_credit_outside_artist_folders():
+    client = FakeSlskdClient()
+    scraper = artist_scraper(client)
+    current = add_peer_files(scraper, "new-peer", "Night Signals", ["Neon Memory"])
+    client.history = [{"username": "old-peer", "directories": [{"files": [
+        {"filename": "Shared\\01 - Target Artist - Neon Memory.mp3", "state": "InProgress"},
+    ]}]}]
+    scraper.verified_standalone_tracks = [{"user": "new-peer", "track": "Neon Memory", "file": current[0]}]
+
+    scraper._queue_downloads()
+
+    assert client.calls == []
+    assert scraper.enqueued_count == 0
+
+
+def test_artist_history_protects_only_matching_repeated_title_position():
+    client = FakeSlskdClient()
+    scraper = artist_scraper(client)
+    files = [
+        {"filename": f"Target Artist\\Twin Memories\\{number:02d} Echo.flac", "size": 1000}
+        for number in (1, 2)
+    ]
+    directory = queue_directory("new-peer", "Twin Memories", files)
+    directory.update(release="Twin Memories", matched_tracks=[
+        {"full_filename": file["filename"], "expected": "Echo", "expected_index": index}
+        for index, file in enumerate(files)
+    ])
+    scraper.queued_directories = [directory]
+    client.history = [{"username": "old-peer", "directories": [{"files": [
+        {"filename": "Target Artist\\Twin Memories\\01 - Echo.mp3", "state": "Completed, Succeeded"},
+    ]}]}]
+
+    scraper._queue_downloads()
+
+    assert client.calls == [("new-peer", files[1:])]
+    assert scraper.enqueued_count == 1
+
+
+def test_artist_history_preserves_repeated_title_on_different_disc():
+    client = FakeSlskdClient()
+    scraper = artist_scraper(client)
+    files = [
+        {"filename": f"Target Artist\\Twin Memories\\CD{disc}\\01 Echo.flac", "size": 1000}
+        for disc in (1, 2)
+    ]
+    directory = queue_directory("new-peer", "Twin Memories", files)
+    directory.update(release="Twin Memories", matched_tracks=[
+        {"full_filename": file["filename"], "expected": "Echo", "expected_index": index}
+        for index, file in enumerate(files)
+    ])
+    scraper.queued_directories = [directory]
+    client.history = [{"username": "old-peer", "directories": [{"files": [
+        {"filename": "Target Artist\\Twin Memories\\CD1\\01 - Echo.mp3", "state": "Completed, Succeeded"},
+    ]}]}]
+
+    scraper._queue_downloads()
+
+    assert client.calls == [("new-peer", files[1:])]
+    assert scraper.enqueued_count == 1
+
+
+def test_artist_primary_releases_do_not_queue_same_track_from_two_editions():
+    client = FakeSlskdClient()
+    scraper = artist_scraper(client, {
+        "Night Signals": ["Neon Memory", "Midnight Echo"],
+        "Night Signals Expanded": ["Neon Memory", "Morning Light"],
+    })
+    first = add_peer_files(scraper, "first-peer", "Night Signals", ["Neon Memory", "Midnight Echo"])
+    second = add_peer_files(scraper, "second-peer", "Night Signals Expanded", ["Neon Memory", "Morning Light"], "mp3")
+
+    scraper._reconcile_primary_releases()
+    scraper._queue_downloads()
+
+    assert client.calls == [("first-peer", first), ("second-peer", second[1:])]
+    assert scraper.enqueued_count == 3
+
+
+def test_artist_overlapping_release_can_supply_track_after_first_release_peer_fails():
+    client = FakeSlskdClient({"first-peer": SlskdPeerUnavailableError("first-peer", "offline")})
+    scraper = artist_scraper(client, {
+        "Initial Visions": ["Neon Memory", "Midnight Echo"],
+        "Later Memories": ["Neon Memory", "Morning Light"],
+    })
+    first = add_peer_files(scraper, "first-peer", "Initial Visions", ["Neon Memory", "Midnight Echo"])
+    second = add_peer_files(scraper, "second-peer", "Later Memories", ["Neon Memory", "Morning Light"], "mp3")
+
+    scraper._reconcile_primary_releases()
+    scraper._queue_downloads()
+
+    assert client.calls == [("first-peer", first), ("second-peer", second)]
+    assert client.accepted == second
+    assert scraper.enqueued_count == 2

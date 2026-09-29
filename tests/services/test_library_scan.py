@@ -1,10 +1,77 @@
 """Library release grouping, sequence gaps, and compilation discovery."""
 
+from unittest.mock import Mock
+
 import pytest
 
-from discogseek.core.audio import AudioMetadata
+from discogseek.core.audio import AudioMetadata, AudioQualityAnalyzer
 from discogseek.core.cache import UnifiedCacheManager
 from discogseek.services.library import LibraryReleaseService
+
+
+def test_incremental_scan_batches_cache_and_reads_only_changed_or_new_files(tmp_path, monkeypatch):
+    music = tmp_path / "music"
+    music.mkdir()
+    paths = [music / f"{number:02d}.flac" for number in range(1, 5)]
+    for path in paths[:3]:
+        path.write_bytes(b"audio")
+    cache = UnifiedCacheManager(tmp_path / "cache.db")
+
+    def metadata(path):
+        return AudioMetadata(path=path, title=f"Title {path.stem}", artist="Artist", album="Album",
+                             track_number=str(int(path.stem)), format_label="FLAC")
+
+    cache.store_audio_metadata_batch([metadata(path) for path in paths[:3]])
+    lookup = Mock(wraps=cache.get_audio_metadata_batch)
+    store = Mock(wraps=cache.store_audio_metadata_batch)
+    monkeypatch.setattr(cache, "get_audio_metadata_batch", lookup)
+    monkeypatch.setattr(cache, "store_audio_metadata_batch", store)
+    analyze = Mock(side_effect=metadata)
+    monkeypatch.setattr(AudioQualityAnalyzer, "analyze_file", analyze)
+    service = LibraryReleaseService(cache_manager=cache)
+
+    paths[1].write_bytes(b"changed audio")
+    paths[2].unlink()
+    paths[3].write_bytes(b"new audio")
+    release = service.scan_library_releases(library_dir=music)[0]
+    assert lookup.call_count == 1
+    assert {call.args[0] for call in analyze.call_args_list} == {paths[1], paths[3]}
+    assert store.call_count == 1
+    assert release["found_count"] == 3
+
+    analyze.reset_mock()
+    store.reset_mock()
+    service.scan_library_releases(library_dir=music)
+    analyze.assert_not_called()
+    store.assert_not_called()
+
+    service.scan_library_releases(library_dir=music, force_rescan=True)
+    assert {call.args[0] for call in analyze.call_args_list} == {paths[0], paths[1], paths[3]}
+    assert lookup.call_count == 2  # Forced scans skip cached metadata entirely.
+
+
+def test_scan_does_not_cache_metadata_if_file_changes_before_batch_flush(tmp_path, monkeypatch):
+    music = tmp_path / "music"
+    music.mkdir()
+    paths = [music / "01.flac", music / "02.flac"]
+    for path in paths:
+        path.write_bytes(b"old")
+    cache = UnifiedCacheManager(tmp_path / "cache.db")
+    analyzed = []
+
+    def analyze(path):
+        title = path.read_text()
+        if analyzed:
+            analyzed[0].write_bytes(b"retagged after analysis")
+        analyzed.append(path)
+        return AudioMetadata(path=path, title=title, artist="Artist", album="Album")
+
+    monkeypatch.setattr(AudioQualityAnalyzer, "analyze_file", analyze)
+    LibraryReleaseService(cache_manager=cache).scan_library_releases(library_dir=music, threads=1)
+
+    assert len(analyzed) == 2
+    assert cache.get_audio_metadata(analyzed[0]) is None
+    assert cache.get_audio_metadata(analyzed[1]).title == "old"
 
 
 def test_multi_disc_sequence_gap_detection(tmp_path):

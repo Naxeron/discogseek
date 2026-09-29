@@ -1,6 +1,7 @@
 """Coordinate Soulseek artist discovery, reconciliation, and download queueing."""
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any
 
@@ -17,7 +18,9 @@ from discogseek.core.text import (
     _tokenize_words_cached,
     clean_search_phrase,
     extract_dir_and_filename,
+    is_sublist,
 )
+from discogseek.core.release_metadata import parse_disc_and_track_number
 from discogseek.clients.slskd import (
     SlskdClient, SlskdEnqueueError, SlskdPeerUnavailableError, SlskdTransferFailedError,
 )
@@ -541,10 +544,83 @@ class SlskdArtistScraper:
         self.already_downloading_files = history.queued_filenames
         queued_fps = {"base_filenames": history.queued_base_filenames}
 
+        # An existing peer may be offline or absent from fresh search results.
+        # Index its healthy transfers independently so a renamed/re-encoded copy
+        # cannot bypass the exact-path and basename checks below.
+        protected_directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (user, _), file in history.protected.items():
+            directory, _ = extract_dir_and_filename(file["filename"])
+            protected_directories.setdefault((user, directory), {"matched_search_files": []})[
+                "matched_search_files"
+            ].append(file)
+        protected_index = PeerCandidateIndex(protected_directories)
+        alias_words = [normalize_text(alias).split() for alias in self.all_artist_aliases if alias]
+
+        def history_position(filename: str, file: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], Optional[int]]:
+            file = file or {}
+            try:
+                disc = int(file.get("disc_number"))
+            except (TypeError, ValueError):
+                disc = None
+            parts = filename.replace("\\", "/").split("/")
+            if disc is None:
+                for folder in reversed(parts[:-1]):
+                    match = re.search(
+                        r"(?:^|[\s._\-\[(])(?:disc|disk|cd)[\s._\-]*(\d+)(?:$|[\s._\-\])])",
+                        folder, re.IGNORECASE,
+                    )
+                    if match:
+                        disc = int(match.group(1))
+                        break
+            return parse_disc_and_track_number(
+                file.get("track_number"), filename=parts[-1], meta_disc=disc,
+            )[:2]
+
+        def protected_track(track: str, release: str = "", reference: str = "",
+                            repeated: bool = False, compilation: bool = False) -> Optional[CandidateFile]:
+            expected_base = pre_parse_single_track(track)["p_struct"]["base_norm"]
+            for candidate in find_track_candidates(protected_index, track, self.all_artist_aliases, release):
+                # Search matching deliberately tolerates partial titles. History
+                # suppression needs the complete title, including version checks
+                # already enforced by find_track_candidates.
+                if not expected_base or candidate.p_struct["base_norm"] != expected_base:
+                    continue
+                # Transfer history contains every artist, unlike artist search
+                # results. Require identifying context outside the track title.
+                directory_words = normalize_text(candidate.dir_name).split()
+                filename_prefix = re.sub(
+                    r"^(?:\[?\d+(?:[-_.]\d+)?\]?[\s._-]+)", "", candidate.base_filename,
+                ).split(" - ", 1)
+                prefix_words = normalize_text(filename_prefix[0]).split() if len(filename_prefix) > 1 else []
+                credited_words = normalize_text(candidate.raw_file.get("artist", "")).split()
+                if credited_words and not any(is_sublist(words, credited_words) for words in alias_words):
+                    continue
+                if prefix_words and prefix_words != expected_base.split() and prefix_words not in alias_words:
+                    continue
+                artist_context = any(
+                    is_sublist(words, directory_words) or words == prefix_words
+                    or any(is_sublist(words, normalize_text(candidate.raw_file.get(field, "")).split())
+                           for field in ("artist", "album_artist"))
+                    for words in alias_words
+                )
+                release_context = compilation and is_sublist(normalize_text(release).split(), directory_words)
+                if not artist_context and not release_context:
+                    continue
+                if repeated:
+                    # Two positions titled "Echo" remain distinct. A title-only
+                    # history match cannot account for both of them.
+                    expected_position = history_position(reference)
+                    existing_position = history_position(candidate.full_filename, candidate.raw_file)
+                    if expected_position[1] is None or existing_position != expected_position:
+                        continue
+                return candidate
+            return None
+
         logger = logging.getLogger(__name__)
         self.queue_errors.clear()
         unavailable: Dict[str, SlskdPeerUnavailableError] = {}
         unresolved_peers: Dict[str, Tuple[Exception, List[Dict[str, Any]]]] = {}
+        queued_titles: Set[str] = set()
 
         def basename(filename: str) -> str:
             return filename.replace("/", "\\").split("\\")[-1].lower()
@@ -611,6 +687,17 @@ class SlskdArtistScraper:
             }
             candidates = self._release_candidates.get(normalize_text(directory.get("release", "")), [directory])
             protected_targets = set()
+            title_counts: Dict[str, int] = {}
+            for match in directory.get("matched_tracks", []):
+                title = normalize_text(match["expected"])
+                title_counts[title] = title_counts.get(title, 0) + 1
+            for match in directory.get("matched_tracks", []):
+                title = normalize_text(match["expected"])
+                if (title_counts[title] == 1 and title in queued_titles) or protected_track(
+                    match["expected"], directory.get("release", ""), match["full_filename"],
+                    repeated=title_counts[title] > 1,
+                ):
+                    protected_targets.add(targets[match["full_filename"]])
             for candidate in candidates:
                 targets = file_targets(candidate)
                 for file in candidate["all_dir_files"]:
@@ -642,8 +729,14 @@ class SlskdArtistScraper:
                     self.queue_errors.append(f"Failed to enqueue {candidate['directory']}: {error}")
                     peer_error = None
                     break
+            # Cover a title only after slskd accepted it (or history protected
+            # it), so a later edition can still supply a failed first attempt.
+            targets = file_targets(directory)
+            for match in directory.get("matched_tracks", []):
+                title = normalize_text(match["expected"])
+                if title_counts[title] == 1 and targets[match["full_filename"]] not in remaining:
+                    queued_titles.add(title)
             if remaining and peer_error is not None:
-                targets = file_targets(directory)
                 record_unavailable(peer_error, [
                     file for file in directory["all_dir_files"]
                     if file.get("filename") and targets.get(file["filename"], file["filename"]) in remaining
@@ -653,6 +746,13 @@ class SlskdArtistScraper:
         # for tracks refused because that peer was unavailable.
         single_tracks_by_user: Dict[str, List[Dict[str, Any]]] = {}
         for item in self.verified_compilation_tracks + self.verified_standalone_tracks:
+            if normalize_text(item["track"]) in queued_titles:
+                continue
+            protected = protected_track(item["track"], item.get("release", ""), compilation=bool(item.get("release")))
+            if protected is not None:
+                item.update(user=protected.user, format_label=protected.fmt_label,
+                            file={**protected.raw_file, "filename": protected.full_filename})
+                continue
             if self.candidate_index is None:
                 self.candidate_index = PeerCandidateIndex(self.peer_directories)
             for candidate in find_track_candidates(

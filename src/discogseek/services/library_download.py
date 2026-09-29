@@ -277,12 +277,19 @@ def download_missing_tracks(
             originals.append(requested_by_key[key])
             keys.append(key)
         if items and not dry_run:
-            try:
-                # Stop slskd retrying the failed source before submitting its replacement.
-                history.prepare_recovery(slskd_client)
-            except SlskdAPIError as error:
-                queue_errors.append({"stage": "recovery", "error": str(error), "tracks": originals})
-                return
+            ready_items, ready_originals, ready_keys = [], [], []
+            for item, original, key in zip(items, originals, keys):
+                try:
+                    # Stop only this row's failed sources before replacing it.
+                    # Another row's cancellation failure must not block the batch.
+                    history.prepare_recovery(slskd_client, failed_source_tracks.get(key, set()))
+                except SlskdAPIError as error:
+                    queue_errors.append({"stage": "recovery", "error": str(error), "tracks": [original]})
+                    continue
+                ready_items.append(item)
+                ready_originals.append(original)
+                ready_keys.append(key)
+            items, originals, keys = ready_items, ready_originals, ready_keys
         # Keep each API call to one chunk, so a later failure cannot hide earlier successes.
         for start in range(0, len(items), 50):
             chunk = items[start:start + 50]
@@ -340,6 +347,59 @@ def download_missing_tracks(
             failed_source_tracks.setdefault(track_key(track), set()).add(source_key(user, file.get("filename", "")))
             return False
         return True
+
+    def reuse_history() -> None:
+        # History is independent of search results: a queued/offline peer or a
+        # completed file may never appear in another search. Resolve these first.
+        directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for (user, _), file in history.protected.items():
+            folder = os.path.dirname(file["filename"].replace("\\", "/"))
+            directories.setdefault((user, folder), {"matched_search_files": []})["matched_search_files"].append(file)
+        index = PeerCandidateIndex(directories)
+        for track in remaining_tracks():
+            parsed_track = pre_parse_single_track(track.get("title", ""))
+            track_artist = (track.get("artist") or "").strip()
+            known_track_artist = (
+                track_artist and not is_various_artists(track_artist) and track_artist.lower() != "unknown artist"
+            )
+            expected_artists = {
+                normalize_text(name) for name in [track_artist if known_track_artist else artist]
+                if name and not is_various_artists(name) and name.lower() != "unknown artist"
+            }
+            candidates = index.get_candidate_files_for_track(parsed_track)
+            for candidate in sorted(candidates, key=lambda item: candidate_rank(item.user, item.raw_file)):
+                file = candidate.raw_file
+                # Fuzzy discovery is useful for searches, but must not hide a
+                # distinct title such as Horsey Noisers behind Horsey Noises.
+                if candidate.p_struct["base_norm"] != parsed_track["p_struct"]["base_norm"]:
+                    continue
+                # Unlike query results, unrelated history has no search context.
+                # Require artist evidence outside the title (or the release
+                # folder for compilations with unknown track credits).
+                folder_words = " " + normalize_text(candidate.dir_name) + " "
+                tagged_artist = normalize_text(file.get("artist") or "")
+                unnumbered = re.sub(
+                    r"^(?:\(\d+\)|\[\d+\]|\d+(?:[-_.]\d+)?)[\s._-]+", "", candidate.base_filename,
+                )
+                parts = re.split(r"\s+[-_]\s+", unnumbered)
+                prefix = normalize_text(parts[0]) if len(parts) > 1 else ""
+                title = normalize_text(track.get("title", ""))
+                if title == prefix or title.startswith(prefix + " "):
+                    prefix = ""
+                has_artist = any(
+                    re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", folder_words)
+                    or tagged_artist == name
+                    or prefix == name
+                    for name in expected_artists
+                )
+                album = normalize_text(release_title)
+                has_context = has_artist if expected_artists else bool(
+                    album and re.search(r"(?<!\w)" + re.escape(album) + r"(?!\w)", folder_words)
+                )
+                if has_context and candidate_matches(track, file, False):
+                    queue_matches(candidate.user, [(track, file)])
+                    if track_key(track) in resolved_missing:
+                        break
 
     def evaluate_album(responses: List[Dict[str, Any]], require_artist: bool = False) -> None:
         # Compare all peers before choosing, so response ordering cannot override format preference.
@@ -406,19 +466,28 @@ def download_missing_tracks(
         else:
             queries = [f"{artist} {release_title}", clean_search_phrase(f"{artist} {release_title}"), release_title]
         queries = unique_queries(queries)
-        for attempt, query in enumerate(queries, 1):
+        # Keep the likely album query as a cheap fast path. If it misses, wait
+        # for the cleaned/title-only variants together instead of serially.
+        for attempt, group in enumerate((queries[:1], queries[1:]), 1):
             remaining = remaining_tracks()
-            if not remaining:
+            if not remaining or not group:
                 break
-            report_progress(f"Release search {attempt}/{len(queries)}: {query}…")
+            report_progress(f"Release search {attempt}/{min(2, len(queries))}: {' / '.join(group)}…")
             try:
-                result = slskd_client.search(query=query, timeout=search_timeout)
+                if len(group) == 1:
+                    results = {group[0]: slskd_client.search(query=group[0], timeout=search_timeout)}
+                else:
+                    results = slskd_client.batch_search(group, timeout=search_timeout)
             except Exception as error:
                 record_search_error(error, remaining)
                 continue
             # A response may contain only artwork, locked files or wrong versions.
             # Continue the fallback queries until actual requested tracks match.
-            evaluate_album(result.get("responses", []), require_artist=not is_va and query == release_title)
+            for query in group:
+                if not remaining_tracks():
+                    break
+                evaluate_album(results.get(query, {}).get("responses", []),
+                               require_artist=not is_va and query == release_title)
 
     def search_tracks() -> None:
         remaining = remaining_tracks()
@@ -462,6 +531,7 @@ def download_missing_tracks(
                 # search with no usable files. The other strategy may still work.
                 break
 
+            candidates_by_track = {}
             for query, tracks in query_tracks.items():
                 candidates = [
                     (response["username"], file)
@@ -476,11 +546,28 @@ def download_missing_tracks(
                         if file_key(user, file) not in used_files and candidate_available(track, user, file, True)
                     ]
                     available.sort(key=lambda item: not history.is_protected(item[0], item[1].get("filename", "")))
-                    for user, file in available:
-                        queue_matches(user, [(track, file)])
-                        if track_key(track) in resolved_missing:
-                            break
+                    candidates_by_track[track_key(track)] = available
 
+            # A peer can satisfy several separate track queries. Submit these
+            # together (queue_matches caps requests at 50 files), retaining the
+            # next-best candidates if that peer is definitely unavailable.
+            while True:
+                matches_by_user = {}
+                selected_files = set(used_files)
+                for track in remaining_tracks():
+                    for user, file in candidates_by_track.get(track_key(track), []):
+                        identity = file_key(user, file)
+                        if user_key(user) in unavailable_users or identity in selected_files:
+                            continue
+                        matches_by_user.setdefault(user, []).append((track, file))
+                        selected_files.add(identity)
+                        break
+                if not matches_by_user:
+                    break
+                for user, matches in matches_by_user.items():
+                    queue_matches(user, matches)
+
+    reuse_history()
     if search_scope == "track":
         search_tracks()
         search_album()

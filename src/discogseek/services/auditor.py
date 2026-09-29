@@ -37,6 +37,11 @@ def is_distinct_track_title(title_norm: str) -> bool:
     return False
 
 
+def _discovery_text(value: str) -> str:
+    """Treat filename-safe underscores as word separators during discovery."""
+    return normalize_text(value.replace("_", " "))
+
+
 class AudioFileScanner:
     """Scans local music directory with fast 2-stage discovery and persistent SQLite caching."""
 
@@ -60,18 +65,18 @@ class AudioFileScanner:
             return []
 
         # 1. Compile Artist Alias Regex
-        alias_norms = sorted({normalize_text(a) for a in self.catalog.aliases if normalize_text(a) and len(normalize_text(a)) >= 2}, key=len, reverse=True)
+        alias_norms = sorted({_discovery_text(a) for a in self.catalog.aliases if len(_discovery_text(a)) >= 2}, key=len, reverse=True)
         alias_regex = re.compile(r"(?:\b|_)(?:" + "|".join(re.escape(a) for a in alias_norms) + r")(?:\b|_)", re.IGNORECASE) if alias_norms else None
 
         # 2. Compile Release Title Regex
         rel_norms_set = set()
         for rel in self.catalog.releases:
-            norm = normalize_text(rel.get("title", ""))
+            norm = _discovery_text(rel.get("title", ""))
             if norm and len(norm) >= 2 and norm not in GENERIC_OR_COMMON_WORDS:
                 rel_norms_set.add(norm)
         for trk in self.catalog.tracks:
             for rel_t in trk.get("all_releases", set()):
-                norm = normalize_text(rel_t)
+                norm = _discovery_text(rel_t)
                 if norm and len(norm) >= 2 and norm not in GENERIC_OR_COMMON_WORDS:
                     rel_norms_set.add(norm)
         rel_norms = sorted(rel_norms_set, key=len, reverse=True)
@@ -79,9 +84,9 @@ class AudioFileScanner:
 
         # 3. Compile Distinct Track Title Regex
         trk_norms_set = {
-            trk.get("norm_title", "")
+            _discovery_text(trk.get("norm_title", ""))
             for trk in self.catalog.tracks
-            if is_distinct_track_title(trk.get("norm_title", ""))
+            if is_distinct_track_title(_discovery_text(trk.get("norm_title", "")))
         }
         trk_norms = sorted(trk_norms_set, key=len, reverse=True)
         trk_regex = re.compile(r"(?:\b|_)(?:" + "|".join(re.escape(t) for t in trk_norms) + r")(?:\b|_)", re.IGNORECASE) if trk_norms else None
@@ -104,7 +109,7 @@ class AudioFileScanner:
             except ValueError:
                 pass
 
-            norm_root = normalize_text(root)
+            norm_root = _discovery_text(root)
             dir_matches = bool((alias_regex and alias_regex.search(norm_root)) or (rel_regex and rel_regex.search(norm_root)))
 
             audio_in_dir = [f for f in files if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS]
@@ -117,9 +122,9 @@ class AudioFileScanner:
             else:
                 matching_files = [
                     f for f in audio_in_dir
-                    if (alias_regex and alias_regex.search(normalize_text(f)))
-                    or (trk_regex and trk_regex.search(normalize_text(f)))
-                    or (rel_regex and rel_regex.search(normalize_text(f)))
+                    if (alias_regex and alias_regex.search(_discovery_text(f)))
+                    or (trk_regex and trk_regex.search(_discovery_text(f)))
+                    or (rel_regex and rel_regex.search(_discovery_text(f)))
                 ]
                 if len(matching_files) >= 2 or (matching_files and len(matching_files) == len(audio_in_dir)):
                     for f in audio_in_dir:

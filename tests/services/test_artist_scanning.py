@@ -2,10 +2,56 @@
 
 import time
 
+import pytest
+
 from discogseek.clients.musicbrainz import ArtistCatalog
 from discogseek.core.audio import AudioMetadata, AudioQualityAnalyzer
 from discogseek.core.cache import UnifiedCacheManager
 from discogseek.services.auditor import AudioFileScanner
+from discogseek.services.reconciler import DiscographyReconciler
+
+
+@pytest.mark.parametrize("folder", [
+    "2003-04-06_ All Tomorrow's Parties, Camber Sands, Sussex, UK ()",
+    "loose",
+])
+def test_artist_scan_finds_filename_safe_colons_from_cached_tags(tmp_path, monkeypatch, folder):
+    title = "2003-04-06: All Tomorrow's Parties, Camber Sands, UK"
+    album = "2003-04-06: All Tomorrow's Parties, Camber Sands, Sussex, UK"
+    recording_id = "c8355854-06a2-4752-9c88-6b9218e6a045"
+    catalog = ArtistCatalog({
+        "artist": {"id": "venetian-snares", "name": "Venetian Snares"},
+        "releases_artist": [{
+            "id": "atp-release",
+            "title": album,
+            "medium-list": [{"track-list": [{
+                "id": "atp-track", "number": "1", "title": title,
+                "recording": {"id": recording_id, "title": title},
+            }]}],
+        }],
+    })
+    music_dir = tmp_path / "music"
+    audio_path = music_dir / "downloads" / folder / (
+        "1 - 2003-04-06_ All Tomorrow's Parties, Camber Sands, UK (1).mp3"
+    )
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"cached audio")
+    cache = UnifiedCacheManager(db_path=tmp_path / "audio.db")
+    cache.store_audio_metadata(AudioMetadata(
+        path=audio_path, title=title, album=album, artist="Venetian Snares",
+        track_number="1", mb_rec_ids={recording_id},
+    ))
+
+    def unexpected_audio_read(path):
+        pytest.fail(f"Cached metadata should satisfy discovery: {path}")
+
+    monkeypatch.setattr(AudioQualityAnalyzer, "analyze_file", unexpected_audio_read)
+    tracks = AudioFileScanner(music_dir, catalog, cache_manager=cache).scan()
+    found, missing = DiscographyReconciler(catalog, tracks).reconcile()
+
+    assert [track["path"] for track in tracks] == [str(audio_path)]
+    assert len(found) == 1
+    assert missing == []
 
 
 def test_audio_file_scanner_skips_trash(tmp_path):

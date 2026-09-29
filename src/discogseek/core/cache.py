@@ -8,7 +8,7 @@ import sqlite3
 import hashlib
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Set, Iterator
+from typing import Dict, List, Optional, Any, Set, Iterator, Tuple
 
 from discogseek.config import Config
 from discogseek.core.audio import AudioMetadata
@@ -85,85 +85,138 @@ class UnifiedCacheManager:
 
     def get_audio_metadata(self, file_path: Path) -> Optional[AudioMetadata]:
         """Retrieves cached AudioMetadata if file mtime and size match."""
-        try:
-            st = file_path.stat()
-            path_str = str(file_path.resolve())
-            with self._get_conn() as conn:
-                cur = conn.execute(
-                    "SELECT * FROM audio_cache WHERE path = ? AND mtime = ? AND size_bytes = ?",
-                    (path_str, st.st_mtime, st.st_size)
-                )
-                row = cur.fetchone()
-                if not row:
-                    return None
+        return self.get_audio_metadata_batch([file_path]).get(file_path)
 
-                return AudioMetadata(
-                    path=file_path,
-                    file_type=file_path.suffix.lower(),
-                    title=row["title"] or "",
-                    artist=row["artist"] or "",
-                    album_artist=row["album_artist"] or "",
-                    album=row["album"] or "",
-                    track_number=row["track_number"] or "",
-                    year=row["year"] or "",
-                    genres=json.loads(row["genres"]) if row["genres"] else [],
-                    mb_track_ids=set(json.loads(row["mb_track_ids"])) if row["mb_track_ids"] else set(),
-                    mb_rec_ids=set(json.loads(row["mb_rec_ids"])) if row["mb_rec_ids"] else set(),
-                    mb_artist_ids=set(json.loads(row["mb_artist_ids"])) if row["mb_artist_ids"] else set(),
-                    mb_release_ids=set(json.loads(row["mb_release_ids"])) if row["mb_release_ids"] else set(),
-                    bitrate_kbps=row["bitrate_kbps"] or 0,
-                    bit_depth=row["bit_depth"] or 0,
-                    sample_rate=row["sample_rate"] or 0,
-                    channels=row["channels"] or 2,
-                    duration=row["duration"] or 0.0,
-                    is_lossless=bool(row["is_lossless"]),
-                    format_label=row["format_label"] or "",
-                    quality_score=row["quality_score"] or 0
-                )
+    def get_audio_metadata_batch(self, file_paths: List[Path]) -> Dict[Path, AudioMetadata]:
+        """Read fresh file fingerprints in chunks using one database connection."""
+        cached = {}
+        if not file_paths:
+            return cached
+        try:
+            with self._get_conn() as conn:
+                # Stay below SQLite's older 999-variable limit and avoid a
+                # connection and SELECT for every track in a warm library scan.
+                for start in range(0, len(file_paths), 500):
+                    fingerprints = {}
+                    for file_path in file_paths[start:start + 500]:
+                        try:
+                            st = file_path.stat()
+                            canonical_path = str(file_path.resolve())
+                            fingerprints.setdefault(canonical_path, []).append((file_path, st))
+                        except OSError:
+                            continue
+                    if not fingerprints:
+                        continue
+                    placeholders = ",".join("?" for _ in fingerprints)
+                    rows = conn.execute(
+                        f"SELECT * FROM audio_cache WHERE path IN ({placeholders})",
+                        tuple(fingerprints),
+                    )
+                    for row in rows:
+                        for file_path, st in fingerprints[row["path"]]:
+                            if row["mtime"] != st.st_mtime or row["size_bytes"] != st.st_size:
+                                continue
+                            try:
+                                cached[file_path] = self._audio_metadata_from_row(file_path, row)
+                            except (TypeError, ValueError):
+                                # A bad cache entry must not discard the other
+                                # valid hits or prevent a fresh metadata read.
+                                continue
         except Exception:
-            return None
+            pass
+        return cached
+
+    @staticmethod
+    def _audio_metadata_from_row(file_path: Path, row: sqlite3.Row) -> AudioMetadata:
+        return AudioMetadata(
+            path=file_path,
+            file_type=file_path.suffix.lower(),
+            title=row["title"] or "",
+            artist=row["artist"] or "",
+            album_artist=row["album_artist"] or "",
+            album=row["album"] or "",
+            track_number=row["track_number"] or "",
+            year=row["year"] or "",
+            genres=json.loads(row["genres"]) if row["genres"] else [],
+            mb_track_ids=set(json.loads(row["mb_track_ids"])) if row["mb_track_ids"] else set(),
+            mb_rec_ids=set(json.loads(row["mb_rec_ids"])) if row["mb_rec_ids"] else set(),
+            mb_artist_ids=set(json.loads(row["mb_artist_ids"])) if row["mb_artist_ids"] else set(),
+            mb_release_ids=set(json.loads(row["mb_release_ids"])) if row["mb_release_ids"] else set(),
+            bitrate_kbps=row["bitrate_kbps"] or 0,
+            bit_depth=row["bit_depth"] or 0,
+            sample_rate=row["sample_rate"] or 0,
+            channels=row["channels"] or 2,
+            duration=row["duration"] or 0.0,
+            is_lossless=bool(row["is_lossless"]),
+            format_label=row["format_label"] or "",
+            quality_score=row["quality_score"] or 0
+        )
 
     def store_audio_metadata(self, meta: AudioMetadata) -> None:
         """Stores AudioMetadata into the cache."""
+        self.store_audio_metadata_batch([meta])
+
+    def store_audio_metadata_batch(
+        self, metadata: List[AudioMetadata],
+        expected_fingerprints: Optional[Dict[Path, Tuple[float, int]]] = None,
+    ) -> None:
+        """Store metadata in bounded transactions, retaining per-file validity."""
+        for start in range(0, len(metadata), 500):
+            rows = []
+            for meta in metadata[start:start + 500]:
+                try:
+                    st = meta.path.stat()
+                    if (expected_fingerprints is not None
+                            and expected_fingerprints.get(meta.path) != (st.st_mtime, st.st_size)):
+                        continue
+                    rows.append(self._audio_metadata_values(meta, st.st_mtime, st.st_size))
+                except (OSError, TypeError, ValueError):
+                    continue
+            if not rows:
+                continue
+            self._store_audio_metadata_rows(rows)
+
+    def _store_audio_metadata_rows(self, rows: List[tuple]) -> None:
         try:
-            st = meta.path.stat()
-            path_str = str(meta.path.resolve())
             with self._get_conn() as conn:
-                conn.execute("""
+                conn.executemany("""
                     INSERT OR REPLACE INTO audio_cache (
                         path, mtime, size_bytes, title, artist, album_artist, album,
                         track_number, year, genres, mb_track_ids, mb_rec_ids, mb_artist_ids,
                         mb_release_ids, bitrate_kbps, bit_depth, sample_rate, channels,
                         duration, is_lossless, format_label, quality_score, cached_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    path_str,
-                    st.st_mtime,
-                    st.st_size,
-                    meta.title,
-                    meta.artist,
-                    meta.album_artist,
-                    meta.album,
-                    meta.track_number,
-                    meta.year,
-                    json.dumps(meta.genres),
-                    json.dumps(list(meta.mb_track_ids)),
-                    json.dumps(list(meta.mb_rec_ids)),
-                    json.dumps(list(meta.mb_artist_ids)),
-                    json.dumps(list(meta.mb_release_ids)),
-                    meta.bitrate_kbps,
-                    meta.bit_depth,
-                    meta.sample_rate,
-                    meta.channels,
-                    meta.duration,
-                    1 if meta.is_lossless else 0,
-                    meta.format_label,
-                    meta.quality_score,
-                    time.time()
-                ))
-                conn.commit()
+                """, rows)
         except Exception:
             pass
+
+    @staticmethod
+    def _audio_metadata_values(meta: AudioMetadata, mtime: float, size: int) -> tuple:
+        return (
+            str(meta.path.resolve()),
+            mtime,
+            size,
+            meta.title,
+            meta.artist,
+            meta.album_artist,
+            meta.album,
+            meta.track_number,
+            meta.year,
+            json.dumps(meta.genres),
+            json.dumps(list(meta.mb_track_ids)),
+            json.dumps(list(meta.mb_rec_ids)),
+            json.dumps(list(meta.mb_artist_ids)),
+            json.dumps(list(meta.mb_release_ids)),
+            meta.bitrate_kbps,
+            meta.bit_depth,
+            meta.sample_rate,
+            meta.channels,
+            meta.duration,
+            1 if meta.is_lossless else 0,
+            meta.format_label,
+            meta.quality_score,
+            time.time()
+        )
 
     # --- Generic API / Key-Value Cache Methods ---
 

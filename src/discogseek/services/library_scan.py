@@ -58,24 +58,44 @@ def scan_library_releases(
     all_tracks: List[AudioMetadata] = []
     uncached_paths: List[Path] = []
 
+    cached_metadata = cache.get_audio_metadata_batch(audio_paths) if not force_rescan else {}
     for p in audio_paths:
-        if not force_rescan:
-            cached = cache.get_audio_metadata(p)
-            if cached:
-                all_tracks.append(cached)
-                continue
-        uncached_paths.append(p)
+        cached = cached_metadata.get(p)
+        if cached:
+            all_tracks.append(cached)
+        else:
+            uncached_paths.append(p)
+    del cached_metadata
 
     if uncached_paths:
         completed = len(all_tracks)
+        pending_cache = []
+        pending_fingerprints = {}
+
+        def analyze_with_fingerprint(path):
+            # Batch writes may happen well after analysis. Never save old tags
+            # under a new fingerprint if a download or retag changes the file.
+            try:
+                stat = path.stat()
+            except OSError:
+                return None, None
+            return AudioQualityAnalyzer.analyze_file(path), (stat.st_mtime, stat.st_size)
+
         with ThreadPoolExecutor(max_workers=threads) as pool:
-            for meta in pool.map(AudioQualityAnalyzer.analyze_file, uncached_paths):
+            for meta, fingerprint in pool.map(analyze_with_fingerprint, uncached_paths):
                 if meta:
-                    cache.store_audio_metadata(meta)
+                    pending_cache.append(meta)
+                    pending_fingerprints[meta.path] = fingerprint
+                    if len(pending_cache) >= 500:
+                        cache.store_audio_metadata_batch(pending_cache, pending_fingerprints)
+                        pending_cache.clear()
+                        pending_fingerprints.clear()
                     all_tracks.append(meta)
                 completed += 1
                 if on_progress and completed % 25 == 0:
                     on_progress(completed, total_files, "Extracting audio metadata...")
+        if pending_cache:
+            cache.store_audio_metadata_batch(pending_cache, pending_fingerprints)
 
     releases_map = _group_releases(all_tracks, lib_path)
     release_list = [_finalize_release(rel) for rel in releases_map.values()]

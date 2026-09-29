@@ -248,125 +248,153 @@ class SlskdClient:
     def batch_search(
         self,
         queries: List[str],
-        timeout: float = 25.0,
+        timeout: float = 28.0,
         poll_interval: float = 1.0,
         max_concurrent: int = 8,
         use_existing: bool = True,
         on_progress: Optional[Callable[[int, int, str], None]] = None
     ) -> Dict[str, Dict[str, Any]]:
-        """Executes multiple Soulseek searches concurrently and waits for completion."""
+        """Search in bounded chunks, polling their results concurrently."""
         clean_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
         if not clean_queries:
             return {}
 
         results: Dict[str, Dict[str, Any]] = {}
-        pending_queries: List[str] = []
         query_to_search_id: Dict[str, str] = {}
+        cached_query_ids: Dict[str, str] = {}
         total_queries = len(clean_queries)
         completed_queries = 0
-
-        # 1. Check existing searches
-        if use_existing:
-            existing = self.list_searches()
-            existing_by_text: Dict[str, List[Dict[str, Any]]] = {}
-            for s in existing:
-                st = s.get("searchText", "").strip().lower()
-                if st:
-                    if st not in existing_by_text:
-                        existing_by_text[st] = []
-                    existing_by_text[st].append(s)
-
-            for q in clean_queries:
-                q_lower = q.lower()
-                if q_lower in existing_by_text:
-                    matches = existing_by_text[q_lower]
-                    best_s = max(matches, key=lambda x: (x.get("fileCount", 0), 1 if ("Completed" in x.get("state", "") or x.get("isComplete", False)) else 0))
-                    sid = best_s.get("id")
-                    st = best_s.get("state", "")
-                    is_done = best_s.get("isComplete", False) or "Completed" in st
-                    if is_done and best_s.get("fileCount", 0) > 0:
-                        try:
-                            full_res = self.get_search_results(sid)
-                            if full_res.get("responses"):
-                                results[q] = full_res
-                                completed_queries += 1
-                                if on_progress:
-                                    on_progress(completed_queries, total_queries, q)
-                                continue
-                        except Exception:
-                            pass
-                    elif is_done and best_s.get("fileCount", 0) == 0:
-                        try:
-                            self.delete_search(sid)
-                        except Exception:
-                            pass
-                    elif not is_done and sid:
-                        query_to_search_id[q] = sid
-
-                pending_queries.append(q)
-        else:
-            pending_queries = list(clean_queries)
-
-        # 2. Dispatch remaining searches in parallel chunks
         chunk_size = max(1, min(max_concurrent, 8))
-        min_settle_time = min(6.0, timeout / 2)
-        for i in range(0, len(pending_queries), chunk_size):
-            chunk = pending_queries[i:i + chunk_size]
-            chunk_query_ids: Dict[str, str] = {}
+        effective_timeout = max(timeout, 28.0)
 
-            def _init_single(q_str: str) -> Tuple[str, Optional[str]]:
-                if q_str in query_to_search_id:
-                    return q_str, query_to_search_id[q_str]
-                try:
-                    resp = self._request("POST", "/api/v0/searches", json={"searchText": q_str})
-                    if resp.status_code in (200, 201):
-                        return q_str, resp.json().get("id")
-                except Exception:
-                    pass
-                return q_str, None
+        def _complete(q_str: str) -> None:
+            nonlocal completed_queries
+            completed_queries += 1
+            if on_progress:
+                on_progress(completed_queries, total_queries, q_str)
 
-            with ThreadPoolExecutor(max_workers=len(chunk)) as executor:
-                futures = [executor.submit(_init_single, q) for q in chunk]
-                for fut in as_completed(futures):
-                    q_str, sid = fut.result()
-                    if sid:
-                        chunk_query_ids[q_str] = sid
+        def _remember(q_str: str, data: Dict[str, Any]) -> None:
+            previous = results.get(q_str, {})
+            previous_responses = previous.get("responses") or []
+            responses = data.get("responses") or []
+            # slskd can return an empty/queued snapshot after streaming files.
+            # Keep those files while updating the search's completion state.
+            if any(r.get("files") for r in previous_responses) and not any(r.get("files") for r in responses):
+                data = dict(data, responses=previous_responses)
+                for field in ("fileCount", "responseCount"):
+                    data[field] = max(data.get(field, 0), previous.get(field, 0))
+            results[q_str] = data
 
-            active_chunk = dict(chunk_query_ids)
-            start_time = time.time()
+        # Reuse completed searches or attach to searches already in progress.
+        if use_existing:
+            existing_by_text: Dict[str, List[Dict[str, Any]]] = {}
+            for search in self.list_searches():
+                search_text = search.get("searchText", "").strip().lower()
+                if search_text and search.get("id"):
+                    existing_by_text.setdefault(search_text, []).append(search)
 
-            while active_chunk and (time.time() - start_time < timeout):
-                time.sleep(poll_interval)
-                elapsed = time.time() - start_time
-                for q_str, sid in list(active_chunk.items()):
+            for query in clean_queries:
+                matches = existing_by_text.get(query.lower(), [])
+                if not matches:
+                    continue
+                running = [s for s in matches if not (
+                    s.get("isComplete", False) or "Completed" in s.get("state", "")
+                )]
+                if running:
+                    # Also keep this ID if retrieving a completed cache entry fails.
+                    query_to_search_id[query] = max(running, key=lambda s: s.get("fileCount", 0))["id"]
+                best = max(matches, key=lambda s: (
+                    bool(s.get("fileCount", 0) > 0 and (
+                        s.get("isComplete", False) or "Completed" in s.get("state", "")
+                    )),
+                    s.get("fileCount", 0),
+                ))
+                sid = best["id"]
+                is_done = best.get("isComplete", False) or "Completed" in best.get("state", "")
+                if is_done and best.get("fileCount", 0) > 0:
+                    cached_query_ids[query] = sid
+                elif not is_done:
+                    query_to_search_id[query] = sid
+                else:
                     try:
-                        poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
-                        if poll_resp.status_code == 200:
-                            s_data = poll_resp.json()
-                            is_complete = s_data.get("isComplete", False) or "Completed" in s_data.get("state", "")
-                            has_files = s_data.get("fileCount", 0) > 0 or len(s_data.get("responses", [])) > 0
-
-                            # Allow early completion if complete with files, or if complete and min settle time passed
-                            if is_complete and (has_files or elapsed >= min_settle_time):
-                                results[q_str] = s_data
-                                del active_chunk[q_str]
-                                completed_queries += 1
-                                if on_progress:
-                                    on_progress(completed_queries, total_queries, q_str)
+                        self.delete_search(sid)
                     except Exception:
                         pass
 
-            # Timeout fallback for any remaining active searches in chunk
-            for q_str, sid in list(active_chunk.items()):
+        def _init_single(q_str: str) -> Optional[str]:
+            if q_str in query_to_search_id:
+                return query_to_search_id[q_str]
+            resp = self._request("POST", "/api/v0/searches", json={"searchText": q_str})
+            if resp.status_code in (200, 201):
+                return resp.json().get("id")
+            return None
+
+        # Reuse workers for all reads so an HTTP round trip is paid once per
+        # polling round instead of once per query. Progress stays on this thread.
+        with ThreadPoolExecutor(max_workers=chunk_size) as executor:
+            cached_futures = {
+                executor.submit(self.get_search_results, sid): query
+                for query, sid in cached_query_ids.items()
+            }
+            for future in as_completed(cached_futures):
+                query = cached_futures[future]
                 try:
-                    poll_resp = self._request("GET", f"/api/v0/searches/{sid}?includeResponses=true")
-                    if poll_resp.status_code == 200:
-                        results[q_str] = poll_resp.json()
-                    completed_queries += 1
-                    if on_progress:
-                        on_progress(completed_queries, total_queries, q_str)
+                    data = future.result()
+                    if data.get("responses"):
+                        results[query] = data
+                        _complete(query)
                 except Exception:
                     pass
+
+            pending_queries = [query for query in clean_queries if query not in results]
+            for i in range(0, len(pending_queries), chunk_size):
+                chunk = pending_queries[i:i + chunk_size]
+                active_chunk: Dict[str, str] = {}
+                init_futures = {executor.submit(_init_single, query): query for query in chunk}
+                for future in as_completed(init_futures):
+                    query = init_futures[future]
+                    try:
+                        sid = future.result()
+                    except Exception:
+                        sid = None
+                    if sid:
+                        active_chunk[query] = sid
+                    else:
+                        _complete(query)
+
+                start_time = time.monotonic()
+                deadline = start_time + effective_timeout
+                while active_chunk and time.monotonic() < deadline:
+                    time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+                    poll_futures = {
+                        executor.submit(self.get_search_results, sid): query
+                        for query, sid in active_chunk.items()
+                    }
+                    for future in as_completed(poll_futures):
+                        query = poll_futures[future]
+                        try:
+                            data = future.result()
+                        except Exception:
+                            continue
+                        _remember(query, data)
+                        is_done = data.get("isComplete", False) or "Completed" in data.get("state", "")
+                        observed = query in query_to_search_id or time.monotonic() - start_time >= 6.0
+                        if is_done and observed:
+                            del active_chunk[query]
+                            _complete(query)
+
+                # A final concurrent read retains late responses at the deadline.
+                final_futures = {
+                    executor.submit(self.get_search_results, sid): query
+                    for query, sid in active_chunk.items()
+                }
+                for future in as_completed(final_futures):
+                    query = final_futures[future]
+                    try:
+                        _remember(query, future.result())
+                    except Exception:
+                        pass
+                    _complete(query)
 
         return results
 
