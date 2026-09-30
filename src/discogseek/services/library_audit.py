@@ -118,12 +118,18 @@ def audit_release(
         rel_artist = "Various Artists" if is_mb_compilation else (mb_artist or artist)
 
         official_tracks: List[Dict[str, Any]] = []
+        official_media: List[Dict[str, Any]] = []
         media_list = mb_release.get("medium-list", [])
 
         for medium in media_list:
             # MusicBrainz positions are strings. Keep official and unmatched
             # local tracks numeric so their combined list sorts consistently.
             disc_num = int(medium.get("position") or 1)
+            official_media.append({
+                "position": disc_num,
+                "format": medium.get("format"),
+                "track_count": len(medium.get("track-list", [])),
+            })
             for trk in medium.get("track-list", []):
                 rec = trk.get("recording", {})
                 trk_num = trk.get("number") or str(trk.get("position", ""))
@@ -397,6 +403,11 @@ def audit_release(
         result["is_va"] = is_mb_compilation
         result["mb_release_id"] = mb_release.get("id")
         result["mb_release_title"] = mb_release.get("title")
+        result["mb_release_group_id"] = rg.get("id")
+        result["mb_release_media"] = official_media
+        result["mb_release_date"] = mb_release.get("date")
+        result["mb_release_country"] = mb_release.get("country")
+        result["mb_release_disambiguation"] = mb_release.get("disambiguation")
         result["total_tracks_expected"] = total_tracks
         result["found_count"] = found_count
         result["missing_count"] = missing_count

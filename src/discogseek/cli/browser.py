@@ -56,6 +56,30 @@ def equivalent_release_key(release):
     return release_key(release)
 
 
+def album_key(release):
+    """Group verified editions of one album without sharing their track state."""
+    if release.get("is_audited") and release.get("mb_release_group_id"):
+        return ("album", release["mb_release_group_id"])
+    return equivalent_release_key(release)
+
+
+def edition_label(release):
+    media = release.get("mb_release_media") or []
+    formats = {}
+    for medium in media:
+        label = medium.get("format") or "Unknown format"
+        formats[label] = formats.get(label, 0) + 1
+    parts = [f"{count}×{label}" if count > 1 else label for label, count in formats.items()]
+    if media:
+        parts.append(f"{sum(medium.get('track_count') or 0 for medium in media)} tracks")
+    parts.extend(str(release[field]) for field in ("mb_release_date", "mb_release_country")
+                 if release.get(field))
+    if release.get("mb_release_disambiguation"):
+        parts.append(release["mb_release_disambiguation"])
+    parts.append(str(release.get("mb_release_id") or release_key(release))[:8])
+    return " · ".join(parts)
+
+
 def track_key(track):
     def number(value):
         try:
@@ -80,31 +104,63 @@ class BrowserModel:
         self.matched = {}
         self.downloaded = {}
         self.preferred_editions = {}
+        self.selected_editions = {}
         self._history_releases = {}
 
-    def visible(self):
-        query = normalize_text(self.artist_filter)
+    def _equivalent_editions(self):
         groups = {}
         for release in self.releases.values():
-            groups.setdefault(equivalent_release_key(release), []).append(release)
+            groups.setdefault((album_key(release), equivalent_release_key(release)), []).append(release)
         rows = []
         for key, editions in groups.items():
-            # Explicit refreshes are freshest. During the initial scan use the
-            # best coverage, keeping the selected edition when coverage agrees.
-            preferred = self.preferred_editions.get(key)
+            # Freshness determines whether equivalent tracklists are incomplete,
+            # independently of which edition the user wants to inspect.
+            preferred = self.preferred_editions.get(key[1])
             rows.append(min(editions, key=lambda r: (
                 release_key(r) != preferred if preferred else False,
                 r.get("missing_count", 0), release_key(r) != self.selected_key,
             )))
+        return rows
+
+    def editions(self, release):
+        key = album_key(release)
         return sorted(
-            [r for r in rows
-             if (not query or any(query in normalize_text(credit or "") for credit in
-                                  [r.get("artist"), r.get("album_artist")]
-                                  + [t.get("artist") for t in r.get("tracks", [])]))
-             and ((r.get("is_audited") and r.get("missing_count", 0) > 0)
-                  or (self.show_unverified and not r.get("is_audited")))],
-            key=lambda r: (r.get("artist", "").casefold(), r.get("title", "").casefold()),
+            [row for row in self.releases.values() if album_key(row) == key],
+            key=lambda row: (row.get("missing_count", 0), str(release_key(row))),
         )
+
+    def choose_edition(self, release):
+        self.selected_editions[album_key(release)] = release_key(release)
+        self.selected_key = release_key(release)
+        self.track_index = 0
+
+    def visible(self):
+        query = normalize_text(self.artist_filter)
+        groups = {}
+        for release in self._equivalent_editions():
+            groups.setdefault(album_key(release), []).append(release)
+        rows = []
+        for key, editions in groups.items():
+            incomplete = [row for row in editions
+                          if ((row.get("is_audited") and row.get("missing_count", 0) > 0)
+                              or (self.show_unverified and not row.get("is_audited")))]
+            if not incomplete or (query and not any(
+                query in normalize_text(credit or "") for row in editions
+                for credit in [row.get("artist"), row.get("album_artist")]
+                + [track.get("artist") for track in row.get("tracks", [])]
+            )):
+                continue
+            preferred = self.selected_editions.get(key)
+            selected = self.releases.get(preferred)
+            if selected and album_key(selected) != key:
+                selected = None
+            rows.append(selected or min(incomplete, key=lambda row: (
+                row.get("missing_count", 0), release_key(row) != self.selected_key,
+                str(release_key(row)),
+            )))
+        return sorted(rows, key=lambda row: (
+            row.get("artist", "").casefold(), row.get("title", "").casefold(),
+        ))
 
     def selected(self):
         rows = self.visible()
@@ -127,6 +183,10 @@ class BrowserModel:
             if self.selected_key == old_key:
                 self.selected_key = key
             self._history_releases.pop(old_key, None)
+            for album, selected in list(self.selected_editions.items()):
+                if selected == old_key:
+                    self.selected_editions.pop(album)
+                    self.selected_editions[album_key(release)] = key
         self.releases[key] = release
         if key in self._history_releases or any(key in history for history in
                                                (self.queued, self.matched, self.downloaded)):
@@ -251,6 +311,8 @@ class ReleaseBrowser:
         self.filter_edit = None
         self.overlay = None
         self.action_index = 0
+        self.edition_index = 0
+        self.edition_choices = []
         self.message = "Scanning the library…"
         self.error = ""
         self.last_result = ""
@@ -554,6 +616,10 @@ class ReleaseBrowser:
 
     def _update_release(self, release, old_key=None):
         self.model.update(release, old_key)
+        if self.overlay == "editions":
+            # Keep the menu order stable as scan and transfer events arrive.
+            self.edition_choices = [release if release_key(row) in (old_key, release_key(release))
+                                    else row for row in self.edition_choices]
         requests = list(self.pending_downloads)
         if self.active_download is not None:
             requests.append(self.active_download)
@@ -712,6 +778,20 @@ class ReleaseBrowser:
         self.overlay = "downloads"
         self.action_index = 1 if self.focus_tracks else 0
 
+    def _open_editions(self):
+        release = self.model.selected()
+        if not release:
+            self.message = "Select an album first."
+            return
+        editions = self.model.editions(release)
+        if len(editions) < 2:
+            self.message = "Only one distinct verified edition for this album."
+            return
+        self.overlay = "editions"
+        self.edition_choices = editions
+        self.edition_index = next(index for index, row in enumerate(editions)
+                                  if release_key(row) == release_key(release))
+
     def _handle_overlay_key(self, key, curses):
         if key in ("q", "Q", "\x03"):
             self._quit()
@@ -719,6 +799,20 @@ class ReleaseBrowser:
             self.overlay = None
         elif self.overlay == "help":
             if key in ("\n", "\r", curses.KEY_ENTER):
+                self.overlay = None
+        elif self.overlay == "editions":
+            editions = self.edition_choices
+            if not editions:
+                self.overlay = None
+                return
+            self.edition_index = min(self.edition_index, len(editions) - 1)
+            if key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j", "\t", curses.KEY_BTAB):
+                delta = -1 if key in (curses.KEY_UP, "k", curses.KEY_BTAB) else 1
+                self.edition_index = (self.edition_index + delta) % len(editions)
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                edition = editions[self.edition_index]
+                self.model.choose_edition(edition)
+                self.message = f"Edition selected: {edition_label(edition)}"
                 self.overlay = None
         elif key in (curses.KEY_UP, "k", curses.KEY_DOWN, "j", "\t", curses.KEY_BTAB):
             delta = -1 if key in (curses.KEY_UP, "k", curses.KEY_BTAB) else 1
@@ -758,6 +852,8 @@ class ReleaseBrowser:
             self._open_download_options()
         elif key == "?":
             self.overlay = "help"
+        elif key == "e":
+            self._open_editions()
         elif key == "/":
             self.filter_edit = self.model.artist_filter
         elif key == "\x1b":
@@ -831,13 +927,15 @@ class ReleaseBrowser:
             counts = (f"{release.get('missing_count', 0)}/{len(release.get('tracks', []))} missing"
                       if release.get("is_audited") else "unverified")
             request_label = ""
+            editions = self.model.editions(release)
             if (self.active_download
-                    and equivalent_release_key(self.active_download.release) == equivalent_release_key(release)):
+                    and album_key(self.active_download.release) == album_key(release)):
                 request_label = "[searching] "
-            elif any(equivalent_release_key(request.release) == equivalent_release_key(release)
+            elif any(album_key(request.release) == album_key(release)
                      for request in self.pending_downloads):
                 request_label = "[waiting] "
-            put(y, 1, f"{'›' if active else ' '} {request_label}{release['title']}", split - 2,
+            edition_count = f" [{len(editions)} editions]" if len(editions) > 1 else ""
+            put(y, 1, f"{'›' if active else ' '} {request_label}{release['title']}{edition_count}", split - 2,
                 curses.A_REVERSE if active else 0)
             put(y + 1, 3, f"{release['artist']} · {counts}", split - 4, curses.A_DIM)
         if not rows:
@@ -861,14 +959,14 @@ class ReleaseBrowser:
                 marker = "›" if index == self.model.track_index else " "
                 put(5 + index - track_start, split + 2, f"{marker}{label:>5} {status.upper():<10} {title}", attr=attr)
             detail = selected.get("audit_error") or (
-                f"Track {self.model.track_index + 1}/{len(tracks)} · MBID: {selected.get('mb_release_id') or 'unresolved'}"
+                f"Track {self.model.track_index + 1}/{len(tracks)} · {edition_label(selected)}"
             )
             put(height - 6, split + 2, detail, attr=curses.A_DIM)
         put(height - 5, 1, self.error or self.download_error or self.message,
             attr=curses.A_BOLD if self.error or self.download_error else 0)
         put(height - 4, 1, self.last_result or "Downloads update automatically; DOWNLOADED = waiting for library.", attr=curses.A_DIM)
         put(height - 3, 1, "d Download all missing · t Download selected track · Enter options", attr=curses.A_BOLD)
-        put(height - 2, 1, "↑↓ move · Tab pane · / artist · p preview · r refresh · ? help · q quit")
+        put(height - 2, 1, "↑↓ move · Tab pane · e editions · / artist · r refresh · ? help · q quit")
         if self.overlay is not None:
             self._draw_overlay(put, height, width, curses)
         screen.refresh()
@@ -892,20 +990,39 @@ class ReleaseBrowser:
                 "↑↓ / j k: move    Tab / ← →: switch panes",
                 "PgUp/PgDn, Home/End / g G: move through long lists",
                 "/: artist filter    Esc: clear filter    u: unverified",
-                "r: refresh selected release from MusicBrainz",
-                "R: rescan library, reuse saved audits if unchanged",
+                "e: choose an album's edition; downloads use that edition",
+                "r: refresh edition    R: rescan library, reuse saved audits",
                 "d/t requests wait in order; q discards waiting requests",
                 "Esc / Enter: close help    q: quit",
             ], 1):
                 line(row, text)
             return
 
+        if self.overlay == "editions":
+            line(0, "ALBUM EDITIONS", True)
+            editions = self.edition_choices
+            if not editions:
+                line(2, "No album selected. Esc to close.")
+                return
+            release = editions[0]
+            line(1, f"{release['artist']} — {release['title']}")
+            self.edition_index = min(self.edition_index, max(0, len(editions) - 1))
+            line(2, f"MBID: {editions[self.edition_index].get('mb_release_id') or 'unresolved'}")
+            start = max(0, self.edition_index - 5)
+            for index, edition in enumerate(editions[start:start + 6], start):
+                counts = f"{edition.get('missing_count', 0)}/{len(edition.get('tracks', []))} missing"
+                marker = "› " if index == self.edition_index else "  "
+                line(3 + index - start, f"{marker}{counts} · {edition_label(edition)}",
+                     index == self.edition_index)
+            line(9, f"Edition {self.edition_index + 1}/{len(editions)} · ↑↓ choose · Enter select · Esc close")
+            line(10, "Tracks and downloads follow the selected edition.")
+            return
         release = self.model.selected()
         line(0, "DOWNLOAD OPTIONS" + (" · DRY RUN" if self.args.dry_run else ""), True)
         if not release:
             line(2, "No incomplete release selected. Esc to close.")
             return
-        line(1, f"Release: {release['artist']} — {release['title']}")
+        line(1, f"Release: {release['title']} · {edition_label(release)}")
         tracks = release.get("tracks", [])
         track = tracks[self.model.track_index] if tracks else None
         status = self.model.track_status(release, track) if track else "unavailable"

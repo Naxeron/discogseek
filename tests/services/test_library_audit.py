@@ -212,3 +212,65 @@ def test_audit_sorts_official_and_unmatched_tracks_with_mixed_disc_types(
         (2, "1", "Disc Two", "found"),
         (10, "1", "Finale", "missing"),
     ]
+
+
+def test_audit_retains_authoritative_album_and_edition_metadata_with_local_extras():
+    mb = MagicMock()
+    mb.get_release_by_id.return_value = {
+        "id": "cd-edition", "title": "Album",
+        "artist-credit": [{"name": "Artist"}],
+        "release-group": {"id": "album-group"},
+        "date": "2000-09-18", "country": "GB", "disambiguation": "Original issue",
+        "medium-list": [
+            {"position": str(disc), "format": "CD", "track-count": "999", "track-list": [
+                {"id": f"track-{disc}", "number": "1", "recording": {
+                    "id": f"rec-{disc}", "title": f"Song {disc}",
+                }},
+            ]}
+            for disc in (1, 2, 3)
+        ],
+    }
+    service = LibraryReleaseService(mb_client=mb, slskd_client=MagicMock())
+    local = {
+        "artist": "Artist", "title": "Album", "mb_release_id": "cd-edition", "tracks": [
+            {"disc_number": 5, "track_number": "1", "title": "Bonus mix",
+             "filename": "Bonus mix.flac"},
+        ],
+    }
+
+    audited = service.audit_release(local)
+
+    assert audited["mb_release_group_id"] == "album-group"
+    assert audited["mb_release_media"] == [
+        {"position": disc, "format": "CD", "track_count": 1} for disc in (1, 2, 3)
+    ]
+    assert audited["mb_release_date"] == "2000-09-18"
+    assert audited["mb_release_country"] == "GB"
+    assert audited["mb_release_disambiguation"] == "Original issue"
+    assert len(audited["tracks"]) == 4
+    assert audited["tracks"][-1]["title"] == "Bonus mix"
+
+
+def test_audit_clears_stale_edition_metadata_when_musicbrainz_omits_it():
+    mb = MagicMock()
+    mb.get_release_by_id.return_value = {
+        "id": "edition", "title": "Album", "medium-list": [{"track-list": [
+            {"number": "1", "recording": {"id": "rec-1", "title": "Song"}},
+        ]}],
+    }
+    service = LibraryReleaseService(mb_client=mb, slskd_client=MagicMock())
+    local = {
+        "artist": "Artist", "title": "Album", "mb_release_id": "edition", "tracks": [],
+        "mb_release_group_id": "stale-group", "mb_release_media": [{"format": "CD"}],
+        "mb_release_date": "1999", "mb_release_country": "US",
+        "mb_release_disambiguation": "Stale description",
+    }
+
+    audited = service.audit_release(local)
+
+    assert audited["is_audited"] is True
+    assert audited["mb_release_group_id"] is None
+    assert audited["mb_release_media"] == [{"position": 1, "format": None, "track_count": 1}]
+    assert audited["mb_release_date"] is None
+    assert audited["mb_release_country"] is None
+    assert audited["mb_release_disambiguation"] is None

@@ -68,7 +68,7 @@ discogseek browse --dry-run -f flac
 
 The left pane lists incomplete releases; the right shows every track in the selected release, including disc/track numbers and found, missing, matched, or queued status. The browser scans local files and every configured Navidrome/Subsonic album and reuses saved MusicBrainz audits for unchanged releases across launches. If an album is split across different edition tags, tracks with the same MusicBrainz recording ID and disc/track position count across editions with the same artist and album title. The first run builds this audit cache. New or changed releases are audited as needed; failed audits remain retryable. Use `r` to refresh a selected release from MusicBrainz or launch with `--force-refresh` to refresh all audits. It covers releases already represented in your library; use `download "Artist"` for entirely absent releases.
 
-Verified editions with the same artist, album title, and full recording list at the same disc/track positions share one browser row and download status. Editions with different tracklists or incomplete recording metadata remain separate.
+Verified editions in the same MusicBrainz release group share one album row. Press **e** to choose an edition; the menu shows its format, official track count, release date, country, and missing tracks. The browser initially selects the incomplete edition with the fewest missing tracks and remembers your choice during the session. Complete editions remain available while another edition of the album is incomplete. Tracks, refreshes, and downloads follow the selected edition. Editions with the same artist, album title, and full recording list at the same disc/track positions also share download status; other editions keep their own status. Releases without a verified album identity remain separate.
 
 Press **Enter** for a menu offering **Download all missing tracks** and **Download selected track only**, with previews for either choice. To select an individual track, press **Tab**, then **↑ / ↓**; the arrow beside the track shows the selection. The download shortcuts also stay visible at the bottom of the screen.
 
@@ -80,6 +80,7 @@ Press **Enter** for a menu offering **Download all missing tracks** and **Downlo
 | / | Edit the artist filter; Enter applies, Esc cancels |
 | Esc | Clear the applied artist filter |
 | Enter | Open download options; ↑ / ↓ chooses, Enter runs, Esc closes |
+| e | Choose an album edition; ↑ / ↓ chooses, Enter selects, Esc closes |
 | d | Queue a request to download all unqueued missing tracks in this release |
 | t | Download the selected missing track |
 | p | Preview matches for the release without queueing |
