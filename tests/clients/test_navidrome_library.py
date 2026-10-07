@@ -69,7 +69,6 @@ def test_duplicate_album_ids_on_overlapping_pages_are_read_once():
 @pytest.mark.parametrize("failure", [
     RuntimeError("Remote timed out"),
     {},
-    {"album": {"songCount": 2, "song": [{"id": "one", "title": "First"}]}},
 ])
 def test_album_failures_abort_inventory(failure):
     client = scanner()
@@ -78,6 +77,23 @@ def test_album_failures_abort_inventory(failure):
     ])
     with pytest.raises(RuntimeError):
         client.scan_library_releases()
+
+
+@pytest.mark.parametrize("selected_release", [None, {"navidrome_id": "a"}])
+@pytest.mark.parametrize("tracklist", [{}, {"song": []}, {"song": [{"id": "one", "title": "First"}]}])
+def test_stale_song_count_uses_returned_tracks(selected_release, tracklist):
+    client = scanner()
+    client._scan_request = MagicMock(side_effect=[
+        {"albumList2": {"album": [{"id": "a", "songCount": 3}]}},
+        {"album": {"id": "a", "name": "Album", "songCount": 2, **tracklist}},
+    ])
+    result = client.scan_library_releases(selected_release=selected_release)
+    assert len(result) == 1
+    tracks = result[0]["tracks"]
+    assert [track["remote_id"] for track in tracks] == [song["id"] for song in tracklist.get("song", [])]
+    assert result[0]["found_count"] == result[0]["total_tracks_expected"] == len(tracks)
+    assert result[0]["is_audited"] is False
+    assert result[0]["missing_count"] == 0
 
 
 def test_repeated_page_raises_instead_of_accepting_truncated_inventory():

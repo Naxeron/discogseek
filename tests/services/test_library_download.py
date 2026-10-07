@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from discogseek.clients.slskd import SlskdAPIError, SlskdPeerBlockedError, SlskdPeerUnavailableError
+from discogseek.clients.slskd import SlskdAPIError, SlskdEnqueueError, SlskdPeerBlockedError, SlskdPeerUnavailableError
 from discogseek.core.peer_policy import PeerPolicy
 from discogseek.services.library import LibraryReleaseService
 from discogseek.services.library_download import download_missing_tracks
@@ -126,6 +126,30 @@ def test_download_missing_tracks_various_artists_orchestration():
     assert "Bong-Ra - Mashup Core" in queries
     assert not any("Exnoiz" in q for q in queries)
     assert not any("Various Artists" in q for q in queries)
+
+
+def test_complete_release_requires_exact_titles_before_queueing():
+    tracks = [
+        {"title": "Horsey Noisers", "artist": "Target Artist", "track_number": "1"},
+        {"title": "Other Song", "artist": "Other Artist", "track_number": "2"},
+    ]
+    response = {"responses": [{"username": "peer", "files": [
+        {"filename": "Compilation/01 Target Artist - Horsey Noises.flac", "size": 1000},
+        {"filename": "Compilation/02 Other Artist - Other Song.flac", "size": 1000},
+    ]}]}
+    client = MagicMock()
+    client.get_downloads.return_value = []
+    client.search.return_value = response
+    client.batch_search.side_effect = lambda queries, **kwargs: {query: response for query in queries}
+
+    result = download_missing_tracks(
+        client, MagicMock(), "Various Artists", "Compilation", tracks,
+        complete_release_tracks=tracks,
+    )
+
+    assert not result["complete_release_available"]
+    assert result["queued_files"] == []
+    client.enqueue_download.assert_not_called()
 
 def test_download_single_missing_track_with_track_artist():
     """Verifies that downloading a single track on a VA release searches for the track artist rather than 'Various Artists'."""
@@ -483,8 +507,33 @@ def test_download_missing_tracks_keeps_successful_chunks_when_later_chunk_fails(
     assert result["matched_count"] == 51
     assert result["queued_count"] == 50
     assert result["queued_tracks"] == tracks[:50]
+    assert result["enqueued_files"] == result["queued_files"]
     assert result["queue_errors"][0]["tracks"] == tracks[50:]
     assert [len(call.args[1]) for call in client.enqueue_download.call_args_list] == [50, 1]
+
+
+@pytest.mark.parametrize("peer_unavailable", [False, True])
+def test_download_reports_partial_accepted_submissions_as_new_files(peer_unavailable):
+    client = MagicMock()
+    tracks = [{"title": "First Song", "track_number": 1}, {"title": "Last Song", "track_number": 2}]
+    files = [{"filename": f"Artist/Album/{track['track_number']:02d} {track['title']}.flac"}
+             for track in tracks]
+    client.search.return_value = {"responses": [{"username": "peer", "files": files}]}
+
+    def enqueue(user, submitted):
+        if peer_unavailable:
+            raise SlskdPeerUnavailableError(user, "offline", queued_files=submitted[:1])
+        raise SlskdEnqueueError("Remaining submission failed", queued_files=submitted[:1])
+
+    client.enqueue_download.side_effect = enqueue
+
+    result = download_missing_tracks(client, MagicMock(), "Artist", "Album", tracks)
+
+    assert [file["title"] for file in result["enqueued_files"]] == ["First Song"]
+    assert result["queued_files"] == result["enqueued_files"]
+    assert result["queued_count"] == 1
+    assert result["queued_tracks"] == tracks[:1]
+    assert result["queue_errors"][0]["tracks"] == tracks[1:]
 
 
 def test_download_missing_tracks_dry_run_attributes_matches_without_queueing():
@@ -501,6 +550,7 @@ def test_download_missing_tracks_dry_run_attributes_matches_without_queueing():
     assert result["queued_tracks"] == []
     assert result["queued_count"] == 0
     assert result["queued_files"][0]["track_number"] == 3
+    assert result["enqueued_files"] == []
     assert result["queue_errors"] == []
     client.enqueue_download.assert_not_called()
 
@@ -992,6 +1042,7 @@ def test_existing_healthy_download_prevents_preferred_alternative_duplicate(sear
     assert result["queued_count"] == (0 if dry_run else 1)
     assert result["queued_tracks"] == ([] if dry_run else [track])
     assert result["queued_files"][0]["user"] == "z-existing"
+    assert result["enqueued_files"] == []
     assert result["queue_errors"] == []
     client.enqueue_download.assert_not_called()
     client.cancel_download.assert_not_called()
@@ -1091,6 +1142,7 @@ def test_history_reuses_original_file_and_searches_only_missing_sibling():
 
     assert result["queued_tracks"] == tracks
     assert [file["user"] for file in result["queued_files"]] == ["offline-peer", "new-peer"]
+    assert [file["title"] for file in result["enqueued_files"]] == ["Kimberly Clark"]
     assert [file["title"] for file in client.enqueue_download.call_args.args[1]] == ["Kimberly Clark"]
 
 

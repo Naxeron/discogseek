@@ -15,7 +15,7 @@ from typing import Callable, Dict, List, Set, Optional, Any
 from discogseek.config import Config
 from discogseek.core.constants import GENERIC_OR_COMMON_WORDS
 from discogseek.core.constants import LOSSLESS_EXTENSIONS
-from discogseek.core.release_metadata import is_various_artists, parse_disc_and_track_number
+from discogseek.core.release_metadata import is_unknown_album, is_various_artists, parse_disc_and_track_number
 from discogseek.core.text import normalize_text
 from discogseek.clients.musicbrainz import ArtistCatalog
 
@@ -150,15 +150,17 @@ class NavidromeScanner:
                 album, selected_release, include_sibling_editions=include_sibling_editions,
             ):
                 continue
+            # getAlbum is not paginated. songCount can include missing files
+            # that Navidrome omits from song; audit the returned tracks instead.
             songs = album.get("song", [])
-            if album.get("songCount", 0) > len(songs):
-                raise RuntimeError(f"Navidrome scan failed: incomplete tracklist for {album_id}")
             title = album.get("name") or album.get("title") or "Unknown Album"
+            release_id = album.get("musicBrainzId") or None
+            if is_unknown_album(title) and not release_id:
+                continue
             artist = album.get("displayArtist") or album.get("artist") or "Unknown Artist"
             is_va = bool(album.get("isCompilation")) or is_various_artists(artist)
             if is_va:
                 artist = "Various Artists"
-            release_id = album.get("musicBrainzId") or None
             tracks = []
             seen_songs = set()
             for song in songs:

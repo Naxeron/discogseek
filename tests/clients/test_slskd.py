@@ -1,6 +1,7 @@
 """slskd search polling and download payload deduplication."""
 
-from threading import Barrier, Lock
+import logging
+from threading import Barrier, Event, Lock
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -436,8 +437,9 @@ def test_slskd_batch_search_keeps_files_when_completed_snapshot_is_empty(search_
 
 
 @pytest.mark.parametrize("final_failure", [False, True])
-def test_slskd_batch_search_timeout_retains_streamed_files(search_client, final_failure):
+def test_slskd_batch_search_timeout_retains_streamed_files(search_client, final_failure, caplog):
     client, request, clock = search_client
+    caplog.set_level(logging.INFO, logger="discogseek.clients.slskd")
     metadata_reads = 0
     progress_updates = []
 
@@ -462,11 +464,14 @@ def test_slskd_batch_search_timeout_retains_streamed_files(search_client, final_
     assert results["query"]["responses"] == [peer_response()]
     assert results["query"]["isComplete"] is False
     assert progress_updates == [(1, 1, "query")]
+    status = "results unavailable" if final_failure else "still running (poll timeout)"
+    assert f"1/1 {status} — query" in caplog.text
 
 
 @pytest.mark.parametrize("already_complete", [False, True])
-def test_slskd_batch_search_reads_concurrently_with_bounded_workers(search_client, monkeypatch, already_complete):
+def test_slskd_batch_search_reads_concurrently_with_bounded_workers(search_client, monkeypatch, already_complete, caplog):
     client, request, clock = search_client
+    caplog.set_level(logging.INFO, logger="discogseek.clients.slskd")
     queries = [f"query-{i}" for i in range(4)]
     monkeypatch.setattr(client, "list_searches", lambda: [
         {"id": query, "searchText": query, "isComplete": already_complete, "fileCount": 1}
@@ -499,6 +504,103 @@ def test_slskd_batch_search_reads_concurrently_with_bounded_workers(search_clien
     assert set(results) == set(queries)
     assert clock["now"] == (0 if already_complete else 2)
     request.assert_not_called()
+    status = "cached" if already_complete else "completed"
+    assert sum(f" {status} — " in record.message for record in caplog.records) == len(queries)
+
+
+def test_slskd_batch_search_serializes_posts_and_waits_before_submitting_more(search_client):
+    client, request, clock = search_client
+    queries = [f"query-{index}" for index in range(5)]
+    request_lock = Lock()
+    pending = {}
+    accepted, rejected = [], []
+    peak_pending = 0
+
+    def respond(method, path, **kwargs):
+        nonlocal peak_pending
+        if method == "POST":
+            query = kwargs["json"]["searchText"]
+            if not request_lock.acquire(blocking=False):
+                rejected.append(query)
+                return enqueue_response(429, "Only one concurrent operation is permitted")
+            try:
+                # Give overlapping requests time to reach the fake server.
+                Event().wait(0.02)
+                accepted.append(query)
+                pending[query] = clock["now"]
+                peak_pending = max(peak_pending, len(pending))
+                return search_response({"id": query})
+            finally:
+                request_lock.release()
+        query = path.split("/")[-1].split("?")[0]
+        complete = clock["now"] - pending[query] >= 9
+        if complete:
+            del pending[query]
+        return search_response({"isComplete": complete, "responses": [peer_response(query)]})
+
+    request.side_effect = respond
+    results = client.batch_search(queries)
+
+    assert rejected == []
+    assert accepted == queries
+    assert peak_pending == 2
+    assert not pending
+    assert set(results) == set(queries)
+    assert all(result["isComplete"] for result in results.values())
+
+
+@pytest.mark.parametrize("method", ["search", "batch_search"])
+def test_slskd_search_retries_explicit_rate_limit_before_polling(search_client, method, caplog):
+    client, request, clock = search_client
+    attempts = []
+
+    def respond(verb, path, **kwargs):
+        if verb == "POST":
+            attempts.append(clock["now"])
+            if len(attempts) < 3:
+                return enqueue_response(429, "Only one concurrent operation is permitted")
+            return search_response({"id": "accepted"})
+        return search_response({"isComplete": True, "responses": [peer_response()]})
+
+    request.side_effect = respond
+    if method == "search":
+        result = client.search("query")
+    else:
+        result = client.batch_search(["query"])["query"]
+
+    assert result["responses"] == [peer_response()]
+    assert attempts == [0, 1, 3]
+    assert caplog.text.count("retrying search — query") == 2
+
+
+@pytest.mark.parametrize("method", ["search", "batch_search"])
+@pytest.mark.parametrize("failure, expected, attempts", [
+    (429, "HTTP 429", 3),
+    (500, "HTTP 500", 1),
+    (200, "no search ID", 1),
+    (None, "connection lost", 1),
+])
+def test_slskd_search_submission_failures_are_visible(search_client, method, failure, expected, attempts, caplog):
+    client, request, clock = search_client
+    if failure is None:
+        request.side_effect = SlskdAPIError("connection lost")
+    else:
+        request.return_value = MagicMock(status_code=failure, text="server detail", json=lambda: {})
+
+    if method == "search":
+        with pytest.raises(SlskdAPIError, match=expected):
+            client.search("query")
+    else:
+        progress = []
+        assert client.batch_search(["query"], on_progress=lambda *args: progress.append(args)) == {}
+        assert progress == [(1, 1, "query")]
+        assert "1/1 not submitted — query" in caplog.text
+        assert expected in caplog.text
+        assert " completed — " not in caplog.text
+
+    assert request.call_count == attempts
+    assert all(entry.args[0] == "POST" for entry in request.call_args_list)
+    assert clock["now"] == (3 if failure == 429 else 0)
 
 
 def test_slskd_batch_search_purges_empty_completed_search_before_redispatch(search_client, monkeypatch):

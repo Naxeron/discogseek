@@ -20,7 +20,7 @@ from discogseek.core.text import (
     extract_dir_and_filename,
     is_sublist,
 )
-from discogseek.core.release_metadata import parse_disc_and_track_number
+from discogseek.core.release_metadata import is_various_artists, parse_disc_and_track_number
 from discogseek.clients.slskd import (
     SlskdClient, SlskdEnqueueError, SlskdPeerBlockedError, SlskdPeerUnavailableError, SlskdTransferFailedError,
 )
@@ -28,6 +28,7 @@ from discogseek.core.peer_policy import peer_key
 from discogseek.core.transfers import DownloadHistory, source_key
 from discogseek.clients.musicbrainz import MusicBrainzClient, ArtistCatalog
 from discogseek.services.auditor import AuditorService
+from discogseek.services.library import LibraryReleaseService
 from discogseek.services.candidates import (
     CandidateDir,
     CandidateFile,
@@ -110,6 +111,9 @@ class SlskdArtistScraper:
         self.unresolved_compilation_tracks: List[Dict[str, Any]] = []
         self.verified_standalone_tracks: List[Dict[str, Any]] = []
         self.unresolved_standalone_tracks: List[Dict[str, Any]] = []
+        self.full_release_audits: List[Dict[str, Any]] = []
+        self.release_downloads: List[Dict[str, Any]] = []
+        self._full_release_ids: Set[str] = set()
 
     def run(self) -> Dict[str, Any]:
         """Runs the complete Soulseek discography discovery and queueing pipeline."""
@@ -147,8 +151,7 @@ class SlskdArtistScraper:
         # 5. Reconcile primary releases
         self._reconcile_primary_releases()
 
-        # 6. Reconcile compilations and singles
-        self._reconcile_compilation_tracks()
+        # 6. Reconcile standalone recordings; appearances keep their full release scope.
         self._reconcile_standalone_tracks()
 
         # 7. Queue downloads
@@ -157,6 +160,8 @@ class SlskdArtistScraper:
         else:
             logging.getLogger(__name__).info("\n--dry-run enabled: Showing matched directories without enqueuing transfers.")
 
+        self._download_full_releases()
+
         return {
             "artist": self.catalog.name,
             "mbid": self.catalog.mbid,
@@ -164,6 +169,7 @@ class SlskdArtistScraper:
             "verified_releases": self.verified_releases,
             "verified_compilation_tracks": self.verified_compilation_tracks,
             "verified_standalone_tracks": self.verified_standalone_tracks,
+            "release_downloads": self.release_downloads,
             "unresolved_releases": self.unresolved_releases,
             "unresolved_compilation_tracks": self.unresolved_compilation_tracks,
             "unresolved_standalone_tracks": self.unresolved_standalone_tracks,
@@ -178,9 +184,7 @@ class SlskdArtistScraper:
         local_tracks = AuditorService(mb_client=self.mb_client).scan_library(
             self.catalog, self.music_dir, full_scan=self.full_scan, threads=self.threads,
         )
-        if not local_tracks:
-            logging.getLogger(__name__).info("No existing artist tracks found in the libraries.")
-            return
+        self._audit_full_releases(local_tracks)
 
         logging.getLogger(__name__).info("Comparing %s library tracks with the discography...", len(local_tracks))
         reconciler = DiscographyReconciler(catalog=self.catalog, local_tracks=local_tracks)
@@ -195,6 +199,8 @@ class SlskdArtistScraper:
         self.covered_track_titles.update(self.local_found_map)
 
         for rel in self.catalog.releases:
+            if rel.get("is_va") or rel.get("id") in self._full_release_ids:
+                continue
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
             rel_tracks = [
@@ -205,26 +211,159 @@ class SlskdArtistScraper:
             if not rel_tracks:
                 continue
 
-            artist_tracks = [
-                t for t in rel_tracks
-                if any(alias.lower() in t.get("artist_credit", "").lower() for alias in self.all_artist_aliases)
-                or t.get("artist_credit", "").lower() == self.catalog.name.lower()
-            ]
-
             found_rel_tracks = [t for t in rel_tracks if t.get("norm_title") in self.local_found_map]
-            found_artist_tracks = [t for t in artist_tracks if t.get("norm_title") in self.local_found_map]
-
-            is_complete = False
-            if artist_tracks and len(found_artist_tracks) == len(artist_tracks):
-                is_complete = True
-            elif rel_tracks and len(found_rel_tracks) == len(rel_tracks):
-                is_complete = True
-
-            if is_complete:
+            if len(found_rel_tracks) == len(rel_tracks):
                 self.local_found_releases.add(norm_rel)
                 self.reconciled_release_keys.add(norm_rel)
 
         logging.getLogger(__name__).info(f"✔ Library Status: {len(found_items)} artist tracks / {len(self.local_found_releases)} releases already in library.")
+
+    def _audit_full_releases(self, library_tracks: List[Dict[str, Any]]) -> None:
+        """Audit complete appearances and splits using the shared library inventory."""
+        raw = self.catalog.raw_data
+        primary_ids = {release.get("id") for release in self.catalog.primary_releases}
+        primary_groups = {
+            release["release_group_id"] for release in self.catalog.primary_releases
+            if release.get("release_group_id")
+        }
+        aliases = {normalize_text(name) for name in self.catalog.aliases | {self.catalog.name}}
+        service = LibraryReleaseService(mb_client=self.mb_client, slskd_client=self.client)
+        self.full_release_audits = []
+        self._full_release_ids = set()
+        seen = set()
+        releases = [(False, release) for release in raw.get("releases_artist", [])]
+        releases += [(True, release) for release in raw.get("releases_track_artist", [])]
+        for appearance, metadata in releases:
+            release_id = metadata.get("id")
+            group_id = metadata.get("release-group", {}).get("id")
+            identity = group_id or release_id
+            if identity in seen:
+                continue
+            credits = [
+                ArtistCatalog.format_credit(track.get("artist-credit")
+                                            or track.get("recording", {}).get("artist-credit"))
+                for medium in metadata.get("medium-list", [])
+                for track in medium.get("track-list", [])
+            ]
+            if appearance:
+                # MusicBrainz often returns the same album in both artist searches.
+                if release_id in primary_ids or group_id in primary_groups:
+                    continue
+            elif not any(credit and normalize_text(credit) not in aliases for credit in credits):
+                continue
+
+            seen.add(identity)
+            self._full_release_ids.add(release_id)
+            if group_id:
+                self._full_release_ids.update(
+                    release.get("id") for release in self.catalog.primary_releases
+                    if release.get("release_group_id") == group_id
+                )
+            title = metadata.get("title", "")
+            norm_title = normalize_text(title)
+            artist = ArtistCatalog.format_credit(
+                metadata.get("artist-credit"),
+                default="Various Artists" if appearance else self.catalog.name,
+            )
+            credited_artists = {normalize_text(credit) for credit in credits if credit}
+            for medium in metadata.get("medium-list", []):
+                for track in medium.get("track-list", []):
+                    for credit in (track.get("artist-credit")
+                                   or track.get("recording", {}).get("artist-credit") or []):
+                        if isinstance(credit, dict):
+                            credited_artists.update(normalize_text(name) for name in (
+                                credit.get("name"), credit.get("artist", {}).get("name"),
+                            ) if name)
+            tracks, recording_candidates = [], []
+            for track in library_tracks:
+                release_ids = track.get("mb_release_ids") or set()
+                if release_id in release_ids:
+                    tracks.append(dict(track))
+                    continue
+                album = normalize_text(track.get("album") or track.get("norm_album", ""))
+                if album != norm_title:
+                    # Untagged audio can still be grouped by its release folder.
+                    path = normalize_text(str(track.get("path", "")))
+                    if album or not norm_title or not re.search(
+                        r"(?<!\w)" + re.escape(norm_title) + r"(?!\w)", path,
+                    ):
+                        continue
+                album_artist = track.get("album_artist")
+                if (album_artist and not is_various_artists(album_artist)
+                        and normalize_text(album_artist) != normalize_text(artist)):
+                    track_artists = {normalize_text(name) for name in track.get("artists", [])}
+                    if not is_various_artists(artist) or not track_artists.intersection(credited_artists):
+                        continue
+                # Other tagged editions can only supply exact recordings at the
+                # same position, as in the incomplete-release browser.
+                (recording_candidates if release_ids else tracks).append(dict(track))
+            audit = service.audit_release({
+                "artist": artist, "title": title, "mb_release_id": release_id,
+                "is_va": appearance, "tracks": tracks,
+                "recording_candidates": recording_candidates,
+            }, mb_release=metadata)
+            audit["artist_track_ids"] = {
+                track.get("id")
+                for medium in metadata.get("medium-list", [])
+                for track in medium.get("track-list", [])
+                if track.get("id") and any(
+                    isinstance(credit, dict) and credit.get("artist", {}).get("id") == self.catalog.mbid
+                    for credit in (track.get("artist-credit")
+                                   or track.get("recording", {}).get("artist-credit")
+                                   or metadata.get("artist-credit", []))
+                )
+            }
+            self.full_release_audits.append(audit)
+            logging.getLogger(__name__).info(
+                "Full release: %s — %s found, %s missing", title,
+                audit.get("found_count", 0), audit.get("missing_count", 0),
+            )
+
+    def _download_full_releases(self) -> None:
+        """Prefer a verified complete release; otherwise fetch only this artist's tracks."""
+        service = LibraryReleaseService(mb_client=self.mb_client, slskd_client=self.client)
+        logger = logging.getLogger(__name__)
+        for audit in self.full_release_audits:
+            missing = [track for track in audit.get("tracks", []) if track.get("status") == "missing"]
+            if not missing:
+                continue
+            title = audit.get("mb_release_title") or audit["title"]
+            progress = lambda done, total, message: logger.info(
+                "%s [%s/%s tracks matched]", message, done, total,
+            )
+            result = service.download_missing_tracks(
+                artist=audit["artist"], release_title=title, missing_tracks=missing,
+                preferred_format=self.preferred_format, search_timeout=self.search_timeout,
+                dry_run=self.dry_run,
+                on_progress=progress,
+                complete_release_tracks=[track for track in audit["tracks"] if track.get("mb_track_id")],
+            )
+            scope = "release"
+            if not result.get("complete_release_available"):
+                missing = [track for track in missing if track.get("mb_track_id") in audit["artist_track_ids"]]
+                logger.info(
+                    "No complete source verified for %s; searching only %s's %s missing tracks.",
+                    title, self.catalog.name, len(missing),
+                )
+                if not missing:
+                    continue
+                result = service.download_missing_tracks(
+                    artist=audit["artist"], release_title=title, missing_tracks=missing,
+                    preferred_format=self.preferred_format, search_timeout=self.search_timeout,
+                    dry_run=self.dry_run, on_progress=progress, search_scope="track",
+                )
+                scope = "artist_tracks"
+            result["download_scope"] = scope
+            self.release_downloads.append(dict(result, release_id=audit.get("mb_release_id")))
+            if not self.dry_run:
+                enqueued = result.get("enqueued_files", [])
+                self.enqueued_count += len(enqueued)
+                self.enqueued_files.extend(enqueued)
+            self.queue_errors.extend(
+                f"{title}: {error.get('error', str(error))}" for error in result.get("queue_errors", [])
+            )
+            if result.get("resolved_count", 0) < len(missing):
+                self.unresolved_releases.append({"id": audit.get("mb_release_id"), "title": title})
 
     def _generate_all_search_queries(self) -> List[str]:
         queries: List[str] = []
@@ -243,6 +382,8 @@ class SlskdArtistScraper:
         # 2. Targeted Primary Release Queries (User Query + Release, Canonical Name + Release, Release Title)
         if self.catalog:
             for rel in self.catalog.primary_releases:
+                if rel.get("id") in self._full_release_ids:
+                    continue
                 rel_title = rel.get("title", "")
                 norm_rel = normalize_text(rel_title)
                 if not rel_title or norm_rel in self.local_found_releases:
@@ -267,20 +408,7 @@ class SlskdArtistScraper:
                     if clean_rel not in queries:
                         queries.append(clean_rel)
 
-        # 3. Targeted Compilation Release Queries (e.g. "Various Artists Amen Destroyer")
-        if self.catalog:
-            for rel in self.catalog.compilation_releases:
-                rel_title = rel.get("title", "")
-                norm_rel = normalize_text(rel_title)
-                if not rel_title or norm_rel in self.local_found_releases:
-                    continue
-                clean_rel = clean_search_phrase(rel_title)
-                if clean_rel and len(clean_rel) >= 4 and clean_rel.lower() not in DIR_STOP_WORDS and clean_rel.lower() not in GENERIC_OR_COMMON_WORDS:
-                    q_va_rel = clean_search_phrase(f"Various Artists {rel_title}")
-                    if q_va_rel and q_va_rel not in queries:
-                        queries.append(q_va_rel)
-
-        # 4. Artist Aliases (Ordered by relevance, skipping overly short/symbolic noise)
+        # 3. Artist Aliases (Ordered by relevance, skipping overly short/symbolic noise)
         if self.catalog:
             for alias in self.catalog.aliases:
                 alias_clean = clean_search_phrase(alias)
@@ -296,9 +424,6 @@ class SlskdArtistScraper:
 
         batch_results = self.client.batch_search(
             all_queries, timeout=self.search_timeout, poll_interval=1.0,
-            on_progress=lambda done, total, query: logging.getLogger(__name__).info(
-                "Soulseek searches: %s/%s checked — %s", done, total, query,
-            ),
         )
         total_files = 0
         for query_str, s_data in batch_results.items():
@@ -360,6 +485,8 @@ class SlskdArtistScraper:
             self.candidate_index = PeerCandidateIndex(self.peer_directories)
 
         for index, rel in enumerate(primary_rels, 1):
+            if rel.get("id") in self._full_release_ids:
+                continue
             rel_title = rel.get("title", "")
             norm_rel = normalize_text(rel_title)
             if norm_rel in self.local_found_releases or norm_rel in self.reconciled_release_keys:
@@ -449,58 +576,6 @@ class SlskdArtistScraper:
                 logging.getLogger(__name__).info(f"✔ Matched Album: {rel_title} ({best['format_label']}) from {best['user']} ({len(best['matched_tracks'])}/{len(expected_tracks)} tracks)")
             else:
                 self.unresolved_releases.append(rel)
-
-    def _reconcile_compilation_tracks(self) -> None:
-        comp_releases = self.catalog.compilation_releases
-        if not comp_releases:
-            return
-        logging.getLogger(__name__).info(f"\nVerifying Compilation / VA Releases ({len(comp_releases)} releases)...")
-
-        if self.candidate_index is None:
-            self.candidate_index = PeerCandidateIndex(self.peer_directories)
-
-        for rel in comp_releases:
-            rel_title = rel.get("title", "")
-            norm_rel = normalize_text(rel_title)
-            if norm_rel in self.local_found_releases or norm_rel in self.reconciled_release_keys:
-                continue
-
-            comp_tracks = [
-                t for t in self.catalog.tracks
-                if (norm_rel in [normalize_text(r) for r in t.get("all_releases", set())]
-                or t.get("norm_release") == norm_rel)
-                and (any(alias.lower() in t.get("artist_credit", "").lower() for alias in self.all_artist_aliases)
-                     or t.get("artist_credit", "").lower() == self.catalog.name.lower()
-                     or not t.get("artist_credit"))
-            ]
-            if not comp_tracks:
-                continue
-
-            for t in comp_tracks:
-                t_title = t.get("title", "")
-                norm_t = normalize_text(t_title)
-                if norm_t in self.local_found_map or norm_t in self.covered_track_titles:
-                    continue
-
-                best_cf = find_best_track_candidate(
-                    self.candidate_index,
-                    t_title,
-                    self.all_artist_aliases,
-                    self.preferred_format,
-                    rel_title,
-                )
-                if best_cf:
-                    self.covered_track_titles.add(norm_t)
-                    self.verified_compilation_tracks.append({
-                        "release": rel_title,
-                        "track": t_title,
-                        "user": best_cf.user,
-                        "file": best_cf.raw_file,
-                        "format_label": best_cf.fmt_label,
-                    })
-                    logging.getLogger(__name__).info(f"✔ Matched VA Track: {t_title} ({best_cf.fmt_label}) from {best_cf.user} (on '{rel_title}')")
-                else:
-                    self.unresolved_compilation_tracks.append({"release": rel_title, "track": t_title})
 
     def _reconcile_standalone_tracks(self) -> None:
         standalone = [t for t in self.catalog.tracks if t.get("release_type") == "Standalone / Single"]

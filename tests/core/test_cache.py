@@ -37,6 +37,43 @@ def test_batch_cache_storage_and_prefetch(tmp_path):
     assert all(meta.artist == "Batch Artist" for meta in fetched.values())
 
 
+def test_legacy_cache_migrates_and_refreshes_missing_disc_metadata(tmp_path):
+    database = tmp_path / "legacy.db"
+    path = tmp_path / "01 Song.flac"
+    path.write_bytes(b"audio")
+    fingerprint = path.stat()
+    with sqlite3.connect(database) as connection:
+        connection.execute("""
+            CREATE TABLE audio_cache (
+                path TEXT PRIMARY KEY, mtime REAL, size_bytes INTEGER,
+                title TEXT, artist TEXT, album_artist TEXT, album TEXT,
+                track_number TEXT, year TEXT, genres TEXT, mb_track_ids TEXT,
+                mb_rec_ids TEXT, mb_artist_ids TEXT, mb_release_ids TEXT,
+                bitrate_kbps INTEGER, bit_depth INTEGER, sample_rate INTEGER,
+                channels INTEGER, duration REAL, is_lossless INTEGER,
+                format_label TEXT, quality_score INTEGER, cached_at REAL
+            )
+        """)
+        connection.execute(
+            "INSERT INTO audio_cache (path, mtime, size_bytes, title, album_artist) VALUES (?, ?, ?, ?, ?)",
+            (str(path), fingerprint.st_mtime, fingerprint.st_size, "Song", "Various Artists"),
+        )
+
+    cache = UnifiedCacheManager(database)
+
+    # The old row cannot prove which disc its track belongs to and must refresh.
+    assert cache.get_audio_metadata(path) is None
+    with cache._get_conn() as connection:
+        assert connection.execute("SELECT album_artist FROM audio_cache").fetchone()[0] == "Various Artists"
+    cache.store_audio_metadata(AudioMetadata(
+        path=path, title="Song", album_artist="Various Artists", track_number="1", disc_number=2,
+    ))
+    reopened = UnifiedCacheManager(database)
+    restored = reopened.get_audio_metadata(path)
+    assert restored.disc_number == 2
+    assert restored.album_artist == "Various Artists"
+
+
 def test_batch_lookup_preserves_file_fingerprints_and_skips_bad_entries(tmp_path):
     cache = UnifiedCacheManager(tmp_path / "cache.db")
     names = ("unchanged", "retagged", "resized", "deleted", "corrupt", "new")

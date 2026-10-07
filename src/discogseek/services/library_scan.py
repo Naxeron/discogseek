@@ -15,6 +15,7 @@ from discogseek.core.constants import (
     IGNORED_SCAN_DIR_PREFIXES,
 )
 from discogseek.core.release_metadata import (
+    is_unknown_album,
     is_various_artists,
     is_various_artists_directory,
     parse_disc_and_track_number,
@@ -108,6 +109,8 @@ def scan_library_releases(
 def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str, Dict[str, Any]]:
     """Group tagged files into releases, retaining track details for gap analysis."""
     releases_map: Dict[str, Dict[str, Any]] = {}
+    # Loose tracks must not become albums or affect compilation inference.
+    all_tracks = [meta for meta in all_tracks if meta.mb_release_ids or not is_unknown_album(meta.album)]
 
     # Pre-analyze directories to detect multi-artist compilation folders
     folder_artists: Dict[str, Set[str]] = {}
@@ -136,11 +139,7 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
             artist = tagged_album_artist or meta.artist or "Unknown Artist"
             album_artist = tagged_album_artist or artist
 
-        album = meta.album
-        # Derive clean album name fallback from parent folder if not tagged
-        if not album:
-            folder_name = meta.path.parent.name
-            album = folder_name if folder_name else "Unknown Album"
+        album = meta.album or "Unknown Album"
 
         norm_artist = normalize_text(artist)
         norm_album = normalize_text(album)

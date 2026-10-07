@@ -127,13 +127,15 @@ class LibraryReleaseService:
         return self.audit_release(reference)
 
     def audit_release(
-        self, release_data: Dict[str, Any], force_refresh: bool = False
+        self, release_data: Dict[str, Any], force_refresh: bool = False,
+        mb_release: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Reconcile local files against MusicBrainz and resolve missing track titles."""
         return library_audit.audit_release(
             mb_client=self.mb_client,
             release_data=release_data,
             force_refresh=force_refresh,
+            mb_release=mb_release,
         )
 
     def download_missing_tracks(
@@ -147,6 +149,7 @@ class LibraryReleaseService:
         on_progress: Optional[Callable[[int, int, str], None]] = None,
         search_scope: str = "release",
         excluded_sources: Optional[Set[Tuple[str, str]]] = None,
+        complete_release_tracks: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Find requested missing tracks, starting with a release or selected-track search."""
         return library_download.download_missing_tracks(
@@ -161,6 +164,7 @@ class LibraryReleaseService:
             on_progress=on_progress,
             search_scope=search_scope,
             excluded_sources=excluded_sources,
+            complete_release_tracks=complete_release_tracks,
         )
 
     def download_single_missing_track(

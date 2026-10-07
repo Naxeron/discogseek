@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     download = commands.add_parser(
         "download", aliases=["artist", "soulseek", "slsk"],
         help="Search slskd and queue missing tracks for an artist or release",
+        description="Complete an artist's releases, including all tracks on compilations, "
+                    "splits, and guest appearances, or download one selected release.",
     )
     browse = commands.add_parser("browse", help="Browse incomplete library releases in a two-pane terminal UI")
     browse.add_argument("--artist", help="Initial artist filter (editable with / in the browser)")
@@ -178,6 +180,8 @@ def _download(args):
                    for f in directory["all_dir_files"]]
         matches += [t["file"] for t in result.get("verified_compilation_tracks", [])
                     + result.get("verified_standalone_tracks", [])]
+        matches += [file for release in result.get("release_downloads", [])
+                    for file in release.get("queued_files", [])]
         if not args.dry_run and "queued_files" in result:
             matches = result["queued_files"]
     if args.export_json:

@@ -49,6 +49,7 @@ class UnifiedCacheManager:
                     album_artist TEXT,
                     album TEXT,
                     track_number TEXT,
+                    disc_number INTEGER,
                     year TEXT,
                     genres TEXT,
                     mb_track_ids TEXT,
@@ -66,6 +67,11 @@ class UnifiedCacheManager:
                     cached_at REAL
                 )
             """)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(audio_cache)")}
+            if "disc_number" not in columns:
+                # Older cache rows did not retain disc tags. Leave their new
+                # value NULL so the next scan refreshes metadata from the file.
+                conn.execute("ALTER TABLE audio_cache ADD COLUMN disc_number INTEGER")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_mtime ON audio_cache (path, mtime)")
 
             # 2. Generic Key-Value / API Cache with TTL
@@ -114,7 +120,8 @@ class UnifiedCacheManager:
                     )
                     for row in rows:
                         for file_path, st in fingerprints[row["path"]]:
-                            if row["mtime"] != st.st_mtime or row["size_bytes"] != st.st_size:
+                            if (row["mtime"] != st.st_mtime or row["size_bytes"] != st.st_size
+                                    or row["disc_number"] is None):
                                 continue
                             try:
                                 cached[file_path] = self._audio_metadata_from_row(file_path, row)
@@ -136,6 +143,7 @@ class UnifiedCacheManager:
             album_artist=row["album_artist"] or "",
             album=row["album"] or "",
             track_number=row["track_number"] or "",
+            disc_number=int(row["disc_number"] or 1),
             year=row["year"] or "",
             genres=json.loads(row["genres"]) if row["genres"] else [],
             mb_track_ids=set(json.loads(row["mb_track_ids"])) if row["mb_track_ids"] else set(),
@@ -182,10 +190,10 @@ class UnifiedCacheManager:
                 conn.executemany("""
                     INSERT OR REPLACE INTO audio_cache (
                         path, mtime, size_bytes, title, artist, album_artist, album,
-                        track_number, year, genres, mb_track_ids, mb_rec_ids, mb_artist_ids,
+                        track_number, disc_number, year, genres, mb_track_ids, mb_rec_ids, mb_artist_ids,
                         mb_release_ids, bitrate_kbps, bit_depth, sample_rate, channels,
                         duration, is_lossless, format_label, quality_score, cached_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, rows)
         except Exception:
             pass
@@ -201,6 +209,7 @@ class UnifiedCacheManager:
             meta.album_artist,
             meta.album,
             meta.track_number,
+            meta.disc_number,
             meta.year,
             json.dumps(meta.genres),
             json.dumps(list(meta.mb_track_ids)),

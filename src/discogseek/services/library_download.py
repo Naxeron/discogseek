@@ -6,8 +6,10 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from discogseek.clients.slskd import SlskdAPIError, SlskdClient, SlskdPeerBlockedError, SlskdPeerUnavailableError
-from discogseek.core.audio import AudioQualityAnalyzer
+from discogseek.clients.slskd import (
+    SlskdAPIError, SlskdClient, SlskdEnqueueError, SlskdPeerBlockedError, SlskdPeerUnavailableError,
+)
+from discogseek.core.audio import AudioQualityAnalyzer, DISC_DIR_PATTERN
 from discogseek.core.constants import AUDIO_EXTENSIONS
 from discogseek.core.release_metadata import (
     MISSING_TRACK_PATTERN,
@@ -39,6 +41,7 @@ def download_missing_tracks(
     on_progress: Optional[Callable[[int, int, str], None]] = None,
     search_scope: str = "release",
     excluded_sources: Optional[Set[Tuple[str, str]]] = None,
+    complete_release_tracks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Orchestrates Soulseek discovery and queueing for missing tracks of a release.
@@ -48,7 +51,11 @@ def download_missing_tracks(
     matched_tracks and queued_tracks refer to requested rows; only confirmed enqueue
     successes enter queued_tracks. Queue/search errors retain their affected rows so
     callers can keep earlier successes and retry the remaining positions.
+    enqueued_files contains only newly accepted submissions, while queued_files
+    also contains protected transfers and dry-run matches.
     Progress counts matched requested tracks, not a percentage or transfer progress.
+    complete_release_tracks requires one peer's release folder to match every
+    official track before queueing missing rows; it disables individual searches.
     """
     if search_scope not in {"release", "track"}:
         raise ValueError("search_scope must be 'release' or 'track'")
@@ -56,7 +63,7 @@ def download_missing_tracks(
         return {
             "status": "skipped", "message": "No missing tracks to download.",
             "queued_count": 0, "matched_count": 0, "resolved_count": 0,
-            "queued_files": [], "matched_tracks": [], "queued_tracks": [], "queue_errors": [],
+            "queued_files": [], "enqueued_files": [], "matched_tracks": [], "queued_tracks": [], "queue_errors": [],
         }
 
     def track_position(track: Dict[str, Any]) -> Tuple[int, Optional[int]]:
@@ -133,6 +140,7 @@ def download_missing_tracks(
     )
 
     queued_files: List[Dict[str, Any]] = []
+    enqueued_files: List[Dict[str, Any]] = []
     matched_tracks: List[Dict[str, Any]] = []
     queued_tracks: List[Dict[str, Any]] = []
     queue_errors: List[Dict[str, Any]] = []
@@ -146,6 +154,13 @@ def download_missing_tracks(
         track_key(resolved): requested
         for requested, resolved in zip(requested_tracks, missing_tracks)
     }
+    if complete_release_tracks is not None and (
+        not complete_release_tracks
+        or any(is_missing_track_placeholder(track.get("title", "")) for track in complete_release_tracks)
+        or not set(requested_by_key).issubset({track_key(track) for track in complete_release_tracks})
+    ):
+        raise ValueError("Complete release verification requires the official tracklist, including all missing tracks")
+    complete_release_available = False
     preferred = preferred_format.lower()
 
     def report_progress(message: str) -> None:
@@ -309,6 +324,7 @@ def download_missing_tracks(
                         identity = file_key(user, item)
                         if identity in accepted:
                             queued_files.append(item)
+                            enqueued_files.append(item)
                             queued_tracks.append(track)
                         else:
                             resolved_missing.discard(key)
@@ -321,9 +337,22 @@ def download_missing_tracks(
                     report_progress(f"Peer {user} is unavailable; trying other matches…")
                     break
                 except Exception as error:
-                    queue_errors.append({"user": user, "error": str(error), "tracks": tracks})
+                    accepted = {
+                        file_key(user, file) for file in error.queued_files
+                    } if isinstance(error, SlskdEnqueueError) else set()
+                    rejected_tracks = []
+                    for item, track in zip(chunk, tracks):
+                        if file_key(user, item) in accepted:
+                            queued_files.append(item)
+                            enqueued_files.append(item)
+                            queued_tracks.append(track)
+                        else:
+                            rejected_tracks.append(track)
+                    if rejected_tracks:
+                        queue_errors.append({"user": user, "error": str(error), "tracks": rejected_tracks})
                     continue
                 queued_tracks.extend(tracks)
+                enqueued_files.extend(chunk)
             queued_files.extend(chunk)
 
     def remaining_tracks() -> List[Dict[str, Any]]:
@@ -402,6 +431,7 @@ def download_missing_tracks(
                         break
 
     def evaluate_album(responses: List[Dict[str, Any]], require_artist: bool = False) -> None:
+        nonlocal complete_release_available
         # Compare all peers before choosing, so response ordering cannot override format preference.
         peer_directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for response in responses:
@@ -412,6 +442,14 @@ def download_missing_tracks(
                 filename = file.get("filename", "")
                 if Path(filename).suffix.lower() in AUDIO_EXTENSIONS and not file.get("isLocked"):
                     folder = os.path.dirname(filename.replace("\\", "/"))
+                    if complete_release_tracks is not None:
+                        # Sibling discs belong to one release; other folders/peers do not.
+                        if DISC_DIR_PATTERN.match(os.path.basename(folder)):
+                            folder = os.path.dirname(folder)
+                        if not set(normalize_text(release_title).split()).issubset(
+                            normalize_text(os.path.basename(folder)).split()
+                        ):
+                            continue
                     info = peer_directories.setdefault((user, folder), {"matched_search_files": []})
                     info["matched_search_files"].append(file)
 
@@ -419,9 +457,12 @@ def download_missing_tracks(
         matches_by_directory: Dict[Tuple[str, str], Dict[Tuple[int, Optional[int], str], Any]] = {}
         selected_by_directory: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
         protected_matches: Dict[Tuple[int, Optional[int], str], Tuple[str, Dict[str, Any], Dict[str, Any]]] = {}
-        for track in remaining_tracks():
-            candidates = candidate_index.get_candidate_files_for_track(pre_parse_single_track(track.get("title", "")))
+        for track in complete_release_tracks if complete_release_tracks is not None else remaining_tracks():
+            parsed_track = pre_parse_single_track(track.get("title", ""))
+            candidates = candidate_index.get_candidate_files_for_track(parsed_track)
             for candidate in sorted(candidates, key=lambda item: candidate_rank(item.user, item.raw_file)):
+                if complete_release_tracks is not None and candidate.p_struct["base_norm"] != parsed_track["p_struct"]["base_norm"]:
+                    continue
                 if require_artist:
                     expected_artist = normalize_text(track.get("artist") or artist).split()
                     remote_words = set(normalize_text(candidate.full_filename).split())
@@ -435,7 +476,7 @@ def download_missing_tracks(
                 # stopped when a better file from this directory replaces them.
                 if not candidate_available(track, candidate.user, candidate.raw_file, False):
                     continue
-                if history.is_protected(candidate.user, candidate.raw_file.get("filename", "")):
+                if complete_release_tracks is None and history.is_protected(candidate.user, candidate.raw_file.get("filename", "")):
                     protected_matches.setdefault(track_key(track), (candidate.user, track, candidate.raw_file))
                 if track_key(track) not in matches and identity not in selected_files:
                     matches[track_key(track)] = (track, candidate.raw_file)
@@ -448,6 +489,8 @@ def download_missing_tracks(
 
         directory_matches = []
         for (user, folder), matches in matches_by_directory.items():
+            if complete_release_tracks is not None and len(matches) != len(complete_release_tracks):
+                continue
             if matches:
                 ranks = [candidate_rank(user, file) for _, file in matches.values()]
                 rank = (
@@ -456,7 +499,13 @@ def download_missing_tracks(
                 )
                 directory_matches.append((rank, user, list(matches.values())))
         for _, user, matches in sorted(directory_matches, key=lambda item: item[0]):
+            if complete_release_tracks is not None:
+                complete_release_available = True
+                report_progress(f"Verified complete release: {len(matches)}/{len(complete_release_tracks)} tracks from {user}…")
+                matches = [(track, file) for track, file in matches if track_key(track) in requested_by_key]
             queue_matches(user, matches)
+            if not remaining_tracks():
+                break
 
     def search_album() -> None:
         if not release_title or not remaining_tracks():
@@ -568,7 +617,9 @@ def download_missing_tracks(
                     queue_matches(user, matches)
 
     reuse_history()
-    if search_scope == "track":
+    if complete_release_tracks is not None:
+        search_album()
+    elif search_scope == "track":
         search_tracks()
         search_album()
     else:
@@ -607,9 +658,11 @@ def download_missing_tracks(
         "resolved_count": len(matched_missing),
         "dry_run": dry_run,
         "queued_files": queued_files,
+        "enqueued_files": enqueued_files,
         "matched_tracks": matched_tracks,
         "queued_tracks": queued_tracks,
         "queue_errors": queue_errors,
+        "complete_release_available": complete_release_available,
     }
 
 

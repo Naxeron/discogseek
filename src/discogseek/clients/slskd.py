@@ -85,6 +85,7 @@ class SlskdClient:
         self.token: Optional[str] = None
         self.token_expiry: float = 0
         self._lock = threading.Lock()
+        self._search_lock = threading.Lock()
 
         # Bounded LRU memory cache for directory browsing
         self._max_cache_size: int = MAX_DIRECTORY_CACHE_SIZE
@@ -177,6 +178,26 @@ class SlskdClient:
             return []
         return resp.json()
 
+    def _start_search(self, query: str) -> Dict[str, Any]:
+        # slskd rejects overlapping POSTs, even though searches run concurrently.
+        with self._search_lock:
+            for attempt in range(3):
+                resp = self._request("POST", "/api/v0/searches", json={"searchText": query})
+                if resp.status_code != 429 or attempt == 2:
+                    break
+                logging.getLogger(__name__).warning(
+                    "slskd busy (HTTP 429); retrying search — %s", query,
+                )
+                time.sleep(attempt + 1)
+            if resp.status_code not in (200, 201):
+                raise SlskdAPIError(
+                    f"Failed to initiate search for '{query}' (HTTP {resp.status_code}): {resp.text}"
+                )
+            data = resp.json()
+            if not isinstance(data, dict) or not data.get("id"):
+                raise SlskdAPIError(f"slskd returned no search ID for '{query}'")
+            return data
+
     def search(
         self,
         query: str,
@@ -210,12 +231,8 @@ class SlskdClient:
                         break
 
         if not search_id:
-            init_resp = self._request("POST", "/api/v0/searches", json={"searchText": clean_q})
-            if init_resp.status_code not in (200, 201):
-                raise SlskdAPIError(f"Failed to initiate search for '{clean_q}' (HTTP {init_resp.status_code}): {init_resp.text}")
-
-            search_data = init_resp.json()
-            search_id = search_data.get("id")
+            search_data = self._start_search(clean_q)
+            search_id = search_data["id"]
             last_data = search_data
         else:
             last_data = {"id": search_id, "searchText": clean_q, "responses": []}
@@ -265,7 +282,7 @@ class SlskdClient:
         use_existing: bool = True,
         on_progress: Optional[Callable[[int, int, str], None]] = None
     ) -> Dict[str, Dict[str, Any]]:
-        """Search in bounded chunks, polling their results concurrently."""
+        """Submit searches serially in pairs, polling their results concurrently."""
         clean_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
         if not clean_queries:
             return {}
@@ -275,12 +292,21 @@ class SlskdClient:
         cached_query_ids: Dict[str, str] = {}
         total_queries = len(clean_queries)
         completed_queries = 0
-        chunk_size = max(1, min(max_concurrent, 8))
+        worker_count = max(1, min(max_concurrent, 8))
+        # slskd runs two searches at a time; larger chunks spend our timeout queued.
+        chunk_size = min(worker_count, 2)
         effective_timeout = max(timeout, 28.0)
+        logger = logging.getLogger(__name__)
 
-        def _complete(q_str: str) -> None:
+        def _complete(q_str: str, status: str, error: Optional[Exception] = None) -> None:
             nonlocal completed_queries
             completed_queries += 1
+            logger.log(
+                logging.WARNING if error else logging.INFO,
+                "Soulseek searches: %s/%s %s — %s%s",
+                completed_queries, total_queries, status, q_str,
+                f": {error}" if error else "",
+            )
             if on_progress:
                 on_progress(completed_queries, total_queries, q_str)
 
@@ -332,17 +358,9 @@ class SlskdClient:
                     except Exception:
                         pass
 
-        def _init_single(q_str: str) -> Optional[str]:
-            if q_str in query_to_search_id:
-                return query_to_search_id[q_str]
-            resp = self._request("POST", "/api/v0/searches", json={"searchText": q_str})
-            if resp.status_code in (200, 201):
-                return resp.json().get("id")
-            return None
-
         # Reuse workers for all reads so an HTTP round trip is paid once per
         # polling round instead of once per query. Progress stays on this thread.
-        with ThreadPoolExecutor(max_workers=chunk_size) as executor:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             cached_futures = {
                 executor.submit(self.get_search_results, sid): query
                 for query, sid in cached_query_ids.items()
@@ -353,7 +371,7 @@ class SlskdClient:
                     data = future.result()
                     if data.get("responses"):
                         results[query] = data
-                        _complete(query)
+                        _complete(query, "cached")
                 except Exception:
                     pass
 
@@ -361,17 +379,12 @@ class SlskdClient:
             for i in range(0, len(pending_queries), chunk_size):
                 chunk = pending_queries[i:i + chunk_size]
                 active_chunk: Dict[str, str] = {}
-                init_futures = {executor.submit(_init_single, query): query for query in chunk}
-                for future in as_completed(init_futures):
-                    query = init_futures[future]
+                for query in chunk:
                     try:
-                        sid = future.result()
-                    except Exception:
-                        sid = None
-                    if sid:
+                        sid = query_to_search_id.get(query) or self._start_search(query)["id"]
                         active_chunk[query] = sid
-                    else:
-                        _complete(query)
+                    except Exception as error:
+                        _complete(query, "not submitted", error)
 
                 start_time = time.monotonic()
                 deadline = start_time + effective_timeout
@@ -392,7 +405,7 @@ class SlskdClient:
                         observed = query in query_to_search_id or time.monotonic() - start_time >= 6.0
                         if is_done and observed:
                             del active_chunk[query]
-                            _complete(query)
+                            _complete(query, "completed")
 
                 # A final concurrent read retains late responses at the deadline.
                 final_futures = {
@@ -403,9 +416,12 @@ class SlskdClient:
                     query = final_futures[future]
                     try:
                         _remember(query, future.result())
-                    except Exception:
-                        pass
-                    _complete(query)
+                    except Exception as error:
+                        _complete(query, "results unavailable", error)
+                        continue
+                    data = results[query]
+                    is_done = data.get("isComplete", False) or "Completed" in data.get("state", "")
+                    _complete(query, "completed" if is_done else "still running (poll timeout)")
 
         return results
 

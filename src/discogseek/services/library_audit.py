@@ -2,11 +2,12 @@
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from discogseek.clients.musicbrainz import MusicBrainzClient
 from discogseek.core.release_metadata import (
     format_artist_credit,
+    is_unknown_album,
     is_various_artists,
     parse_disc_and_track_number,
 )
@@ -43,11 +44,13 @@ def is_numeric_track_item(lt: Dict[str, Any]) -> bool:
 
 
 def audit_release(
-    mb_client: MusicBrainzClient, release_data: Dict[str, Any], force_refresh: bool = False
+    mb_client: MusicBrainzClient, release_data: Dict[str, Any], force_refresh: bool = False,
+    mb_release: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Reconciles a local release against MusicBrainz to identify full tracklist,
     found tracks, and missing tracks with real official song titles.
+    Supplied MusicBrainz metadata is authoritative and avoids another lookup.
     """
     artist = release_data.get("artist", "")
     title = release_data.get("title", "")
@@ -75,14 +78,14 @@ def audit_release(
                 if lt.get("track_num_int") is None:
                     lt["track_num_int"] = p_trk
 
-    mb_release = None
+    supplied_metadata = mb_release is not None
 
     # 1. Look up by MBID if available
-    if mb_rel_id:
+    if not supplied_metadata and mb_rel_id:
         mb_release = mb_client.get_release_by_id(mb_rel_id, force_refresh=force_refresh)
 
     # 2. Search MusicBrainz by release title + artist if not found by ID
-    if not mb_release and title:
+    if not supplied_metadata and not mb_release and not is_unknown_album(title):
         search_results = mb_client.search_release(release_title=title, artist_name=artist, limit=5)
         if search_results:
             best_cand = None
@@ -161,7 +164,11 @@ def audit_release(
         recording_candidates = release_data.get("recording_candidates", [])
         reconciled_tracklist: List[Dict[str, Any]] = []
         positions_by_recording: Dict[str, Set[Tuple[int, str]]] = {}
+        positions_by_title: Dict[str, Set[Tuple[int, str]]] = {}
         for track in official_tracks:
+            positions_by_title.setdefault(track["norm_title"], set()).add(
+                (int(track["disc_number"] or 1), track["track_number"])
+            )
             if track["mb_recording_id"]:
                 positions_by_recording.setdefault(track["mb_recording_id"], set()).add(
                     (int(track["disc_number"] or 1), track["track_number"])
@@ -195,6 +202,24 @@ def audit_release(
                     matched_local = lt
                     matched_local_indices.add(idx)
                     break
+
+            # Without matching IDs, a repeated title belongs at its known
+            # position. A later track called "Intro" must not fill an earlier
+            # artist's missing "Intro" through the title-only fallback.
+            if not matched_local:
+                title_positions = positions_by_title[off_trk["norm_title"]]
+                if len(title_positions) > 1:
+                    for idx, lt in enumerate(local_tracks):
+                        if normalize_text(lt.get("title", "")) != off_trk["norm_title"]:
+                            continue
+                        own_disc = int(lt.get("disc_number") or 1)
+                        own_number = lt.get("track_number")
+                        if (own_disc == int(off_trk["disc_number"] or 1)
+                                and is_track_number_match(own_number, off_trk["track_number"])):
+                            continue
+                        if any(own_disc == disc and is_track_number_match(own_number, number)
+                               for disc, number in title_positions):
+                            reserved_local_indices.add(idx)
 
             # Pass 2: Track number + Title match (with numeric filename support)
             if not matched_local:

@@ -6,7 +6,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from discogseek.config import Config
-from discogseek.cli.browser import download_release
+from discogseek.clients.navidrome import NavidromeScanner
+from discogseek.cli.browser import BrowserModel, download_release
 from discogseek.services.library import LibraryReleaseService
 from discogseek.services.library_browser import LibraryBrowserService, merge_library_releases
 
@@ -71,6 +72,38 @@ def test_merges_local_and_pathless_navidrome_tracks_before_auditing():
     assert len(result["tracks"]) == 3
     assert result["tracks"][0]["path"].startswith("/music/")
     assert result["mb_release_id"] == "edition-1"
+
+
+def test_stale_navidrome_song_count_still_displays_missing_tracks_and_scans_later_albums():
+    browser = make_browser([])
+    official = browser.release_service.mb_client.get_release_by_id.return_value
+    browser.release_service.mb_client.get_release_by_id.side_effect = lambda release_id, **kwargs: dict(
+        official, id=release_id, title="Album" if release_id == "edition-1" else "Later",
+    )
+    songs = [{"id": f"song-{number}", "title": title, "track": number,
+              "musicBrainzId": f"rec-{number}"}
+             for number, title in enumerate(["First", "Second", "Third"], 1)]
+    scanner = NavidromeScanner(base_url="http://navidrome.invalid", username="user", password="pass")
+    scanner._api_request = MagicMock(side_effect=[
+        {},
+        {"albumList2": {"album": [{"id": "stale-count"}, {"id": "later"}]}},
+        {"album": {"name": "Album", "artist": "Artist", "musicBrainzId": "edition-1",
+                   "songCount": 3, "song": songs[:1]}},
+        {"album": {"name": "Later", "artist": "Artist", "musicBrainzId": "edition-2",
+                   "songCount": 3, "song": songs}},
+    ])
+    browser.navidrome_scanner = scanner
+
+    rows = list(browser.iter_releases())
+    model = BrowserModel()
+    for row in rows:
+        model.update(row)
+
+    assert len(rows) == 2
+    assert [row["missing_count"] for row in rows] == [2, 0]
+    assert [row["navidrome_id"] for row in model.visible()] == ["stale-count"]
+    assert [track["title"] for track in model.visible()[0]["tracks"]
+            if track["status"] == "missing"] == ["Second", "Third"]
 
 
 def test_refresh_picks_up_new_remote_tracks_and_keeps_selected_edition():

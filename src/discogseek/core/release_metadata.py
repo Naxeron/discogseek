@@ -5,6 +5,12 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from discogseek.core.constants import VA_DIR_MARKERS
+from discogseek.core.text import normalize_text
+
+
+def is_unknown_album(title: Optional[str]) -> bool:
+    """Missing album metadata and server placeholders are not release titles."""
+    return normalize_text(title) in ("", "unknown album")
 
 
 def parse_disc_and_track_number(

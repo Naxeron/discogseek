@@ -227,14 +227,22 @@ def test_download_progress_is_visible_before_connecting(workflow, monkeypatch, c
     assert workflow == []
 
 
-def test_download_reports_search_counts(workflow, monkeypatch, capsys):
-    def batch_search(client, queries, **kwargs):
-        kwargs["on_progress"](1, len(queries), queries[0])
-        assert "Soulseek searches: 1/" in capsys.readouterr().err
-        return {}
-
+def test_download_reports_search_counts(request, monkeypatch, capsys):
+    batch_search = SlskdClient.batch_search
+    request.getfixturevalue("workflow")
     monkeypatch.setattr(SlskdClient, "batch_search", batch_search)
+    queries = ["Target Artist", "Target Artist Three Track EP", "Three Track EP"]
+    monkeypatch.setattr(SlskdClient, "list_searches", lambda client: [
+        {"id": query, "searchText": query, "isComplete": True, "fileCount": 1}
+        for query in queries
+    ])
+    monkeypatch.setattr(SlskdClient, "get_search_results", lambda client, sid: {
+        "isComplete": True, "responses": [{"username": "peer", "files": []}],
+    })
     assert main(["download", "Target Artist", "--dry-run"]) == 0
+    output = capsys.readouterr().err
+    assert "Soulseek searches: 3/3 cached — " in output
+    assert "checked — " not in output
 
 
 @pytest.mark.parametrize("scope", [[], ["--release", "Three Track EP"], ["--release-id", "release-1"]])
