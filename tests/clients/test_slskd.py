@@ -1,12 +1,16 @@
 """slskd search polling and download payload deduplication."""
 
 import logging
+from datetime import datetime, timedelta, timezone
 from threading import Barrier, Event, Lock
 from unittest.mock import MagicMock, call
 
 import pytest
 
 from discogseek.clients.slskd import (
+    SEARCH_FILE_LIMIT,
+    SEARCH_RESPONSE_LIMIT,
+    SEARCH_TIMEOUT_MS,
     SlskdAPIError,
     SlskdClient,
     SlskdEnqueueError,
@@ -45,7 +49,7 @@ def test_slskd_enqueue_offline_peer_fails_without_retry(enqueue_client):
     sleep.assert_not_called()
 
 
-@pytest.mark.parametrize("state", ["Rejected", "Aborted", "Cancelled"])
+@pytest.mark.parametrize("state", ["Rejected", "Cancelled"])
 def test_enqueue_observes_new_peer_block_before_post(enqueue_client, state):
     client, request, _ = enqueue_client
     client.get_downloads.return_value = [{"username": "Peer", "directories": [{"files": [{
@@ -353,22 +357,43 @@ def peer_response(filename="song.flac"):
     return {"username": "peer", "files": [{"filename": filename, "size": 1000}]}
 
 
-def test_slskd_batch_search_waits_for_completion_and_fetches_live_responses(search_client):
+def recent(seconds=5.0):
+    """An slskd timestamp (7 fractional digits, 'Z') from seconds ago."""
+    moment = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+
+
+def test_slskd_search_posts_explicit_inactivity_timeout_and_limits(search_client):
+    client, request, clock = search_client
+    request.side_effect = lambda method, path, **kwargs: search_response(
+        {"id": "sid"} if method == "POST" else {"isComplete": True, "responses": [peer_response()]}
+    )
+
+    client.search("Lone Reality Testing")
+
+    assert request.call_args_list[0] == call("POST", "/api/v0/searches", json={
+        "searchText": "Lone Reality Testing",
+        "searchTimeout": SEARCH_TIMEOUT_MS,
+        "responseLimit": SEARCH_RESPONSE_LIMIT,
+        "fileLimit": SEARCH_FILE_LIMIT,
+    })
+
+
+def test_slskd_batch_search_reads_responses_once_slskd_stores_them(search_client):
+    # slskd 0.26 returns no responses from either endpoint while a search runs.
     client, request, clock = search_client
     progress_updates = []
 
     def respond(method, path, **kwargs):
         if method == "POST":
             return search_response({"id": "search-123"})
+        done = clock["now"] >= 9
         if path.endswith("/responses"):
-            files = [peer_response()]
-            if clock["now"] >= 8:
-                files.append(peer_response("late.flac"))
-            return search_response(files)
+            return search_response([peer_response(), peer_response("late.flac")] if done else [])
         return search_response({
-            "id": "search-123", "isComplete": False,
-            "state": "Completed, TimedOut" if clock["now"] >= 9 else "InProgress",
-            "responseCount": 50, "fileCount": 200, "responses": [],
+            "id": "search-123", "isComplete": done,
+            "state": "Completed, TimedOut" if done else "InProgress",
+            "responseCount": 2 if done else 1, "fileCount": 2, "responses": [],
         })
 
     request.side_effect = respond
@@ -380,10 +405,10 @@ def test_slskd_batch_search_waits_for_completion_and_fetches_live_responses(sear
     assert clock["now"] == 9
     assert results["test artist"]["responses"] == [peer_response(), peer_response("late.flac")]
     assert progress_updates == [(1, 1, "test artist")]
-    assert sum(entry.args[1].endswith("/responses") for entry in request.call_args_list) == 9
+    assert sum(entry.args[1].endswith("/responses") for entry in request.call_args_list) == 1
 
 
-def test_slskd_batch_search_observes_cold_search_for_six_seconds(search_client):
+def test_slskd_batch_search_accepts_a_stored_result_without_extra_observation(search_client):
     client, request, clock = search_client
 
     def respond(method, path, **kwargs):
@@ -394,14 +419,14 @@ def test_slskd_batch_search_observes_cold_search_for_six_seconds(search_client):
     request.side_effect = respond
     results = client.batch_search(["query"], timeout=2)
 
-    assert clock["now"] == 6
+    assert clock["now"] == 1
     assert results["query"]["responses"] == [peer_response()]
 
 
 def test_slskd_batch_search_uses_in_progress_existing_search(search_client, monkeypatch):
     client, request, clock = search_client
     monkeypatch.setattr(client, "list_searches", lambda: [{
-        "id": "existing-sid", "searchText": "existing query",
+        "id": "existing-sid", "searchText": "existing query", "startedAt": recent(5),
         "isComplete": False, "state": "InProgress", "fileCount": 10,
     }])
     request.return_value = search_response({"isComplete": True, "responses": [peer_response()]})
@@ -413,59 +438,74 @@ def test_slskd_batch_search_uses_in_progress_existing_search(search_client, monk
     assert results["existing query"]["responses"] == [peer_response()]
 
 
-def test_slskd_batch_search_keeps_files_when_completed_snapshot_is_empty(search_client):
+def test_slskd_batch_search_rereads_completed_search_until_responses_are_stored(search_client):
+    # slskd marks a search Completed shortly before it stores its responses.
     client, request, clock = search_client
 
     def respond(method, path, **kwargs):
         if method == "POST":
             return search_response({"id": "search-id"})
+        stored = clock["now"] >= 5
         if path.endswith("/responses"):
-            return search_response([peer_response()] if clock["now"] == 1 else [])
+            return search_response([peer_response()] if stored else [])
         return search_response({
-            "isComplete": clock["now"] >= 8,
-            "state": "Completed" if clock["now"] >= 8 else "InProgress",
-            "fileCount": 1 if clock["now"] == 1 else 0, "responses": [],
+            "isComplete": clock["now"] >= 3,
+            "state": "Completed, TimedOut" if clock["now"] >= 3 else "InProgress",
+            "responseCount": 1, "fileCount": 1,
+            "endedAt": recent(0) if stored else None,
+            "responses": [peer_response()] if stored else [],
         })
 
     request.side_effect = respond
     results = client.batch_search(["query"])
 
-    assert clock["now"] == 8
+    assert clock["now"] == 5
     assert results["query"]["responses"] == [peer_response()]
     assert results["query"]["fileCount"] == 1
     assert results["query"]["isComplete"] is True
 
 
-@pytest.mark.parametrize("final_failure", [False, True])
-def test_slskd_batch_search_timeout_retains_streamed_files(search_client, final_failure, caplog):
+@pytest.mark.parametrize("finalized", [True, False])
+def test_slskd_batch_search_stops_search_at_time_limit_and_keeps_its_responses(
+    search_client, finalized, caplog,
+):
     client, request, clock = search_client
     caplog.set_level(logging.INFO, logger="discogseek.clients.slskd")
-    metadata_reads = 0
+    stopped = []
     progress_updates = []
 
     def respond(method, path, **kwargs):
-        nonlocal metadata_reads
         if method == "POST":
             return search_response({"id": "search-id"})
-        if path.endswith("/responses"):
-            return search_response([peer_response()] if clock["now"] == 1 else [])
-        metadata_reads += 1
-        if final_failure and metadata_reads > 28:
-            raise SlskdAPIError("Disconnected during final poll")
-        return search_response({"isComplete": False, "state": "InProgress", "responses": []})
+        if method == "PUT":
+            stopped.append(clock["now"])
+            return search_response({})
+        if finalized and stopped and clock["now"] > stopped[0]:
+            return search_response({
+                "isComplete": True, "state": "Completed, Cancelled", "responseCount": 1,
+                "responses": [peer_response()],
+            })
+        return search_response({"isComplete": False, "state": "InProgress", "responseCount": 1, "responses": []})
 
     request.side_effect = respond
     results = client.batch_search(
         ["query"], timeout=2, on_progress=lambda *args: progress_updates.append(args),
     )
 
-    assert clock["now"] == 28
-    assert metadata_reads == 29
-    assert results["query"]["responses"] == [peer_response()]
-    assert results["query"]["isComplete"] is False
+    # max(timeout, 28) + 45 s, then a short wait for slskd to store the responses.
+    assert stopped == [73]
     assert progress_updates == [(1, 1, "query")]
-    status = "results unavailable" if final_failure else "still running (poll timeout)"
-    assert f"1/1 {status} — query" in caplog.text
+    if finalized:
+        assert clock["now"] == 74
+        assert results["query"]["responses"] == [peer_response()]
+        assert results["query"]["state"] == "Completed, Cancelled"
+        assert "1/1 stopped at time limit — query" in caplog.text
+    else:
+        assert clock["now"] == 83
+        assert results["query"] == {
+            "error": "slskd did not finish the search within 83s", "responses": [], "searchText": "query",
+        }
+        assert "1/1 results unavailable — query" in caplog.text
 
 
 @pytest.mark.parametrize("already_complete", [False, True])
@@ -474,7 +514,9 @@ def test_slskd_batch_search_reads_concurrently_with_bounded_workers(search_clien
     caplog.set_level(logging.INFO, logger="discogseek.clients.slskd")
     queries = [f"query-{i}" for i in range(4)]
     monkeypatch.setattr(client, "list_searches", lambda: [
-        {"id": query, "searchText": query, "isComplete": already_complete, "fileCount": 1}
+        {"id": query, "searchText": query, "isComplete": already_complete, "fileCount": 1,
+         "state": "Completed, TimedOut" if already_complete else "InProgress",
+         "startedAt": recent(30), "endedAt": recent(10) if already_complete else None}
         for query in queries
     ])
     barrier = Barrier(2, timeout=2)
@@ -577,6 +619,7 @@ def test_slskd_search_retries_explicit_rate_limit_before_polling(search_client, 
 @pytest.mark.parametrize("failure, expected, attempts", [
     (429, "HTTP 429", 3),
     (500, "HTTP 500", 1),
+    (409, "HTTP 409", 1),
     (200, "no search ID", 1),
     (None, "connection lost", 1),
 ])
@@ -592,7 +635,12 @@ def test_slskd_search_submission_failures_are_visible(search_client, method, fai
             client.search("query")
     else:
         progress = []
-        assert client.batch_search(["query"], on_progress=lambda *args: progress.append(args)) == {}
+        results = client.batch_search(["query"], on_progress=lambda *args: progress.append(args))
+        # A failed search is reported, not mistaken for a search without matches.
+        assert list(results) == ["query"]
+        assert results["query"]["responses"] == []
+        assert results["query"]["searchText"] == "query"
+        assert expected in results["query"]["error"]
         assert progress == [(1, 1, "query")]
         assert "1/1 not submitted — query" in caplog.text
         assert expected in caplog.text
@@ -619,7 +667,10 @@ def test_slskd_batch_search_purges_empty_completed_search_before_redispatch(sear
 
     assert request.call_args_list[:2] == [
         call("DELETE", "/api/v0/searches/stale"),
-        call("POST", "/api/v0/searches", json={"searchText": "query"}),
+        call("POST", "/api/v0/searches", json={
+            "searchText": "query", "searchTimeout": SEARCH_TIMEOUT_MS,
+            "responseLimit": SEARCH_RESPONSE_LIMIT, "fileLimit": SEARCH_FILE_LIMIT,
+        }),
     ]
     assert results["query"]["responses"] == [peer_response()]
 
@@ -630,8 +681,10 @@ def test_slskd_batch_search_reuses_running_search_when_old_results_are_unavailab
 ):
     client, request, clock = search_client
     monkeypatch.setattr(client, "list_searches", lambda: [
-        {"id": "old", "searchText": "query", "isComplete": True, "fileCount": stale_file_count},
-        {"id": "running", "searchText": "query", "isComplete": False, "fileCount": 0},
+        {"id": "old", "searchText": "query", "isComplete": True, "state": "Completed, TimedOut",
+         "startedAt": recent(60), "endedAt": recent(40), "fileCount": stale_file_count},
+        {"id": "running", "searchText": "query", "isComplete": False, "state": "InProgress",
+         "startedAt": recent(5), "fileCount": 0},
     ])
 
     def respond(method, path, **kwargs):

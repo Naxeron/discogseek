@@ -20,6 +20,13 @@ from discogseek.core.text import normalize_text
 logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+# Artist relations that name the same person (a performance name); other relations
+# (member of band, named after, collaboration) are different artists.
+STRONG_ARTIST_RELATIONS = {"is person"}
+
+# Release searches are cached; a later scan of the same untagged album reuses them.
+SEARCH_CACHE_TTL = 7 * 24 * 3600
+
 # Initialize musicbrainzngs
 musicbrainzngs.set_useragent(
     Config.MB_APP_NAME,
@@ -40,6 +47,9 @@ class ArtistCatalog:
 
         self.aliases: Set[str] = set()
         self.alias_details: List[Dict[str, str]] = []
+        # Related artists (band memberships, 'named after' acts) that never appear in
+        # this artist's own credits: listed in alias_details, not used for matching.
+        self.related_names: Set[str] = set()
         self._extract_aliases()
 
         # Catalog items
@@ -96,21 +106,51 @@ class ArtistCatalog:
                         "locale": locale
                     })
 
-        # Related artist personas
+        # Related artists. Only a persona ('is person') names this artist; a band,
+        # member or tribute act is another artist unless this artist's own release
+        # or track credits name it ('Squarepusher presents Shobaleader One').
+        credited = None
         for rel in self.artist_info.get('artist-relation-list', []):
             if isinstance(rel, dict):
                 art = rel.get('artist', {})
                 art_name = art.get('name')
                 if art_name:
-                    self.aliases.add(art_name.strip().lower())
-                    self.aliases.add(unidecode(art_name).strip().lower())
+                    rel_type = rel.get('type', 'persona')
+                    if credited is None and rel_type not in STRONG_ARTIST_RELATIONS:
+                        credited = self._credited_names()
+                    if rel_type in STRONG_ARTIST_RELATIONS or normalize_text(art_name) in credited:
+                        self.aliases.add(art_name.strip().lower())
+                        self.aliases.add(unidecode(art_name).strip().lower())
+                    else:
+                        self.related_names.add(art_name.strip())
                     self.alias_details.append({
                         "alias": art_name,
-                        "type": f"Relation ({rel.get('type', 'persona')})",
+                        "type": f"Relation ({rel_type})",
                         "locale": ""
                     })
 
         self.aliases.discard("")
+
+    def _credited_names(self) -> Set[str]:
+        """Normalized names credited next to this artist on its releases and tracks."""
+        names: Set[str] = set()
+        for key in ('releases_artist', 'releases_track_artist'):
+            for rel in self.raw_data.get(key, []):
+                credits = [rel.get('artist-credit') or []]
+                for medium in rel.get('medium-list', []):
+                    for trk in medium.get('track-list', []):
+                        credits.append(trk.get('artist-credit') or trk.get('recording', {}).get('artist-credit') or [])
+                for credit in credits:
+                    if not isinstance(credit, list) or not any(
+                        isinstance(c, dict) and (c.get('artist') or {}).get('id') == self.mbid for c in credit
+                    ):
+                        continue
+                    for c in credit:
+                        if isinstance(c, dict):
+                            for name in (c.get('name'), (c.get('artist') or {}).get('name')):
+                                if name:
+                                    names.add(normalize_text(name))
+        return names
 
     def _build_catalog(self) -> None:
         """Organizes all recordings and tracks into a deduplicated, release-grouped catalog."""
@@ -157,7 +197,17 @@ class ArtistCatalog:
                 "date": rel_date,
                 "is_va": False,
             }
-            if not any(not r["is_va"] and (r["norm_title"] == rel_dict["norm_title"] or (rg_id and r.get("release_group_id") == rg_id)) for r in self.releases):
+            same_group = next((r for r in self.releases if not r["is_va"] and rg_id
+                               and r.get("release_group_id") == rg_id), None)
+            if same_group is not None:
+                # A promo or differently titled edition seen first must not hide the
+                # album: the edition titled like its release group represents it.
+                rg_title = normalize_text(rg_data.get('title') or self.release_groups.get(rg_id, {}).get('title') or "")
+                if (rg_title and rel_dict["norm_title"] == rg_title and same_group["norm_title"] != rg_title
+                        and not any(r is not same_group and not r["is_va"] and r["norm_title"] == rg_title
+                                    for r in self.releases)):
+                    same_group.update(rel_dict)
+            elif not any(not r["is_va"] and r["norm_title"] == rel_dict["norm_title"] for r in self.releases):
                 self.releases.append(rel_dict)
 
             for m in rel.get('medium-list', []):
@@ -570,9 +620,58 @@ class MusicBrainzClient:
             logging.getLogger(__name__).info(f"Warning: Could not fetch MusicBrainz release '{release_id}': {e}")
             return None
 
-    def search_release(self, release_title: str, artist_name: Optional[str] = None, limit: int = 5) -> List[Dict[str, Any]]:
-        """Searches MusicBrainz for releases matching a title and optional artist name."""
+    def _search_cache_file(self) -> Path:
+        return self.cache_dir / "release_search_cache.json"
+
+    def _cached_search(self, key: str) -> Optional[List[Dict[str, Any]]]:
+        if not self.use_cache:
+            return None
+        try:
+            with open(self._search_cache_file(), "r", encoding="utf-8") as f:
+                entry = json.load(f).get(key)
+        except Exception:
+            return None
+        if (isinstance(entry, dict) and isinstance(entry.get("results"), list)
+                and time.time() - float(entry.get("fetched_at") or 0) < SEARCH_CACHE_TTL):
+            return entry["results"]
+        return None
+
+    def _store_search(self, key: str, results: List[Dict[str, Any]]) -> None:
+        if not self.use_cache:
+            return
+        path = self._search_cache_file()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            if not isinstance(cache, dict):
+                cache = {}
+        except Exception:
+            cache = {}
+        cache[key] = {"fetched_at": time.time(), "results": results}
+        try:
+            temporary = path.with_suffix(".tmp")
+            with open(temporary, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+            temporary.replace(path)
+        except Exception:
+            pass
+
+    def search_release(
+        self, release_title: str, artist_name: Optional[str] = None, limit: int = 5,
+        force_refresh: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Searches MusicBrainz for releases matching a title and optional artist name.
+        When the artist search finds nothing, the title alone is searched: callers
+        must check the results' artist credits. Results are cached for a week.
+        """
+        cache_key = json.dumps([release_title or "", (artist_name or "").strip().lower(), limit])
+        if not force_refresh:
+            cached = self._cached_search(cache_key)
+            if cached is not None:
+                return cached
         results: List[Dict[str, Any]] = []
+        failed = False
 
         query_parts = []
         if release_title:
@@ -591,6 +690,7 @@ class MusicBrainzClient:
                 res = musicbrainzngs.search_releases(release=release_title, artist=artist_name, limit=limit)
                 results = res.get('release-list', [])
             except Exception as e:
+                failed = True
                 logging.getLogger(__name__).info(f"Warning: MusicBrainz release search error for '{query_str}': {e}")
 
         # Fallback: If searching with a specific artist yielded no results, search by release title alone
@@ -599,6 +699,9 @@ class MusicBrainzClient:
                 res = musicbrainzngs.search_releases(query=f'release:"{release_title}"', limit=limit)
                 results = res.get('release-list', [])
             except Exception:
-                pass
+                failed = True
 
+        # A failed artist search must not leave title-only results cached for a week.
+        if not failed:
+            self._store_search(cache_key, results)
         return results

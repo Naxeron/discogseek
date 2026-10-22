@@ -30,10 +30,11 @@ class Config:
 
     # Default library and download paths
     DEFAULT_LIBRARY_DIR = Path(
-        os.environ.get("DISCOGSEEK_LIBRARY_DIR", "/mnt/music" if os.path.exists("/mnt/music") else "./music")
+        os.path.expanduser(os.environ.get(
+            "DISCOGSEEK_LIBRARY_DIR", "/mnt/music" if os.path.exists("/mnt/music") else "./music"))
     ).resolve()
     DEFAULT_BROWSER_LIBRARY_DIR = Path(
-        os.environ.get("DISCOGSEEK_BROWSER_LIBRARY_DIR", "/mnt/music/Library")
+        os.path.expanduser(os.environ.get("DISCOGSEEK_BROWSER_LIBRARY_DIR", "/mnt/music/Library"))
     ).resolve()
 
     # User Agent

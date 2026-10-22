@@ -1,5 +1,7 @@
 """Persistent peer blocks can be inspected and lifted without contacting slskd."""
 
+from datetime import datetime
+
 import pytest
 import requests
 
@@ -29,7 +31,7 @@ def blocked_peers():
             "id": f"transfer-{user}", "filename": "Album/Track.flac",
             "state": f"Completed, {state}",
         }]}]}
-        for user, state in [("peer-z", "Rejected"), ("peer-a", "Aborted")]
+        for user, state in [("peer-z", "Rejected"), ("peer-a", "Cancelled")]
     ]
     policy = PeerPolicy()
     policy.observe(downloads)
@@ -44,9 +46,13 @@ def test_peers_lists_persisted_blocks_and_reasons_offline(blocked_peers, capsys,
 
     output = capsys.readouterr()
     assert output.err == ""
+    blocks = policy.peer_blocks()
     assert output.out.splitlines() == [
         "Blocked peers: 2",
-        *[f"{user} | {reason}" for user, reason in sorted(policy.blocked_peers().items())],
+        # A cooldown (bare rejection) shows when it ends; a manual cancellation lasts until unblocked.
+        "peer-a | " + blocks["peer-a"]["reason"],
+        f"peer-z | {blocks['peer-z']['reason']} | until "
+        f"{datetime.fromtimestamp(blocks['peer-z']['expires_at']):%Y-%m-%d %H:%M}",
     ]
 
 

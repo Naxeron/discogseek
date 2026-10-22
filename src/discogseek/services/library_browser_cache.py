@@ -10,7 +10,9 @@ from discogseek.core.cache import UnifiedCacheManager
 
 # Bump this namespace when reconciliation rules or required audit metadata change:
 # old results must be rechecked even when their source files have not changed.
-_NAMESPACE = "library_browser_audits_v4"
+_NAMESPACE = "library_browser_audits_v6"
+# MusicBrainz release group of each audited edition (not reconciliation results).
+_RELEASE_GROUPS_NAMESPACE = "library_browser_release_groups"
 _TRANSIENT_FIELDS = {
     "id", "browser_name_key", "browser_alias_keys", "navidrome_ids",
     "is_audited", "audit_error", "status", "found_count", "missing_count",
@@ -68,6 +70,15 @@ class BrowserAuditCache:
                     files[str(path)] = None
         payload = json.dumps(_encode([inventory, files]), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode()).hexdigest()
+
+    def load_release_groups(self) -> Dict[str, str]:
+        value = self.cache.get_api_cache(_RELEASE_GROUPS_NAMESPACE, "editions")
+        if not isinstance(value, dict):
+            return {}
+        return {str(edition): group for edition, group in value.items() if isinstance(group, str) and group}
+
+    def store_release_groups(self, groups: Dict[str, str]) -> None:
+        self.cache.store_api_cache(_RELEASE_GROUPS_NAMESPACE, "editions", dict(sorted(groups.items())))
 
     def load(self, key: str) -> Optional[Dict[str, Any]]:
         entry = self.cache.get_api_cache(_NAMESPACE, key)

@@ -15,10 +15,20 @@ from discogseek.core.constants import (
     LOSSLESS_EXTENSIONS,
     VA_DIR_MARKERS,
 )
+from discogseek.core.release_metadata import is_various_artists
 from discogseek.core.text import (
     strip_track_number_and_artist,
     normalize_text
 )
+
+
+# Bump when analyze_file reads tags differently, so cached rows can be re-read.
+# Version 2: fixed tag precedence (not mutagen's hash-ordered Vorbis keys), MP4
+# 'trkn'/'disk' and MusicBrainz freeform atoms, APEv2 'Track', separate ID3
+# multi-value frames, and track totals. Version 3: stream info (duration, bitrate,
+# sample rate) of files without any tags. See UnifiedCacheManager for which older
+# rows are re-read.
+AUDIO_EXTRACTOR_VERSION = 3
 
 
 @dataclass
@@ -35,6 +45,12 @@ class AudioMetadata:
     total_discs: int = 1
     year: str = ""
     genres: List[str] = field(default_factory=list)
+    # Total tracks from 'n/N' track tags, TRACKTOTAL/TOTALTRACKS or MP4 trkn.
+    track_total: Optional[int] = None
+    # True when the file could not be read; its fallback metadata must not be cached.
+    read_error: bool = False
+    # The analyze_file version that produced these tags (older cached rows report 1).
+    extractor_version: int = AUDIO_EXTRACTOR_VERSION
 
     # MusicBrainz Embedded Tag IDs
     mb_track_ids: Set[str] = field(default_factory=set)
@@ -87,6 +103,91 @@ DISC_DIR_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Tag keys in precedence order. A file may carry several spellings with different
+# values (Picard's ALBUMARTIST next to foobar's 'ALBUM ARTIST'); the first present
+# key wins, independent of mutagen's key order (hash-randomized for Vorbis comments).
+TITLE_KEYS = ("TIT2", "TITLE", "\xa9NAM", "TXXX:TITLE")
+ALBUM_KEYS = ("TALB", "ALBUM", "\xa9ALB", "TXXX:ALBUM")
+TRACK_KEYS = ("TRCK", "TRACKNUMBER", "TRKN", "TRACK", "TXXX:TRACKNUMBER")
+TRACK_TOTAL_KEYS = ("TRACKTOTAL", "TOTALTRACKS", "TXXX:TRACKTOTAL", "TXXX:TOTALTRACKS")
+DISC_KEYS = (
+    "TPOS", "DISCNUMBER", "DISK", "DISC", "TXXX:DISCNUMBER", "TXXX:DISC",
+    "TXXX:PART OF SET", "TXXX:PARTOFSET", "\xa9DISK", "WM/PARTOFSET",
+)
+DISC_TOTAL_KEYS = ("DISCTOTAL", "TOTALDISCS", "TXXX:DISCTOTAL", "TXXX:TOTALDISCS")
+YEAR_KEYS = ("TDRC", "DATE", "\xa9DAY", "TYER", "YEAR")
+ALBUM_ARTIST_KEYS = (
+    "TPE2", "ALBUMARTIST", "AART", "TXXX:ALBUMARTIST", "ALBUM ARTIST",
+    "TXXX:ALBUM ARTIST", "ALBUM_ARTIST",
+)
+ARTIST_KEYS = ("TPE1", "ARTIST", "\xa9ART", "TXXX:ARTIST", "PERFORMER", "TOPE")
+COMPILATION_KEYS = ("TCMP", "CPIL", "COMPILATION", "TXXX:COMPILATION")
+GENRE_KEYS = ("TCON", "GENRE", "\xa9GEN")
+# MusicBrainz IDs from every spelling are combined. MP4 freeform atoms
+# ('----:com.apple.iTunes:MusicBrainz Album Id') are keyed by their name.
+MB_RELEASE_KEYS = ("MUSICBRAINZ_ALBUMID", "MUSICBRAINZ ALBUM ID", "TXXX:MUSICBRAINZ ALBUM ID")
+MB_RECORDING_KEYS = (
+    "MUSICBRAINZ_TRACKID", "MUSICBRAINZ TRACK ID", "TXXX:MUSICBRAINZ TRACK ID",
+    "MUSICBRAINZ_RECORDINGID", "MUSICBRAINZ RECORDING ID", "TXXX:MUSICBRAINZ RECORDING ID",
+)
+MB_ARTIST_KEYS = ("MUSICBRAINZ_ARTISTID", "MUSICBRAINZ ARTIST ID", "TXXX:MUSICBRAINZ ARTIST ID")
+MB_RELEASE_TRACK_KEYS = (
+    "MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ RELEASE TRACK ID", "TXXX:MUSICBRAINZ RELEASE TRACK ID",
+)
+_MP4_FREEFORM_PREFIX = re.compile(r"^----:[^:]*:")
+
+
+def _tag_key(key: Any) -> str:
+    """Upper-case tag key; an MP4 freeform atom is named by its suffix."""
+    return _MP4_FREEFORM_PREFIX.sub("", str(key).upper().strip())
+
+
+def _tag_texts(value: Any) -> List[str]:
+    """
+    Text values of one tag. ID3 frames list each value in .text (str() would join
+    them with NUL); MP4 freeform atoms hold UTF-8 bytes; APEv2 separates values with NUL.
+    """
+    text = getattr(value, "text", None)
+    if isinstance(text, (list, tuple)):
+        items = list(text)
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    texts = []
+    for item in items:
+        if isinstance(item, (tuple, list)):
+            continue  # MP4 (number, total) pairs are read by _tag_pair
+        if isinstance(item, (bytes, bytearray)):
+            item = bytes(item).decode("utf-8", "replace")
+        for part in str(item).split("\x00"):
+            part = part.strip()
+            if part:
+                texts.append(part)
+    return texts
+
+
+def _tag_pair(value: Any) -> Optional[Tuple[int, int]]:
+    """(number, total) from an MP4 'trkn'/'disk' value [(3, 10)]; total is 0 when unknown."""
+    items = list(value) if isinstance(value, (list, tuple)) else [value]
+    if items and isinstance(items[0], (tuple, list)) and items[0]:
+        try:
+            number = int(items[0][0])
+            total = int(items[0][1]) if len(items[0]) > 1 and items[0][1] else 0
+            return number, total
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _split_number(raw: str) -> Tuple[str, Optional[int]]:
+    """'3/12' -> ('3', 12); '3' -> ('3', None)."""
+    if "/" not in raw:
+        return raw.strip(), None
+    number, total = raw.split("/", 1)
+    digits = re.sub(r"[^\d]", "", total)
+    return number.strip(), (int(digits) if digits and int(digits) > 0 else None)
+
 
 def extract_artist_title_from_filename(stem: str) -> Tuple[Optional[str], Optional[str]]:
     """
@@ -115,8 +216,117 @@ def extract_artist_title_from_filename(stem: str) -> Tuple[Optional[str], Option
         return None, None
 
 
+# Formats mutagen.File identifies; None for one of these means the file was unreadable.
+_MUTAGEN_EXTENSIONS = {
+    ".mp3", ".flac", ".m4a", ".mp4", ".aac", ".alac", ".ogg", ".opus",
+    ".wav", ".aiff", ".aif", ".wma", ".ape", ".wv", ".dsf",
+}
+
+
 class AudioQualityAnalyzer:
     """Inspects audio stream parameters and computes standardized quality scores."""
+
+    @staticmethod
+    def _read_tags(mf: Any, meta: AudioMetadata) -> bool:
+        """Fill tag fields of meta by fixed key precedence; returns the compilation flag."""
+        tags = getattr(mf, "tags", None) if mf is not None else None
+        if tags is None or not hasattr(tags, "items"):
+            return False
+        values: Dict[str, List[Any]] = {}
+        try:
+            for key, value in tags.items():
+                values.setdefault(_tag_key(key), []).append(value)
+        except Exception:
+            return False
+
+        def texts(key: str) -> List[str]:
+            found: List[str] = []
+            for value in values.get(key, []):
+                found.extend(_tag_texts(value))
+            return found
+
+        def first(keys: Tuple[str, ...]) -> str:
+            for key in keys:
+                found = texts(key)
+                if found:
+                    return found[0]
+            return ""
+
+        meta.title = first(TITLE_KEYS)
+        meta.album = first(ALBUM_KEYS)
+        meta.year = first(YEAR_KEYS)
+        meta.album_artist = first(ALBUM_ARTIST_KEYS)
+        meta.artist = first(ARTIST_KEYS)
+
+        for key in TRACK_KEYS:
+            pair = _tag_pair(values[key][0]) if values.get(key) else None
+            if pair is not None:
+                if pair[0] > 0:
+                    meta.track_number = str(pair[0])
+                    meta.track_total = pair[1] or None
+                    break
+                continue
+            found = texts(key)
+            if found:
+                number, total = _split_number(found[0])
+                if number:
+                    meta.track_number = number
+                    meta.track_total = total
+                    break
+        if meta.track_total is None:
+            digits = re.sub(r"[^\d]", "", first(TRACK_TOTAL_KEYS))
+            if digits and int(digits) > 0:
+                meta.track_total = int(digits)
+
+        for key in DISC_KEYS:
+            pair = _tag_pair(values[key][0]) if values.get(key) else None
+            if pair is not None:
+                if pair[0] > 0:
+                    meta.disc_number = pair[0]
+                if pair[1] > 0:
+                    meta.total_discs = pair[1]
+                break
+            found = texts(key)
+            if not found:
+                continue
+            number, total = _split_number(found[0])
+            digits = re.sub(r"[^\d]", "", number)
+            if digits and int(digits) > 0:
+                meta.disc_number = int(digits)
+            if total:
+                meta.total_discs = total
+            break
+        digits = re.sub(r"[^\d]", "", first(DISC_TOTAL_KEYS))
+        if digits and int(digits) > 0:
+            meta.total_discs = int(digits)
+
+        for key in GENRE_KEYS:
+            for item in texts(key):
+                for part in re.split(r"[;/]|\s{2,}", item):
+                    part = part.strip()
+                    if part and part not in meta.genres:
+                        meta.genres.append(part)
+            if meta.genres:
+                break
+
+        for keys, target in (
+            (MB_RELEASE_KEYS, meta.mb_release_ids), (MB_RECORDING_KEYS, meta.mb_rec_ids),
+            (MB_ARTIST_KEYS, meta.mb_artist_ids), (MB_RELEASE_TRACK_KEYS, meta.mb_track_ids),
+        ):
+            for key in keys:
+                target.update(texts(key))
+        for key, frames in values.items():
+            if key.startswith("UFID:HTTP://MUSICBRAINZ.ORG"):
+                for frame in frames:
+                    try:
+                        data = getattr(frame, "data", None)
+                        ufid = bytes(data).decode("utf-8", errors="ignore") if data is not None else str(frame)
+                    except Exception:
+                        continue
+                    if ufid.strip():
+                        meta.mb_rec_ids.add(ufid.strip())
+
+        return first(COMPILATION_KEYS).lower() in ("1", "true", "yes")
 
     @staticmethod
     def analyze_file(file_path: Path) -> AudioMetadata:
@@ -132,112 +342,18 @@ class AudioQualityAnalyzer:
             mf = mutagen.File(path_str)
         except Exception:
             mf = None
+            meta.read_error = True
+        if mf is None and ext in _MUTAGEN_EXTENSIONS:
+            # A transient I/O error or a file still being copied: the folder and
+            # filename fallback below is only good for this scan.
+            meta.read_error = True
 
-        type_name = type(mf).__name__ if mf else "Unknown"
-        mime = getattr(mf, "mime", [""])[0] if (mf and hasattr(mf, "mime")) else ""
+        # A mutagen file object without tags is falsy (it is a mapping of its tags),
+        # but its stream info is still valid: compare with None, never by truth value.
+        type_name = type(mf).__name__ if mf is not None else "Unknown"
+        mime = getattr(mf, "mime", [""])[0] if (mf is not None and hasattr(mf, "mime")) else ""
 
-        is_compilation = False
-
-        # Extract Tags
-        if mf and hasattr(mf, "tags") and mf.tags is not None:
-            tags = mf.tags
-            if hasattr(tags, "items"):
-                for k, v in tags.items():
-                    k_str = str(k).upper().strip()
-                    v_list = [str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]
-
-                    if k_str in ("TIT2", "TITLE", "\xa9NAM", "TXXX:TITLE") and not meta.title:
-                        meta.title = v_list[0].strip() if v_list else ""
-                    elif k_str in ("TALB", "ALBUM", "\xa9ALB", "TXXX:ALBUM") and not meta.album:
-                        meta.album = v_list[0].strip() if v_list else ""
-                    elif k_str in ("TRCK", "TRACKNUMBER", "TXXX:TRACKNUMBER") and not meta.track_number:
-                        raw_trck = v_list[0].strip() if v_list else ""
-                        meta.track_number = raw_trck.split("/")[0].strip()
-                    elif k_str in (
-                        "TPOS", "DISCNUMBER", "DISC", "TXXX:DISCNUMBER",
-                        "TXXX:DISC", "TXXX:PART OF SET", "TXXX:PARTOFSET",
-                        "DISK", "\xa9DISK", "WM/PARTOFSET"
-                    ):
-                        if isinstance(v, (list, tuple)) and v and isinstance(v[0], (tuple, list)):
-                            try:
-                                d = int(v[0][0])
-                                if d > 0:
-                                    meta.disc_number = d
-                                if len(v[0]) > 1:
-                                    t = int(v[0][1])
-                                    if t > 0:
-                                        meta.total_discs = t
-                            except Exception:
-                                pass
-                        else:
-                            raw_disc = str(v_list[0]).strip() if v_list else ""
-                            if "/" in raw_disc:
-                                parts = raw_disc.split("/", 1)
-                                d_digits = re.sub(r"[^\d]", "", parts[0])
-                                t_digits = re.sub(r"[^\d]", "", parts[1])
-                                if d_digits and int(d_digits) > 0:
-                                    meta.disc_number = int(d_digits)
-                                if t_digits and int(t_digits) > 0:
-                                    meta.total_discs = int(t_digits)
-                            else:
-                                d_digits = re.sub(r"[^\d]", "", raw_disc)
-                                if d_digits and int(d_digits) > 0:
-                                    meta.disc_number = int(d_digits)
-                    elif k_str in ("DISCTOTAL", "TOTALDISCS", "TXXX:DISCTOTAL", "TXXX:TOTALDISCS"):
-                        raw_tot = str(v_list[0]).strip() if v_list else ""
-                        t_digits = re.sub(r"[^\d]", "", raw_tot)
-                        if t_digits and int(t_digits) > 0:
-                            meta.total_discs = int(t_digits)
-                    elif k_str in ("TDRC", "DATE", "YEAR", "\xa9DAY") and not meta.year:
-                        meta.year = v_list[0].strip() if v_list else ""
-                    # Album Artist
-                    elif k_str in (
-                        "TPE2", "ALBUMARTIST", "ALBUM ARTIST", "AART",
-                        "TXXX:ALBUMARTIST", "TXXX:ALBUM ARTIST"
-                    ) and not meta.album_artist:
-                        meta.album_artist = v_list[0].strip() if v_list else ""
-                    # Track Artist
-                    elif k_str in (
-                        "TPE1", "TOPE", "ARTIST", "PERFORMER",
-                        "\xa9ART", "TXXX:ARTIST"
-                    ) and not meta.artist:
-                        meta.artist = v_list[0].strip() if v_list else ""
-
-                    # Compilation flag
-                    if k_str in ("TCMP", "CPIL", "COMPILATION", "TXXX:COMPILATION"):
-                        val_str = str(v_list[0]).strip().lower() if v_list else ""
-                        if val_str in ("1", "true", "yes"):
-                            is_compilation = True
-
-                    # Genres
-                    if k_str in ("TCON", "GENRE", "\xa9GEN") and not meta.genres:
-                        for item in v_list:
-                            parts = re.split(r"[;/]|\s{2,}", item)
-                            for p in parts:
-                                p_clean = p.strip()
-                                if p_clean and p_clean not in meta.genres:
-                                    meta.genres.append(p_clean)
-
-                    # MusicBrainz Tag IDs
-                    if k_str in ("MUSICBRAINZ_ALBUMID", "MUSICBRAINZ ALBUM ID", "TXXX:MUSICBRAINZ ALBUM ID"):
-                        meta.mb_release_ids.update(x.strip() for x in v_list if x.strip())
-                    elif k_str in (
-                        "MUSICBRAINZ_TRACKID", "MUSICBRAINZ TRACK ID", "TXXX:MUSICBRAINZ TRACK ID",
-                        "MUSICBRAINZ_RECORDINGID", "MUSICBRAINZ RECORDING ID", "TXXX:MUSICBRAINZ RECORDING ID"
-                    ):
-                        meta.mb_rec_ids.update(x.strip() for x in v_list if x.strip())
-                    elif k_str in ("MUSICBRAINZ_ARTISTID", "MUSICBRAINZ ARTIST ID", "TXXX:MUSICBRAINZ ARTIST ID"):
-                        meta.mb_artist_ids.update(x.strip() for x in v_list if x.strip())
-                    elif k_str in ("MUSICBRAINZ_RELEASETRACKID", "MUSICBRAINZ RELEASE TRACK ID", "TXXX:MUSICBRAINZ RELEASE TRACK ID"):
-                        meta.mb_track_ids.update(x.strip() for x in v_list if x.strip())
-                    elif k_str.startswith("UFID:HTTP://MUSICBRAINZ.ORG"):
-                        # Extract UFID
-                        try:
-                            ufid_val = bytes(v.data).decode('utf-8', errors='ignore') if hasattr(v, 'data') else str(v)
-                            if ufid_val:
-                                meta.mb_rec_ids.add(ufid_val.strip())
-                        except Exception:
-                            pass
+        is_compilation = AudioQualityAnalyzer._read_tags(mf, meta)
 
         if meta.total_discs < meta.disc_number:
             meta.total_discs = meta.disc_number
@@ -245,14 +361,8 @@ class AudioQualityAnalyzer:
         if is_compilation and not meta.album_artist:
             meta.album_artist = "Various Artists"
 
-        if meta.album_artist:
-            norm_aa = meta.album_artist.strip().lower()
-            if (
-                norm_aa in VA_DIR_MARKERS
-                or norm_aa in ("various artists", "various", "va", "v.a.", "v/a", "compilation", "compilations")
-                or bool(re.match(r"^v(?:arious|\.)?\s*arti[st]{2,4}s?$", norm_aa))
-            ):
-                meta.album_artist = "Various Artists"
+        if meta.album_artist and is_various_artists(meta.album_artist):
+            meta.album_artist = "Various Artists"
 
         # Fallback metadata from filename / path hierarchy
         filename_no_ext = file_path.stem
@@ -361,7 +471,7 @@ class AudioQualityAnalyzer:
                 meta.album_artist = "Various Artists"
 
         # Extract Audio Stream Specs
-        if mf and hasattr(mf, "info") and mf.info is not None:
+        if mf is not None and hasattr(mf, "info") and mf.info is not None:
             info = mf.info
             meta.duration = getattr(info, "length", 0.0)
             meta.sample_rate = getattr(info, "sample_rate", 0)
@@ -383,7 +493,7 @@ class AudioQualityAnalyzer:
                 meta.format_label = "FLAC (Lossless 16-bit)"
                 meta.quality_score = 100
         elif ext in (".mp4", ".m4a") or type_name == "MP4" or "mp4" in mime or "m4a" in mime:
-            codec = getattr(mf.info, "codec", "") if (mf and hasattr(mf, "info")) else ""
+            codec = getattr(mf.info, "codec", "") if (mf is not None and hasattr(mf, "info")) else ""
             if codec == "alac" or meta.bit_depth > 0:
                 meta.is_lossless = True
                 meta.format_label = f"ALAC {meta.bit_depth or 16}-bit"

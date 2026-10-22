@@ -150,8 +150,28 @@ class LibraryReleaseService:
         search_scope: str = "release",
         excluded_sources: Optional[Set[Tuple[str, str]]] = None,
         complete_release_tracks: Optional[List[Dict[str, Any]]] = None,
+        official_tracks: Optional[List[Dict[str, Any]]] = None,
+        search_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+        use_existing: bool = True,
+        downloads_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Find requested missing tracks, starting with a release or selected-track search."""
+        """
+        Find requested missing tracks, starting with a release or selected-track search.
+        official_tracks (the audited tracklist) adds flat and vinyl numbering; a shared
+        search_cache lets several calls of one run search each query once.
+        use_existing=False searches the network again instead of reusing slskd's recent
+        searches; downloads_dir (slskd's downloads folder, when already known) saves
+        reading slskd's options.
+        """
+        optional: Dict[str, Any] = {}
+        if official_tracks is not None:
+            optional["official_tracks"] = official_tracks
+        if search_cache is not None:
+            optional["search_cache"] = search_cache
+        if not use_existing:
+            optional["use_existing"] = False
+        if downloads_dir is not None:
+            optional["downloads_dir"] = downloads_dir
         return library_download.download_missing_tracks(
             slskd_client=self.slskd_client,
             audit_release=self.audit_release,
@@ -165,6 +185,7 @@ class LibraryReleaseService:
             search_scope=search_scope,
             excluded_sources=excluded_sources,
             complete_release_tracks=complete_release_tracks,
+            **optional,
         )
 
     def download_single_missing_track(

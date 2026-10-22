@@ -2,12 +2,19 @@
 
 import hashlib
 import os
+import re
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from discogseek.config import Config
-from discogseek.core.audio import AudioMetadata, AudioQualityAnalyzer, DISC_DIR_PATTERN
+from discogseek.core.audio import (
+    AUDIO_EXTRACTOR_VERSION,
+    AudioMetadata,
+    AudioQualityAnalyzer,
+    DISC_DIR_PATTERN,
+)
 from discogseek.core.cache import UnifiedCacheManager
 from discogseek.core.constants import (
     AUDIO_EXTENSIONS,
@@ -20,7 +27,7 @@ from discogseek.core.release_metadata import (
     is_various_artists_directory,
     parse_disc_and_track_number,
 )
-from discogseek.core.text import normalize_text
+from discogseek.core.text import normalize_text, primary_artist
 
 
 def scan_library_tracks(
@@ -35,16 +42,17 @@ def scan_library_tracks(
     if not lib_path.exists():
         return []
 
-    # 1. Discover all candidate audio files
+    # 1. Discover all candidate audio files. Network filesystems list entries in
+    # server order; sort them so grouping never depends on directory order.
     audio_paths: List[Path] = []
     for root, dirs, files in os.walk(lib_path):
-        dirs[:] = [
+        dirs[:] = sorted(
             d
             for d in dirs
             if not d.startswith(IGNORED_SCAN_DIR_PREFIXES)
             and d.lower() not in IGNORED_SCAN_DIR_NAMES
-        ]
-        for f in files:
+        )
+        for f in sorted(files):
             ext = os.path.splitext(f)[1].lower()
             if ext in AUDIO_EXTENSIONS:
                 audio_paths.append(Path(root) / f)
@@ -66,11 +74,9 @@ def scan_library_tracks(
             uncached_paths.append(p)
     del cached_metadata
 
-    if uncached_paths:
-        completed = len(all_tracks)
-        pending_cache = []
-        pending_fingerprints = {}
+    progress = {"completed": len(all_tracks)}
 
+    def analyze(paths: List[Path], report_progress: bool = True) -> List[AudioMetadata]:
         def analyze_with_fingerprint(path):
             # Batch writes may happen well after analysis. Never save old tags
             # under a new fingerprint if a download or retag changes the file.
@@ -80,23 +86,65 @@ def scan_library_tracks(
                 return None, None
             return AudioQualityAnalyzer.analyze_file(path), (stat.st_mtime, stat.st_size)
 
+        analyzed: List[AudioMetadata] = []
+        pending_cache: List[AudioMetadata] = []
+        pending_fingerprints: Dict[Path, Tuple[float, int]] = {}
         with ThreadPoolExecutor(max_workers=threads) as pool:
-            for meta, fingerprint in pool.map(analyze_with_fingerprint, uncached_paths):
-                if meta:
+            for meta, fingerprint in pool.map(analyze_with_fingerprint, paths):
+                # A failed read keeps its folder/filename fallback for this scan
+                # only; the next scan reads the file again instead of trusting it.
+                if meta and not meta.read_error:
                     pending_cache.append(meta)
                     pending_fingerprints[meta.path] = fingerprint
                     if len(pending_cache) >= 500:
                         cache.store_audio_metadata_batch(pending_cache, pending_fingerprints)
                         pending_cache.clear()
                         pending_fingerprints.clear()
-                    all_tracks.append(meta)
-                completed += 1
-                if on_progress and completed % 25 == 0:
-                    on_progress(completed, total_files, "Extracting audio metadata...")
+                if meta:
+                    analyzed.append(meta)
+                if not report_progress:
+                    continue
+                progress["completed"] += 1
+                if on_progress and progress["completed"] % 25 == 0:
+                    on_progress(progress["completed"], total_files, "Extracting audio metadata...")
         if pending_cache:
             cache.store_audio_metadata_batch(pending_cache, pending_fingerprints)
+        return analyzed
+
+    if uncached_paths:
+        all_tracks.extend(analyze(uncached_paths))
+    reread = _legacy_rows_with_inconsistent_album_artists(all_tracks)
+    if reread:
+        fresh = {meta.path: meta for meta in analyze(sorted(reread), report_progress=False)}
+        # A file that cannot be read (or stat'ed) right now keeps its cached tags for
+        # this scan; the cache lookup found it moments ago.
+        all_tracks = [
+            fresh[meta.path] if meta.path in fresh and not fresh[meta.path].read_error else meta
+            for meta in all_tracks
+        ]
 
     return all_tracks
+
+
+def _legacy_rows_with_inconsistent_album_artists(tracks: List[AudioMetadata]) -> Set[Path]:
+    """
+    Cached rows from an older extractor in folders whose album artists disagree.
+
+    Before extractor version 2 a FLAC file carrying both ALBUMARTIST and
+    'ALBUM ARTIST' kept whichever key mutagen listed first, which changed with each
+    process's hash seed, so one album could be split between two album artists (and
+    a file read now may disagree with its cached neighbours). Re-reading only these
+    folders avoids reading the whole library again over a network mount.
+    """
+    by_folder: Dict[Path, List[AudioMetadata]] = {}
+    for meta in tracks:
+        by_folder.setdefault(meta.path.parent, []).append(meta)
+    reread: Set[Path] = set()
+    for metas in by_folder.values():
+        legacy = [meta for meta in metas if meta.extractor_version < AUDIO_EXTRACTOR_VERSION]
+        if legacy and len({normalize_text(meta.album_artist) for meta in metas}) > 1:
+            reread.update(meta.path for meta in legacy)
+    return reread
 
 
 def scan_library_releases(
@@ -117,23 +165,66 @@ def scan_library_releases(
     return release_list
 
 
+# A featured guest: 'Lone feat. Guest', 'Lone (ft. Guest)'. Collaborations ('A & B', 'A x B') stay.
+_FEATURED_CREDIT_RE = re.compile(
+    r"\s*(?:[\(\[\{]\s*(?:feat\b\.?|ft\b\.?|featuring\b|with\b)[^\)\]\}]*[\)\]\}]"
+    r"|(?<=\S)\s+(?:feat\b\.?|ft\b\.?|featuring\b).*)$",
+    re.IGNORECASE,
+)
+
+
+def _main_credit(artist: str) -> str:
+    """The artist credit without its featured guests."""
+    return _FEATURED_CREDIT_RE.sub("", artist).strip(" -,;") or artist.strip()
+
+
+def _dominant_credit(counts: Counter, main_credits: Dict[str, Counter]) -> str:
+    """
+    The credit naming an album without an album-artist tag: the most frequent main
+    credit of its most frequent primary artist (ties: the smallest name). When no main
+    credit covers most of that artist's tracks ('Lone feat. A', 'Lone x B'), the
+    primary artist's own name.
+    """
+    if not counts:
+        return ""
+    dominant = min(counts, key=lambda name: (-counts[name], name))
+    credits = main_credits.get(dominant) or Counter()
+    if not credits:
+        return ""
+    credit = min(credits, key=lambda name: (-credits[name], name))
+    if credits[credit] * 2 > sum(credits.values()):
+        return credit
+    return primary_artist(credit) or credit
+
+
 def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str, Dict[str, Any]]:
     """Group tagged files into releases, retaining track details for gap analysis."""
     releases_map: Dict[str, Dict[str, Any]] = {}
     # Loose tracks must not become albums or affect compilation inference.
     all_tracks = [meta for meta in all_tracks if meta.mb_release_ids or not is_unknown_album(meta.album)]
 
-    # Pre-analyze directories to detect multi-artist compilation folders
-    folder_artists: Dict[str, Set[str]] = {}
+    # Pre-analyze each folder's albums to detect multi-artist compilations. Albums
+    # are counted separately because slskd puts every remote '.../CD2' folder into one
+    # local 'CD2' folder, and featured guests do not make a compilation.
+    album_artists: Dict[Tuple[str, str], Counter] = {}
+    # The credits (without featured guests) of each primary artist's tracks, so the
+    # release is named 'Simon & Garfunkel' rather than its first name, 'Simon'.
+    main_credits: Dict[Tuple[str, str], Dict[str, Counter]] = {}
     for meta in all_tracks:
-        folder_key = str(meta.path.parent)
         art = meta.artist.strip() if meta.artist else ""
         if art and not is_various_artists(art) and art.lower() != "unknown artist":
-            folder_artists.setdefault(folder_key, set()).add(art.lower())
+            primary = normalize_text(primary_artist(art) or art)
+            album_key = (str(meta.path.parent), normalize_text(meta.album))
+            album_artists.setdefault(album_key, Counter())[primary] += 1
+            main_credits.setdefault(album_key, {}).setdefault(primary, Counter())[_main_credit(art)] += 1
 
+    mbid_counts: Dict[str, Counter] = {}
     for meta in all_tracks:
-        folder = str(meta.path.parent)
-        is_folder_multi_artist = len(folder_artists.get(folder, set())) > 1
+        album_key = (str(meta.path.parent), normalize_text(meta.album))
+        counts = album_artists.get(album_key) or Counter()
+        # A compilation needs two or more primary artists, none credited on more
+        # than half of the album's tracks ('Lone', 'Lone feat. Guest' is one artist).
+        is_folder_multi_artist = len(counts) > 1 and max(counts.values()) * 2 <= sum(counts.values())
         # Guest/remix credits and a VA folder are only hints when no album
         # artist is tagged. Preserve an explicit album credit across its tracks.
         tagged_album_artist = (meta.album_artist or "").strip()
@@ -147,7 +238,10 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
             artist = "Various Artists"
             album_artist = "Various Artists"
         else:
-            artist = tagged_album_artist or meta.artist or "Unknown Artist"
+            # Without an album-artist tag, the album's main primary artist names the
+            # release, so 'Lone feat. Guest' joins the rest of the album.
+            artist = tagged_album_artist or _dominant_credit(counts, main_credits.get(album_key, {})) \
+                or meta.artist or "Unknown Artist"
             album_artist = tagged_album_artist or artist
 
         album = meta.album or "Unknown Album"
@@ -156,7 +250,7 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
         norm_album = normalize_text(album)
 
         # Check if MB release ID is present
-        mb_rel_id = next(iter(meta.mb_release_ids)) if meta.mb_release_ids else None
+        mb_rel_id = min(meta.mb_release_ids) if meta.mb_release_ids else None
 
         # Detect if file is in a disc subfolder
         is_disc_folder = bool(DISC_DIR_PATTERN.match(meta.path.parent.name))
@@ -201,7 +295,7 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
                 "year": meta.year or "",
                 "folder_path": rel_folder,
                 "full_path": effective_folder_str,
-                "mb_release_id": mb_rel_id,
+                "mb_release_id": None,
                 "formats": set(),
                 "is_lossless_all": True,
                 "tracks": [],
@@ -222,12 +316,10 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
             if "download" in rel["folder_path"].lower() and "download" not in curr_folder.lower():
                 rel["folder_path"] = curr_folder
                 rel["full_path"] = effective_folder_str
-            if mb_rel_id and not rel.get("mb_release_id"):
-                rel["mb_release_id"] = mb_rel_id
 
         rel = releases_map[rel_key]
-        if mb_rel_id and not rel.get("mb_release_id"):
-            rel["mb_release_id"] = mb_rel_id
+        if meta.mb_release_ids:
+            mbid_counts.setdefault(rel_key, Counter()).update(meta.mb_release_ids)
         fmt_label = meta.format_label or meta.file_type.lstrip(".").upper()
         if fmt_label:
             rel["formats"].add(fmt_label)
@@ -240,6 +332,9 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
         parsed_disc, trk_num, total_in_tag = parse_disc_and_track_number(
             meta.track_number, filename=meta.path.name, meta_disc=getattr(meta, "disc_number", None)
         )
+        if total_in_tag is None and getattr(meta, "track_total", None):
+            # TRACKTOTAL/TOTALTRACKS or an MP4 trkn total: trailing gaps are visible too.
+            total_in_tag = meta.track_total
         effective_disc = parsed_disc or getattr(meta, "disc_number", 1) or 1
         effective_total_discs = getattr(meta, "total_discs", 1) or 1
         if effective_total_discs < effective_disc:
@@ -258,6 +353,8 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
                 "total_discs": effective_total_discs,
                 "track_number": str(trk_num) if trk_num is not None else None,
                 "track_num_int": trk_num,
+                # The tag's own position ('B2'): the audit compares vinyl sides directly.
+                "position_token": (meta.track_number or "").strip() or None,
                 "total_in_tag": total_in_tag,
                 "format": fmt_label,
                 "bitrate": meta.bitrate_kbps,
@@ -269,6 +366,11 @@ def _group_releases(all_tracks: List[AudioMetadata], lib_path: Path) -> Dict[str
                 "status": "found",
             }
         )
+
+    # A folder can mix files tagged with several editions. Audit the edition most of
+    # its files carry, independent of scan order (ties: the smallest ID).
+    for rel_key, counts in mbid_counts.items():
+        releases_map[rel_key]["mb_release_id"] = min(counts, key=lambda mbid: (-counts[mbid], mbid))
 
     return releases_map
 

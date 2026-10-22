@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -13,7 +14,7 @@ from discogseek.config import Config
 from discogseek.core.report import BaseReportExporter
 from discogseek.services.auditor import AuditorService
 from discogseek.services.library import LibraryReleaseService
-from discogseek.services.soulseek import SlskdArtistScraper
+from discogseek.services.soulseek import SlskdArtistScraper, track_failures
 
 
 def positive_seconds(value: str) -> float:
@@ -81,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--dry-run", action="store_true", help="Show matches without queuing transfers")
     download.add_argument("--min-match", type=match_ratio, default=0.70,
                           help="Minimum album match ratio (default: 0.70)")
+    download.add_argument("--refresh-searches", action="store_true",
+                          help="Search Soulseek again instead of reusing slskd's recent results "
+                               "(--force-refresh also does this)")
+    download.add_argument("--no-track-search", dest="search_missing_tracks", action="store_false",
+                          help="Artist downloads: skip the per-track searches for songs "
+                               "no discovered folder or file supplies")
     return parser
 
 
@@ -151,6 +158,32 @@ def _audit(args):
     return 0
 
 
+def _unresolved_release_tracks(result, missing, release, dry_run):
+    """Requested rows a release download neither queued (nor matched, in a dry run), with a reason."""
+    resolved = result.get("matched_tracks" if dry_run else "queued_tracks") or []
+    reasons = track_failures(result)
+    return [
+        {"release": release, "title": row.get("title", ""), "disc": row.get("disc_number"),
+         "position": row.get("position_token") or row.get("track_number"),
+         "reason": reasons.get(id(row), ("no matching file found", ""))[0]}
+        for row in missing if not any(row is item for item in resolved)
+    ]
+
+
+def _print_unresolved(result, unresolved_tracks):
+    """One line per track left missing; releases only when no track of theirs is listed."""
+    listed = {track.get("release") for track in unresolved_tracks}
+    for release in result.get("unresolved_releases", []):
+        if release.get("title", "") not in listed:
+            print(f"UNRESOLVED | {release.get('title', '')}")
+    for track in unresolved_tracks:
+        position = f"{track.get('disc') or 1}.{track['position']}" if track.get("position") else "-"
+        print(f"UNRESOLVED | {track.get('release', '')} | {position} | {track.get('title', '')} "
+              f"({track.get('reason', 'no matching file found')})")
+    for track in result.get("unresolved_compilation_tracks", []) + result.get("unresolved_standalone_tracks", []):
+        print(f"UNRESOLVED | {track.get('track', track.get('title', ''))}")
+
+
 def _download(args):
     logger = logging.getLogger(__name__)
     logger.info("Starting %s for %s...", "dry run" if args.dry_run else "download", args.artist)
@@ -162,29 +195,41 @@ def _download(args):
             library_dir=args.music_dir, force_refresh=args.force_refresh,
         )
         logger.info("Library: %s found, %s missing", audit["found_count"], audit["missing_count"])
+        missing = [t for t in audit["tracks"] if t["status"] == "missing"]
         result = service.download_missing_tracks(
             artist=audit["artist"], release_title=audit["title"],
-            missing_tracks=[t for t in audit["tracks"] if t["status"] == "missing"],
+            missing_tracks=missing,
             preferred_format=args.format, search_timeout=args.timeout, dry_run=args.dry_run,
             on_progress=lambda done, total, message: logger.info(
                 "%s [%s/%s tracks matched]", message, done, total,
             ),
+            # The whole official tracklist: found tracks' titles and positions are evidence too.
+            official_tracks=[t for t in audit["tracks"] if not t.get("is_extra")],
+            use_existing=not (args.force_refresh or args.refresh_searches),
         )
         matches = result.get("queued_files", [])
+        unresolved_tracks = _unresolved_release_tracks(result, missing, audit["title"], args.dry_run)
     else:
         result = SlskdArtistScraper(
             artist_query=args.artist, music_dir=args.music_dir, preferred_format=args.format,
             min_match_ratio=args.min_match, search_timeout=args.timeout, dry_run=args.dry_run,
             full_scan=args.full_scan, force_refresh=args.force_refresh,
+            refresh_searches=args.refresh_searches, search_missing_tracks=args.search_missing_tracks,
         ).run()
-        matches = [f for directory in result.get("queued_directories", [])
-                   for f in directory["all_dir_files"]]
-        matches += [t["file"] for t in result.get("verified_compilation_tracks", [])
-                    + result.get("verified_standalone_tracks", [])]
+        if "matched_files" in result:
+            # Every folder's share of a release, loose files and single tracks.
+            matches = list(result["matched_files"])
+        else:
+            matches = [f for directory in result.get("queued_directories", [])
+                       for f in directory["all_dir_files"]]
+            matches += [t["file"] for t in result.get("verified_compilation_tracks", [])
+                        + result.get("verified_standalone_tracks", [])
+                        + result.get("verified_release_tracks", [])]
         matches += [file for release in result.get("release_downloads", [])
                     for file in release.get("queued_files", [])]
         if not args.dry_run and "queued_files" in result:
             matches = result["queued_files"]
+        unresolved_tracks = result.get("unresolved_tracks", [])
     if args.export_json:
         _write_json(result, args.export_json)
     if args.export_json != "-":
@@ -194,12 +239,14 @@ def _download(args):
             print(f"{result.get('enqueued_count', result.get('queued_count', 0))} files queued through slskd")
         for file in matches:
             print(f"MATCH | {file['filename']}")
-        for release in result.get("unresolved_releases", []):
-            print(f"UNRESOLVED | {release.get('title', '')}")
-        for track in result.get("unresolved_compilation_tracks", []) + result.get("unresolved_standalone_tracks", []):
-            print(f"UNRESOLVED | {track.get('track', track.get('title', ''))}")
-        if "total_missing" in result:
-            print(f"{result['total_missing'] - result.get('resolved_count', 0)} tracks unresolved")
+        _print_unresolved(result, unresolved_tracks)
+        unresolved_count = len(unresolved_tracks) + len(result.get("unresolved_compilation_tracks", [])
+                                                        + result.get("unresolved_standalone_tracks", []))
+        if "total_missing" in result or unresolved_count:
+            print(f"{unresolved_count} tracks unresolved")
+    # Searches that failed, as opposed to finding nothing: running again may find more.
+    for error in result.get("search_errors", []):
+        print(f"Search failed: {error.get('query', '')}: {error.get('error', '')}", file=sys.stderr)
     for error in result.get("queue_errors", []):
         print(error.get("error", str(error)) if isinstance(error, dict) else error, file=sys.stderr)
     return 1 if result.get("queue_errors") else 0
@@ -216,13 +263,16 @@ def _peers(args):
             print(f"Peer is not blocked: {args.username}")
         return 0
 
-    blocked = policy.blocked_peers()
+    blocked = policy.peer_blocks()
     if not blocked:
         print("No blocked peers.")
     else:
         print(f"Blocked peers: {len(blocked)}")
-        for username, reason in sorted(blocked.items()):
-            print(f"{username} | {reason}")
+        for username, block in sorted(blocked.items()):
+            # Transient refusals pause a peer only until their cooldown ends.
+            until = (f" | until {datetime.fromtimestamp(block['expires_at']):%Y-%m-%d %H:%M}"
+                     if block.get("expires_at") else "")
+            print(f"{username} | {block['reason']}{until}")
     return 0
 
 

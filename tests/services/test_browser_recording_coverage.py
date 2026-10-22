@@ -74,15 +74,17 @@ def test_ap1_complementary_editions_are_complete_with_their_own_official_tracks(
     assert (local, remote) == original
 
 
+# A different disc or position used to be rejected here too. Sibling editions number
+# the same recordings differently (a CD's track 4 is the vinyl's 1-2), so a recording
+# that appears once on the audited edition is now covered at any position; repeated
+# recordings still need their own position (see the next tests).
 @pytest.mark.parametrize("recording, disc, number, artist, title", [
     (None, 1, 2, "Artist", "Album"),
     ("different-recording", 1, 2, "Artist", "Album"),
-    ("rec-2", 2, 2, "Artist", "Album"),
-    ("rec-2", 1, 3, "Artist", "Album"),
     ("rec-2", 1, 2, "Other Artist", "Album"),
     ("rec-2", 1, 2, "Artist", "Other Album"),
-], ids=["untagged", "different-recording", "different-disc", "different-position", "different-artist", "different-album"])
-def test_sibling_coverage_requires_recording_position_and_album_identity(recording, disc, number, artist, title):
+], ids=["untagged", "different-recording", "different-artist", "different-album"])
+def test_sibling_coverage_requires_recording_and_album_identity(recording, disc, number, artist, title):
     local = [release([track("First", 1, recording="rec-1")])]
     remote = [release([
         track("Second", number, disc=disc, source="navidrome", recording=recording),
@@ -93,6 +95,22 @@ def test_sibling_coverage_requires_recording_position_and_album_identity(recordi
     assert target["found_count"] == 1
     assert target["missing_count"] == 1
     assert target["tracks"][1]["status"] == "missing"
+
+
+@pytest.mark.parametrize("disc, number", [(2, 2), (1, 3), (2, 7)],
+                         ids=["different-disc", "different-position", "vinyl-style-numbering"])
+def test_sibling_covers_unambiguous_recording_at_another_position(disc, number):
+    local = [release([track("First", 1, recording="rec-1")])]
+    remote = [release([
+        track("Second", number, disc=disc, source="navidrome", recording="rec-2"),
+    ], release_id="edition-2", source="navidrome")]
+
+    target = by_edition(recording_browser(local, remote, titles=("First", "Second")))["edition-1"]
+
+    assert target["found_count"] == 2
+    assert target["missing_count"] == 0
+    assert target["tracks"][1]["status"] == "found"
+    assert target["tracks"][1]["covered_by_edition"] == "edition-2"
 
 
 @pytest.mark.parametrize("edition", ["edition-1", "edition-2"])

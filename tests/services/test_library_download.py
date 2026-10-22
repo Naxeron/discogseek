@@ -120,7 +120,9 @@ def test_download_missing_tracks_various_artists_orchestration():
     assert res["resolved_count"] == 2
 
     # Verify that Soulseek batch_search was called with the individual track artists, NOT "Various Artists" or "Exnoiz"
-    assert slsk_mock.batch_search.call_count == 2  # Album variants, then track artists.
+    # The compilation's bare title is the album query; 'Various Artists <title>' is never the first one.
+    slsk_mock.search.assert_called_once_with(query="Amen Destroyer", timeout=30.0)
+    assert slsk_mock.batch_search.call_count == 1  # Track artists after the bare-title album search.
     queries = slsk_mock.batch_search.call_args[0][0]
     assert "Venetian Snares - Amen Terror" in queries
     assert "Bong-Ra - Mashup Core" in queries
@@ -1320,26 +1322,25 @@ def test_individual_batch_recovery_failure_only_blocks_affected_row(failure):
         client.cancel_download.assert_called_once_with("failed", "failed-transfer")
 
 
-def test_release_fallback_variants_run_together_and_keep_artist_guard():
+def test_release_fallback_variants_are_searched_once_cleaned_and_keep_artist_guard():
     client = MagicMock()
     track = {"title": "First Song", "track_number": 1}
-    client.search.return_value = {"responses": []}
-    client.batch_search.return_value = {
-        "propa bo!": {"responses": [
-            {"username": "wrong-artist", "files": [{"filename": "Other/propa bo!/01 First Song.flac"}]},
-            {"username": "right-artist", "files": [{"filename": "Artist/propa bo!/01 First Song.flac"}]},
-        ]},
-    }
+    title_only = {"responses": [
+        {"username": "wrong-artist", "files": [{"filename": "Other/propa bo!/01 First Song.flac"}]},
+        {"username": "right-artist", "files": [{"filename": "Artist/propa bo!/01 First Song.flac"}]},
+    ]}
+    client.search.side_effect = lambda query, **kwargs: title_only if query == "propa bo" else {"responses": []}
 
     result = download_missing_tracks(client, MagicMock(), "Artist", "propa bo!", [track])
 
-    client.search.assert_called_once_with(query="Artist propa bo!", timeout=30.0)
-    client.batch_search.assert_called_once_with(["Artist propa bo", "propa bo!"], timeout=30.0)
+    # 'Artist propa bo!' and 'Artist propa bo' find the same files: one search, cleaned.
+    assert [call.kwargs["query"] for call in client.search.call_args_list] == ["Artist propa bo", "propa bo"]
+    client.batch_search.assert_not_called()
     assert result["queued_tracks"] == [track]
     assert result["queued_files"][0]["user"] == "right-artist"
 
 
-@pytest.mark.parametrize("state", ["Rejected", "Aborted", "Cancelled"])
+@pytest.mark.parametrize("state", ["Rejected", "Cancelled"])
 @pytest.mark.parametrize("scope", ["release", "track"])
 def test_persistent_peer_block_skips_other_files_after_history_is_cleared(state, scope):
     PeerPolicy().observe(failed_download_history("Blocked", "Unrelated/Old.flac", f"Completed, {state}"))

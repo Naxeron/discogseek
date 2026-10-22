@@ -1,6 +1,7 @@
 """Incremental release audits over one complete local and Navidrome inventory."""
 
 import hashlib
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
@@ -8,7 +9,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 from discogseek.clients.navidrome import NavidromeScanner
 from discogseek.config import Config
 from discogseek.core.release_metadata import is_various_artists, parse_disc_and_track_number
-from discogseek.core.text import normalize_text
+from discogseek.core.text import artist_credit_matches, normalize_text
 from discogseek.services.library import LibraryReleaseService
 from discogseek.services.library_audit import is_numeric_track_item
 from discogseek.services.library_browser_cache import BrowserAuditCache
@@ -16,6 +17,9 @@ from discogseek.services.reconciler import deduplicate_candidate_tracks
 
 
 ProgressCallback = Optional[Callable[[int, int, str], None]]
+# Lengths of an untagged, credit-less copy conflict beyond this (as for peer files).
+_CREDITLESS_DURATION_SECONDS = 10.0
+_CREDITLESS_DURATION_RATIO = 0.05
 
 
 def _natural_key(release: Dict[str, Any]) -> Tuple[str, str]:
@@ -45,6 +49,10 @@ def _matches_verified_tracklist(local: Dict[str, Any], verified: Dict[str, Any])
         _track_position(track): track for track in verified.get("tracks", [])
         if track.get("mb_track_id") or track.get("mb_recording_id")
     }
+    # Files without any artist credit (untagged peer files that slskd saved as
+    # 'downloads/<Album>/01 Title.flac') contradict no credit of the edition:
+    # their positions, full titles and lengths are the evidence, even for one file.
+    credit_less = not _credit_names(local)
     positions = set()
     edition_track_match = False
     for track in local.get("tracks", []):
@@ -63,23 +71,32 @@ def _matches_verified_tracklist(local: Dict[str, Any], verified: Dict[str, Any])
             edition_track_match = True
         else:
             # A shared recording alone does not identify an edition. Untagged
-            # copies need matching positions, full titles (including versions),
-            # artists, and lengths for every file, across at least two tracks.
+            # copies need matching positions, full titles (including versions;
+            # the printed or the recording title), artists, and lengths for every
+            # file, across at least two tracks (see credit_less above).
+            titles = {normalize_text(title)
+                      for title in [expected.get("title")] + list(expected.get("alt_titles") or [])}
             if (is_numeric_track_item(track)
                     or not normalize_text(track.get("title"))
-                    or normalize_text(track.get("title")) != normalize_text(expected.get("title"))
-                    or not normalize_text(track.get("artist"))
-                    or is_various_artists(track.get("artist"))
-                    or normalize_text(track.get("artist")) != normalize_text(expected.get("artist"))):
+                    or normalize_text(track.get("title")) not in titles
+                    or not (credit_less or (
+                        normalize_text(track.get("artist"))
+                        and not is_various_artists(track.get("artist"))
+                        and normalize_text(track.get("artist")) == normalize_text(expected.get("artist"))
+                    ))):
                 return False
             try:
                 duration, expected_duration = float(track["duration"]), float(expected["duration"])
-                if not (duration > 0 and expected_duration > 0 and abs(duration - expected_duration) <= 2):
+                # A credit-less copy may come from another master (every track a few
+                # seconds shorter); its lengths only must not conflict.
+                tolerance = max(_CREDITLESS_DURATION_SECONDS, _CREDITLESS_DURATION_RATIO * expected_duration) \
+                    if credit_less else 2
+                if not (duration > 0 and expected_duration > 0 and abs(duration - expected_duration) <= tolerance):
                     return False
             except (KeyError, TypeError, ValueError):
                 return False
         positions.add(position)
-    return bool(positions) and (edition_track_match or len(positions) >= 2)
+    return bool(positions) and (edition_track_match or len(positions) >= 2 or credit_less)
 
 
 def _prepare_tracks(release: Dict[str, Any]) -> None:
@@ -182,23 +199,112 @@ def merge_library_releases(releases: List[Dict[str, Any]]) -> List[Dict[str, Any
     return result
 
 
-def _add_recording_candidates(releases: List[Dict[str, Any]]) -> None:
-    """Share tagged recordings across same-name editions without merging identities."""
-    siblings: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+def _compact_key(release: Dict[str, Any]) -> Tuple[str, str]:
+    """The natural key without spaces: 'Machine Drum' and 'Machinedrum' name one artist."""
+    artist, title = _natural_key(release)
+    return re.sub(r"[\W_]+", "", artist), re.sub(r"[\W_]+", "", title)
+
+
+def _sibling_keys(release: Dict[str, Any], release_groups: Dict[str, str]) -> List[Tuple[str, ...]]:
+    keys = [("name",) + _natural_key(release)]
+    compact = _compact_key(release)
+    if all(compact):
+        keys.append(("compact",) + compact)
+    group = release_groups.get(release.get("mb_release_id") or "")
+    if group:
+        keys.append(("group", group))
+    return keys
+
+
+def _sibling_index(
+    releases: List[Dict[str, Any]], release_groups: Dict[str, str],
+) -> Dict[Tuple[str, ...], List[Dict[str, Any]]]:
+    groups: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
     for release in releases:
         if release.get("mb_release_id"):
-            siblings.setdefault(_natural_key(release), []).append(release)
-    for group in siblings.values():
-        for release in group:
-            candidates = [
-                deepcopy(track)
-                for sibling in group
-                if sibling["mb_release_id"] != release["mb_release_id"]
-                for track in sibling.get("tracks", [])
-                if track.get("status") == "found" and track.get("mb_rec_ids")
-            ]
-            if candidates:
-                release["recording_candidates"] = candidates
+            for key in _sibling_keys(release, release_groups):
+                groups.setdefault(key, []).append(release)
+    return groups
+
+
+def _sibling_candidates(
+    release: Dict[str, Any], index: Dict[Tuple[str, ...], List[Dict[str, Any]]],
+    release_groups: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """Tagged found tracks of the release's sibling editions, marked with their edition."""
+    siblings: Dict[int, Dict[str, Any]] = {}
+    for key in _sibling_keys(release, release_groups):
+        for sibling in index.get(key, []):
+            if sibling["mb_release_id"] != release.get("mb_release_id"):
+                siblings.setdefault(id(sibling), sibling)
+    candidates = []
+    for sibling in sorted(siblings.values(), key=lambda item: (
+        item["mb_release_id"], _natural_key(item), item.get("source") or "",
+    )):
+        for track in sibling.get("tracks", []):
+            if track.get("status") == "found" and track.get("mb_rec_ids"):
+                candidate = deepcopy(track)
+                candidate["sibling_release_id"] = sibling["mb_release_id"]
+                candidates.append(candidate)
+    return candidates
+
+
+def _add_recording_candidates(
+    releases: List[Dict[str, Any]], release_groups: Optional[Dict[str, str]] = None,
+) -> None:
+    """
+    Share tagged recordings across sibling editions without merging identities.
+
+    Siblings are other release MBIDs with the same album name (ignoring spaces and
+    punctuation in the artist credit) or, once audited, the same MusicBrainz release
+    group: a folder of mixed edition tags makes Navidrome list each edition as an album.
+    """
+    release_groups = release_groups or {}
+    index = _sibling_index(releases, release_groups)
+    for release in releases:
+        if not release.get("mb_release_id"):
+            continue
+        candidates = _sibling_candidates(release, index, release_groups)
+        if candidates:
+            release["recording_candidates"] = candidates
+        else:
+            release.pop("recording_candidates", None)
+
+
+def _credit_names(release: Dict[str, Any]) -> List[str]:
+    """Album and track artist credits, without Various Artists placeholders."""
+    names = [release.get("artist"), release.get("album_artist")]
+    for track in release.get("tracks", []):
+        names.append(track.get("artist"))
+        names.extend(track.get("artists") or [])
+    return [name for name in dict.fromkeys(names) if name and not is_various_artists(name)
+            and normalize_text(name) not in ("", "unknown artist")]
+
+
+def _is_va_release(release: Dict[str, Any]) -> bool:
+    return bool(release.get("is_va") or is_various_artists(release.get("artist"))
+                or is_various_artists(release.get("album_artist")))
+
+
+def _plausible_alias(local: Dict[str, Any], selected: Dict[str, Any]) -> bool:
+    """
+    Whether an untagged same-title release could be a copy of the selected edition:
+    a shared album or track artist credit (a compilation may be filed under one of
+    its contributors), two compilations, missing credits, or a shared recording.
+    Generic titles ('Remixes', 'EP') by other artists are unrelated.
+    """
+    if _is_va_release(local) and _is_va_release(selected):
+        return True
+    local_names = _credit_names(local)
+    expected = _credit_names(selected)
+    if not local_names or not expected:
+        # Without credits on either side (a compilation listing no track artists)
+        # the copy cannot be ruled out.
+        return True
+    if any(artist_credit_matches(name, credit) for name in expected for credit in local_names):
+        return True
+    official = {track.get("mb_recording_id") for track in selected.get("tracks", []) if track.get("mb_recording_id")}
+    return any(official & set(track.get("mb_rec_ids") or []) for track in local.get("tracks", []))
 
 
 class LibraryBrowserService:
@@ -214,6 +320,12 @@ class LibraryBrowserService:
         self._audit_cache = BrowserAuditCache(self.release_service.cache)
         self._release_aliases: Dict[str, Set[Tuple[str, str]]] = {}
         self._navidrome_ids: Dict[str, Set[str]] = {}
+        # Release group of each audited edition, kept across launches so a targeted
+        # refresh can use sibling editions whose album names differ.
+        self._release_groups: Dict[str, str] = self._audit_cache.load_release_groups()
+        self._release_groups_changed = False
+        # Same-title untagged releases already found unrelated to an edition.
+        self._unrelated_aliases: Dict[str, Set[str]] = {}
 
     def _inventory(
         self, library_dir: Optional[Path], on_progress: ProgressCallback = None,
@@ -262,7 +374,7 @@ class LibraryBrowserService:
                 if len(identities) == 1:
                     release["mb_release_id"] = next(iter(identities))
         inventory = merge_library_releases(releases) if combine_known_identities else releases
-        _add_recording_candidates(inventory)
+        _add_recording_candidates(inventory, self._release_groups)
         return inventory
 
     def _resolve_local_aliases(
@@ -274,6 +386,7 @@ class LibraryBrowserService:
         known_names = self._release_aliases.get(exact_id, set())
         titles = {title for _, title in known_names}
         titles.update(normalize_text(title) for title in (selected.get("title"), selected.get("mb_release_title")) if title)
+        unrelated = self._unrelated_aliases.setdefault(exact_id, set())
         for release in releases:
             name = _natural_key(release)
             if release.get("mb_release_id") or name in known_names or name[1] not in titles:
@@ -282,6 +395,13 @@ class LibraryBrowserService:
             # initial background audit has not run yet. Resolve its own credit;
             # never assign the selected MBID just because the titles agree.
             prepared = merge_library_releases([release])[0]
+            inventory_key = self._audit_cache.key(prepared)
+            if inventory_key in unrelated:
+                continue
+            if not _plausible_alias(prepared, selected):
+                # Another artist's 'Remixes' or 'EP' must not block this download.
+                unrelated.add(inventory_key)
+                continue
             audited = self._audit(prepared, force_refresh, invalidated_editions)
             if not audited.get("is_audited") or not audited.get("mb_release_id"):
                 if _matches_verified_tracklist(prepared, selected):
@@ -316,6 +436,10 @@ class LibraryBrowserService:
         release_id = audited.get("mb_release_id")
         if not audited.get("is_audited") or not release_id:
             return
+        group = audited.get("mb_release_group_id")
+        if group and self._release_groups.get(release_id) != group:
+            self._release_groups[release_id] = group
+            self._release_groups_changed = True
         aliases = self._release_aliases.setdefault(release_id, set())
         aliases.update((_natural_key(original), _natural_key(audited)))
         aliases.update(tuple(pair) for pair in original.get("browser_alias_keys") or [])
@@ -372,8 +496,16 @@ class LibraryBrowserService:
         filtering is case-insensitive text filtering of release/track credits.
         Every selected release has an audit, even if its local numbers have no
         gaps. Verified audits persist across launches while inventory is unchanged.
+        An incomplete edition is yielded again at the end when a release group
+        learned during this scan connects it to a sibling edition holding its
+        missing recordings; the later audit of an edition replaces the earlier one.
         """
-        releases = self._inventory(library_dir, on_progress, combine_known_identities=not force_refresh)
+        inventory = self._inventory(library_dir, on_progress, combine_known_identities=not force_refresh)
+        # The release groups this inventory's sibling candidates were built from. A
+        # refresh between scan steps may save (and clear the flag of) groups learned
+        # by this scan, so compare contents rather than relying on that flag.
+        inventory_groups = dict(self._release_groups)
+        releases = inventory
         needle = normalize_text(artist_filter)
         if needle:
             releases = [release for release in releases if any(
@@ -381,29 +513,60 @@ class LibraryBrowserService:
                 for credit in [release.get("artist") or "", release.get("album_artist") or ""]
                 + [track.get("artist") or "" for track in release.get("tracks", [])]
             )]
-        audited_sources: Dict[str, List[Dict[str, Any]]] = {}
-        invalidated_editions: Set[str] = set()
-        for index, release in enumerate(releases, 1):
-            if on_progress:
-                on_progress(index - 1, len(releases), f"Checking {release.get('artist', '')} — {release.get('title', '')}")
-            audited = self._audit(release, force_refresh, invalidated_editions)
-            self._remember_identity(release, audited)
-            if audited.get("is_audited") and audited.get("mb_release_id"):
-                release_id = audited["mb_release_id"]
-                source = deepcopy(release)
-                source["mb_release_id"] = release_id
-                sources = audited_sources.setdefault(release_id, [])
-                sources.append(source)
-                if len(sources) > 1:
-                    # Two differently tagged raw entries can resolve to the same
-                    # official album. Reconcile their combined files before the
-                    # browser replaces the earlier result for that MusicBrainz ID.
-                    combined = merge_library_releases(sources)[0]
-                    audited = self._audit(combined, False)
-                    self._remember_identity(combined, audited)
-            yield audited
-            if on_progress:
-                on_progress(index, len(releases), f"Checked {index} of {len(releases)} releases")
+        try:
+            audited_sources: Dict[str, List[Dict[str, Any]]] = {}
+            audit_inputs: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+            invalidated_editions: Set[str] = set()
+            for index, release in enumerate(releases, 1):
+                if on_progress:
+                    on_progress(index - 1, len(releases), f"Checking {release.get('artist', '')} — {release.get('title', '')}")
+                audited = self._audit(release, force_refresh, invalidated_editions)
+                self._remember_identity(release, audited)
+                audit_input = release
+                if audited.get("is_audited") and audited.get("mb_release_id"):
+                    release_id = audited["mb_release_id"]
+                    source = deepcopy(release)
+                    source["mb_release_id"] = release_id
+                    sources = audited_sources.setdefault(release_id, [])
+                    sources.append(source)
+                    if len(sources) > 1:
+                        # Two differently tagged raw entries can resolve to the same
+                        # official album. Reconcile their combined files before the
+                        # browser replaces the earlier result for that MusicBrainz ID.
+                        combined = merge_library_releases(sources)[0]
+                        audited = self._audit(combined, False)
+                        self._remember_identity(combined, audited)
+                        audit_input = combined
+                    if audited.get("is_audited"):
+                        audit_inputs[release_id] = (audit_input, audited)
+                yield audited
+                if on_progress:
+                    on_progress(index, len(releases), f"Checked {index} of {len(releases)} releases")
+            # Release groups learned by this scan's audits connect editions whose album
+            # names differ. Re-audit an incomplete edition when a newly found sibling
+            # holds one of its missing recordings; the browser replaces the earlier row.
+            if self._release_groups != inventory_groups:
+                self._save_release_groups()
+                siblings = _sibling_index(inventory, self._release_groups)
+                for release_id, (audit_input, audited) in audit_inputs.items():
+                    missing = {track.get("mb_recording_id") for track in audited.get("tracks", [])
+                               if track.get("status") == "missing" and track.get("mb_recording_id")}
+                    if not missing or not audit_input.get("mb_release_id"):
+                        continue
+                    candidates = _sibling_candidates(audit_input, siblings, self._release_groups)
+                    if candidates == (audit_input.get("recording_candidates") or []) or not any(
+                        missing & set(candidate.get("mb_rec_ids") or []) for candidate in candidates
+                    ):
+                        continue
+                    updated = dict(audit_input, recording_candidates=candidates)
+                    reaudited = self._audit(updated, False)
+                    self._remember_identity(updated, reaudited)
+                    if reaudited.get("is_audited") and reaudited.get("mb_release_id") == release_id:
+                        yield reaudited
+        finally:
+            # Also when the browser stops the scan early: release groups learned so
+            # far connect editions on the next launch.
+            self._save_release_groups()
 
     def refresh_release(
         self,
@@ -449,4 +612,10 @@ class LibraryBrowserService:
         fresh["id"] = release.get("id") or fresh["id"]
         audited = self._audit(fresh, force_refresh, invalidated_editions)
         self._remember_identity(fresh, audited)
+        self._save_release_groups()
         return audited
+
+    def _save_release_groups(self) -> None:
+        if self._release_groups_changed:
+            self._audit_cache.store_release_groups(self._release_groups)
+            self._release_groups_changed = False

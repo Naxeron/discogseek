@@ -202,7 +202,7 @@ def test_download_refreshes_inventory_then_selects_only_missing_unqueued_tracks(
     fake_service.release_service.download_missing_tracks.assert_called_once_with(
         artist="Artist", release_title="Verified Edition", missing_tracks=[fresh["tracks"][2]],
         preferred_format="mp3-320", search_timeout=12.5, dry_run=dry_run, on_progress=progress,
-        search_scope="release",
+        search_scope="release", official_tracks=fresh["tracks"],
     )
 
 

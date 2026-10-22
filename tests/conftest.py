@@ -27,3 +27,6 @@ def isolated_config(tmp_path, monkeypatch):
     }
     for key, value in settings.items():
         monkeypatch.setattr(Config, key, value)
+    # An unreadable downloads folder means "unknown", as with an offline slskd,
+    # without paying for a connection attempt to the placeholder URL.
+    monkeypatch.setenv("DISCOGSEEK_SLSKD_DOWNLOADS_DIR", str(tmp_path / "no-slskd-downloads"))

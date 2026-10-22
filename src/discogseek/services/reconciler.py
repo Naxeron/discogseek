@@ -14,6 +14,7 @@ from discogseek.core.text import (
     are_versions_compatible
 )
 from discogseek.clients.musicbrainz import ArtistCatalog
+from discogseek.core.release_metadata import is_various_artists
 
 
 ROMAN_TO_ARABIC = {
@@ -172,6 +173,68 @@ class DiscographyReconciler:
             if norm_alias:
                 pat = re.compile(rf"(?<![^\W_]){re.escape(norm_alias)}(?![^\W_])")
                 self.artist_alias_patterns.append((norm_alias, pat))
+        self.catalog_release_ids: Set[str] = {
+            release["id"] for release in getattr(self.catalog, "releases", []) if release.get("id")
+        }
+        for mb in self.catalog.tracks:
+            if mb.get("release_id"):
+                self.catalog_release_ids.add(mb["release_id"])
+        self._phrase_patterns: Dict[str, "re.Pattern[str]"] = {}
+        # Normalized directory names per file path (every catalog track checks them).
+        self._folder_norms: Dict[str, Tuple[List[str], str]] = {}
+
+    def _phrase_in(self, phrase: str, text: str) -> bool:
+        """Word-bounded containment: release 'On' is not in the folder 'Online Sessions'."""
+        pattern = self._phrase_patterns.get(phrase)
+        if pattern is None:
+            pattern = re.compile(rf"(?<![^\W_]){re.escape(phrase)}(?![^\W_])")
+            self._phrase_patterns[phrase] = pattern
+        return bool(pattern.search(text))
+
+    def _path_names_release(self, path: str, release_norms: List[str]) -> bool:
+        """Whether a directory of the file's path names one of the release titles."""
+        key = str(path or "")
+        cached = self._folder_norms.get(key)
+        if cached is None:
+            parent = Path(key).parent
+            cached = ([normalize_text(part) for part in parent.parts], normalize_text(str(parent)))
+            self._folder_norms[key] = cached
+        folders, dirs_norm = cached
+        for release in release_norms:
+            if not release:
+                continue
+            if len(release) < 3:
+                # A one- or two-letter title only counts as a whole folder name.
+                if release in folders:
+                    return True
+            elif self._phrase_in(release, dirs_norm):
+                return True
+        return False
+
+    def _has_artist_evidence(self, lt: Dict[str, Any]) -> bool:
+        """An artist alias in the tags or the path, or a tagged release of this artist."""
+        if any(
+            any(norm_alias == normalize_text(str(a)) or bool(pat.search(normalize_text(str(a))))
+                for norm_alias, pat in self.artist_alias_patterns)
+            for a in list(lt.get("artists") or []) + [lt.get("album_artist") or ""] if a
+        ):
+            return True
+        path_norm = normalize_text(str(lt.get("path", "")))
+        if any(pat.search(path_norm) for _, pat in self.artist_alias_patterns):
+            return True
+        return bool(set(lt.get("mb_release_ids") or []) & self.catalog_release_ids)
+
+    def _credits_other_artist(self, lt: Dict[str, Any]) -> bool:
+        """
+        The file's own artist credits name only other artists: a folder named like
+        the release ('Other Artist/Reflections') is then another artist's album.
+        Untagged files (no credits) are not evidence against this artist.
+        """
+        credits = [
+            a for a in list(lt.get("artists") or []) + [lt.get("album_artist") or ""]
+            if a and not is_various_artists(a) and normalize_text(a) not in ("", "unknown artist")
+        ]
+        return bool(credits) and not self._has_artist_evidence(lt)
 
     def reconcile(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
@@ -182,9 +245,12 @@ class DiscographyReconciler:
         matched_local_paths: Set[str] = set()
         mb_tracks = self.catalog.tracks
 
-        mb_parsed = [parse_track_title_structure(mb["title"]) for mb in mb_tracks]
+        # MusicBrainz and tag titles keep ' - ' parts and leading numbers; only a raw
+        # filename (no title tag) has its track number and artist prefix stripped.
+        mb_parsed = [parse_track_title_structure(mb["title"], is_filename=False) for mb in mb_tracks]
         local_parsed = [
-            parse_track_title_structure(lt.get("title") or lt.get("filename") or "")
+            parse_track_title_structure(lt["title"], is_filename=False) if lt.get("title")
+            else parse_track_title_structure(lt.get("filename") or "")
             for lt in self.local_tracks
         ]
 
@@ -231,7 +297,6 @@ class DiscographyReconciler:
 
                 p_lt = local_parsed[j]
                 lt_album_norm = lt.get("norm_album", "")
-                path_norm = normalize_text(str(lt.get("path", "")))
 
                 # Check release container match
                 all_rel_norms = [normalize_text(r) for r in mb.get("all_releases", set())] if mb.get("all_releases") else [mb_rel_norm]
@@ -239,8 +304,14 @@ class DiscographyReconciler:
                     all_rel_norms.append(mb_rel_norm)
 
                 rel_sim = max([calculate_similarity(r, lt_album_norm) for r in all_rel_norms], default=0.0)
-                path_has_rel = any(r and r in path_norm for r in all_rel_norms)
-                rel_confirmed = rel_sim > 0.7 or path_has_rel
+                path_has_rel = self._path_names_release(lt.get("path", ""), all_rel_norms)
+                # A similar album tag or a folder named after the release (whole
+                # words) confirms the container; unless the album tag itself is
+                # (nearly) the release title, the file must not be credited only to
+                # other artists.
+                rel_confirmed = (rel_sim > 0.7 or path_has_rel) and (
+                    rel_sim >= 0.9 or not self._credits_other_artist(lt)
+                )
 
                 # Support purely numeric tracks (e.g. 01.flac) in confirmed albums
                 is_num_lt = is_purely_numeric_track(lt)
@@ -355,7 +426,11 @@ class DiscographyReconciler:
                     bool(pat.search(path_norm))
                     for _, pat in self.artist_alias_patterns
                 )
-                has_rel_match = bool(mb_rel_norm and (mb_rel_norm in path_norm or mb_rel_norm == lt.get("norm_album", "")))
+                has_rel_match = bool(mb_rel_norm and (
+                    mb_rel_norm == lt.get("norm_album", "")
+                    or (self._path_names_release(lt.get("path", ""), [mb_rel_norm])
+                        and not self._credits_other_artist(lt))
+                ))
 
                 if not (has_artist_tag or has_artist_path or has_rel_match):
                     continue

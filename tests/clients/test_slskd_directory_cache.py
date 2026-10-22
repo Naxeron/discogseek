@@ -6,6 +6,12 @@ from unittest.mock import MagicMock
 from discogseek.clients.slskd import MAX_DIRECTORY_CACHE_SIZE, SlskdClient
 
 
+def directory_reply(name, *basenames, size=1000):
+    """slskd 0.26 browse body: Soulseek directories whose files carry basenames."""
+    return [{"name": name, "fileCount": len(basenames),
+             "files": [{"filename": basename, "size": size} for basename in basenames]}]
+
+
 class TestSlskdDirectoryCache:
     """Keep directory caching bounded and reusable under concurrent requests."""
 
@@ -23,7 +29,7 @@ class TestSlskdDirectoryCache:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
             dir_name = kwargs.get("json", {}).get("directory", "dir")
-            mock_resp.json.return_value = [{"filename": f"{dir_name}/track.flac", "size": 1000}]
+            mock_resp.json.return_value = directory_reply(dir_name, "track.flac")
             return mock_resp
 
         monkeypatch.setattr(client, "_request", mock_request)
@@ -60,7 +66,7 @@ class TestSlskdDirectoryCache:
             call_counts[d] = call_counts.get(d, 0) + 1
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_resp.json.return_value = [{"filename": f"{d}/file.flac"}]
+            mock_resp.json.return_value = directory_reply(d, "file.flac")
             return mock_resp
 
         monkeypatch.setattr(client, "_request", mock_request)
@@ -95,7 +101,7 @@ class TestSlskdDirectoryCache:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = [{"filename": "song.mp3"}]
+        mock_resp.json.return_value = directory_reply("dir", "song.mp3")
         monkeypatch.setattr(client, "_request", lambda *a, **kw: mock_resp)
 
         for i in range(50):
@@ -121,7 +127,7 @@ class TestSlskdDirectoryCache:
             d = kwargs.get("json", {}).get("directory", "")
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_resp.json.return_value = [{"filename": d}]
+            mock_resp.json.return_value = directory_reply(d, "01 track.flac")
             return mock_resp
 
         monkeypatch.setattr(client, "_request", mock_request)
@@ -131,7 +137,7 @@ class TestSlskdDirectoryCache:
         res1 = client.browse_directory("a:b", "c")
         res2 = client.browse_directory("a", "b:c")
 
-        assert res1[0]["filename"] == "c"
+        assert res1[0]["filename"] == "c\\01 track.flac"
         # Both keys happen to map to "a:b:c" in naive format, but let's verify both calls succeed cleanly
         assert isinstance(res2, list)
 
@@ -149,7 +155,7 @@ class TestSlskdDirectoryCache:
             calls.append(d)
             mock_resp = MagicMock()
             mock_resp.status_code = 200
-            mock_resp.json.return_value = [{"filename": f"{d}/track.flac"}]
+            mock_resp.json.return_value = directory_reply(d, "track.flac")
             return mock_resp
 
         monkeypatch.setattr(client, "_request", mock_request)
@@ -177,7 +183,7 @@ def test_slskd_lru_directory_cache_bounding(monkeypatch):
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = [{"filename": "track.flac", "size": 1000}]
+    mock_resp.json.return_value = directory_reply("Music\\Album", "track.flac")
 
     monkeypatch.setattr(client, "_request", lambda method, path, **kwargs: mock_resp)
 
@@ -204,9 +210,7 @@ def test_slskd_lru_directory_cache_eviction_order(monkeypatch):
         request_calls.append(req_dir)
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = [
-            {"filename": f"{req_dir}.flac", "size": 1000}
-        ]
+        resp.json.return_value = directory_reply(req_dir, "01 track.flac")
         return resp
 
     monkeypatch.setattr(client, "_request", mock_request)
@@ -221,7 +225,7 @@ def test_slskd_lru_directory_cache_eviction_order(monkeypatch):
 
     # Access dir1 (cache hit, moves to end/MRU)
     res_dir1 = client.browse_directory("user1", "dir1")
-    assert res_dir1[0]["filename"] == "dir1.flac"
+    assert res_dir1[0]["filename"] == "dir1\\01 track.flac"
     # No new HTTP request should have been made for dir1
     assert request_calls.count("dir1") == 1
 
@@ -249,7 +253,7 @@ def test_slskd_lru_directory_cache_batch_and_concurrency(monkeypatch):
         req_dir = kwargs.get("json", {}).get("directory", "default")
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = [{"filename": f"{req_dir}.flac", "size": 500}]
+        resp.json.return_value = directory_reply(req_dir, "01 track.flac", size=500)
         return resp
 
     monkeypatch.setattr(client, "_request", mock_request)

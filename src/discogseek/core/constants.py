@@ -21,6 +21,14 @@ LOSSY_EXTENSIONS: Set[str] = {
     ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma"
 }
 
+# Extensions stripped from peer filenames before title parsing. Tracker formats
+# (.it, .mod, .xm, ...) are excluded because titles such as "BRKSNG.IT" end in them.
+TITLE_AUDIO_EXTENSIONS: Set[str] = {
+    ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".oga",
+    ".opus", ".alac", ".aiff", ".aif", ".wma", ".ape",
+    ".wv", ".dsf", ".dff", ".mka", ".mp4"
+}
+
 # Archive / Release Container Extensions
 ARCHIVE_EXTENSIONS: Set[str] = {
     ".zip", ".rar", ".7z", ".tar", ".gz", ".tar.gz", ".tgz"
@@ -95,7 +103,9 @@ DIR_STOP_WORDS: Set[str] = {
     "rip", "24bit", "16bit", "44.1khz", "96khz", "192khz", "cue", "log",
     "eac", "edition", "reissue", "remaster", "remastered", "deluxe",
     "ep", "lp", "single", "album", "disc", "disk", "ost", "soundtrack",
-    "discography", "complete", "boxset", "vol", "volume"
+    "discography", "complete", "boxset", "vol", "volume",
+    # normalize_text spells '&' as 'and'; it never makes a directory significant.
+    "and"
 }
 
 # Special diacritics translation mappings (e.g. Polish letters that unidecode transforms into approximations)
@@ -105,3 +115,5 @@ POLISH_DIACRITICS_MAP: Dict[str, str] = {
     "Ą": "A", "Ć": "C", "Ę": "E", "Ł": "L", "Ń": "N",
     "Ó": "O", "Ś": "S", "Ź": "Z", "Ż": "Z"
 }
+# str.translate needs code-point keys; the plain dict above is kept for callers that read it.
+POLISH_DIACRITICS_TABLE: Dict[int, str] = str.maketrans(POLISH_DIACRITICS_MAP)

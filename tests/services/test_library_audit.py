@@ -202,8 +202,10 @@ def test_audit_sorts_official_and_unmatched_tracks_with_mixed_disc_types(
     audited = service.audit_release(local)
 
     assert audited["is_audited"] is True
-    assert audited["found_count"] == 3
+    # 'Bonus mix' is a local extra: listed as found, not counted as an official track.
+    assert audited["found_count"] == 2
     assert audited["missing_count"] == 2
+    assert audited["total_tracks_expected"] == 4
     assert [(t["disc_number"], t["track_number"], t["title"], t["status"])
             for t in audited["tracks"]] == [
         (1, "1", "First", "found"),

@@ -1,6 +1,7 @@
 """Offline CLI audit and download workflows using local and remote libraries."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -232,8 +233,11 @@ def test_download_reports_search_counts(request, monkeypatch, capsys):
     request.getfixturevalue("workflow")
     monkeypatch.setattr(SlskdClient, "batch_search", batch_search)
     queries = ["Target Artist", "Target Artist Three Track EP", "Three Track EP"]
+    # Only recent searches are reused; older peer snapshots are searched again.
+    ended = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     monkeypatch.setattr(SlskdClient, "list_searches", lambda client: [
-        {"id": query, "searchText": query, "isComplete": True, "fileCount": 1}
+        {"id": query, "searchText": query, "isComplete": True, "state": "Completed, TimedOut",
+         "endedAt": ended, "fileCount": 1}
         for query in queries
     ])
     monkeypatch.setattr(SlskdClient, "get_search_results", lambda client, sid: {

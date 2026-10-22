@@ -218,8 +218,10 @@ def test_finished_download_refreshes_real_audit_with_string_discs_and_local_bonu
     tui._drain_events()
     fresh = tui.model.releases[release_key(row)]
     assert tui.download_error == ""
-    assert fresh["found_count"] == 3 and fresh["missing_count"] == 0
+    # The local bonus file stays listed as an extra; counts cover the official tracklist.
+    assert fresh["found_count"] == 2 and fresh["missing_count"] == 0
     assert [track["title"] for track in fresh["tracks"]] == ["First", "Second", "Bonus"]
+    assert [bool(track.get("is_extra")) for track in fresh["tracks"]] == [False, False, True]
     assert tui.model.track_status(fresh, fresh["tracks"][1]) == "found"
     assert release_key(row) not in tui._downloads
     assert tui.model.visible() == []
@@ -241,9 +243,10 @@ def test_active_and_unknown_transfers_remain_queued_without_claiming_success(tui
     assert tui.model.pending(row) == [row["tracks"][2]]
 
 
+# A size-mismatch abort is searched again elsewhere: see
+# test_browser_transfer_recovery.py::test_aborted_transfer_is_searched_again_without_cancel_or_peer_block.
 @pytest.mark.parametrize("state", ["Completed, Cancelled", "Completed, TimedOut",
-                                   "Completed, Errored", "Completed, Rejected",
-                                   "Completed, Aborted"])
+                                   "Completed, Errored", "Completed, Rejected"])
 def test_terminal_failure_restores_missing_track_and_stops_empty_watch(tui, service, state):
     row = release(missing=1)
     remember(tui, row)
@@ -513,7 +516,9 @@ def test_failed_transfer_is_stopped_then_only_its_track_tries_another_source(tui
     assert tui.jobs.empty() and not tui.pending_downloads
 
 
-@pytest.mark.parametrize("state", ["Cancelled", "Aborted"])
+# Aborted (size mismatch) is recovered without blocking the peer; see
+# test_browser_transfer_recovery.py.
+@pytest.mark.parametrize("state", ["Cancelled"])
 def test_explicitly_stopped_transfer_is_never_cancelled_or_recovered(tui, service, state):
     row = release(missing=1)
     remember(tui, row)
@@ -527,10 +532,11 @@ def test_explicitly_stopped_transfer_is_never_cancelled_or_recovered(tui, servic
     assert tui.jobs.empty() and not tui.pending_downloads
     assert tui.model.track_status(row, row["tracks"][1]) == "missing"
     assert tui._failed_sources[release_key(row)] == {("peer", "Music/Album/2 song.flac")}
-    assert tui._peer_policy.blocked_reason("peer")
+    # A size-mismatch abort excludes only that file, not the peer.
+    assert bool(tui._peer_policy.blocked_reason("peer")) == (state == "Cancelled")
 
 
-@pytest.mark.parametrize("state", ["Rejected", "Aborted", "Cancelled"])
+@pytest.mark.parametrize("state", ["Rejected", "Cancelled"])
 def test_untracked_peer_failure_survives_cleared_history_and_a_new_browser(tui, service, state):
     row = release(missing=1)
     remember(tui, row)

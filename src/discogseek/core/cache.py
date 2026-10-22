@@ -11,7 +11,43 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Set, Iterator, Tuple
 
 from discogseek.config import Config
-from discogseek.core.audio import AudioMetadata
+from discogseek.core.audio import AUDIO_EXTRACTOR_VERSION, AudioMetadata
+
+
+# Rows written before extractor version 2 are re-read only where the old extraction
+# lost data: MP4/ALAC (trkn, disk and MusicBrainz freeform atoms were ignored, so
+# those files had no position or MBIDs) and APEv2 formats (the 'Track' key was
+# ignored). Re-reading every file on a slow network mount would be costly while
+# FLAC/MP3 tags were otherwise read correctly; ID3 rows that joined multiple values
+# with NUL, and folders whose cached album artists disagree (Vorbis key-order
+# lottery, see library_scan), are re-read selectively. Before version 3 a file
+# without any tags (an untagged peer download, a WAV) lost its stream info; only
+# rows without a duration are re-read for that.
+REREAD_LEGACY_EXTENSIONS = {".m4a", ".mp4", ".m4b", ".aac", ".alac", ".ape", ".wv", ".mpc"}
+_STREAM_INFO_VERSION = 3
+_LEGACY_TEXT_COLUMNS = (
+    "title", "artist", "album_artist", "album", "mb_track_ids", "mb_rec_ids",
+    "mb_artist_ids", "mb_release_ids",
+)
+
+
+def _is_outdated_audio_row(file_path: Path, row: sqlite3.Row) -> bool:
+    """Whether a cached row predates a material extraction fix for this file."""
+    keys = row.keys()
+    version = (row["extractor_version"] if "extractor_version" in keys else None) or 1
+    if version >= AUDIO_EXTRACTOR_VERSION:
+        return False
+    if version < _STREAM_INFO_VERSION and not (row["duration"] if "duration" in keys else None):
+        return True
+    if version >= 2:
+        return False
+    if file_path.suffix.lower() in REREAD_LEGACY_EXTENSIONS:
+        return True
+    # ID set columns are JSON lists, where a NUL is stored as the escape '\u0000'.
+    return any(
+        "\x00" in (row[column] or "") or "\\u0000" in (row[column] or "")
+        for column in _LEGACY_TEXT_COLUMNS if column in keys
+    )
 
 
 class UnifiedCacheManager:
@@ -72,6 +108,10 @@ class UnifiedCacheManager:
                 # Older cache rows did not retain disc tags. Leave their new
                 # value NULL so the next scan refreshes metadata from the file.
                 conn.execute("ALTER TABLE audio_cache ADD COLUMN disc_number INTEGER")
+            # NULL in these columns marks a row from extractor version 1 (no totals).
+            for column in ("total_discs", "track_total", "extractor_version"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE audio_cache ADD COLUMN {column} INTEGER")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_audio_mtime ON audio_cache (path, mtime)")
 
             # 2. Generic Key-Value / API Cache with TTL
@@ -121,7 +161,8 @@ class UnifiedCacheManager:
                     for row in rows:
                         for file_path, st in fingerprints[row["path"]]:
                             if (row["mtime"] != st.st_mtime or row["size_bytes"] != st.st_size
-                                    or row["disc_number"] is None):
+                                    or row["disc_number"] is None
+                                    or _is_outdated_audio_row(file_path, row)):
                                 continue
                             try:
                                 cached[file_path] = self._audio_metadata_from_row(file_path, row)
@@ -135,6 +176,13 @@ class UnifiedCacheManager:
 
     @staticmethod
     def _audio_metadata_from_row(file_path: Path, row: sqlite3.Row) -> AudioMetadata:
+        keys = row.keys()
+
+        def optional_int(column: str) -> Optional[int]:
+            value = row[column] if column in keys else None
+            return int(value) if value is not None else None
+
+        disc_number = int(row["disc_number"] or 1)
         return AudioMetadata(
             path=file_path,
             file_type=file_path.suffix.lower(),
@@ -143,7 +191,10 @@ class UnifiedCacheManager:
             album_artist=row["album_artist"] or "",
             album=row["album"] or "",
             track_number=row["track_number"] or "",
-            disc_number=int(row["disc_number"] or 1),
+            disc_number=disc_number,
+            total_discs=max(optional_int("total_discs") or 1, disc_number),
+            track_total=optional_int("track_total"),
+            extractor_version=optional_int("extractor_version") or 1,
             year=row["year"] or "",
             genres=json.loads(row["genres"]) if row["genres"] else [],
             mb_track_ids=set(json.loads(row["mb_track_ids"])) if row["mb_track_ids"] else set(),
@@ -172,6 +223,9 @@ class UnifiedCacheManager:
         for start in range(0, len(metadata), 500):
             rows = []
             for meta in metadata[start:start + 500]:
+                if getattr(meta, "read_error", False):
+                    # Folder/filename fallbacks from a failed read are not the file's tags.
+                    continue
                 try:
                     st = meta.path.stat()
                     if (expected_fingerprints is not None
@@ -192,8 +246,9 @@ class UnifiedCacheManager:
                         path, mtime, size_bytes, title, artist, album_artist, album,
                         track_number, disc_number, year, genres, mb_track_ids, mb_rec_ids, mb_artist_ids,
                         mb_release_ids, bitrate_kbps, bit_depth, sample_rate, channels,
-                        duration, is_lossless, format_label, quality_score, cached_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        duration, is_lossless, format_label, quality_score, cached_at,
+                        total_discs, track_total, extractor_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, rows)
         except Exception:
             pass
@@ -224,7 +279,11 @@ class UnifiedCacheManager:
             1 if meta.is_lossless else 0,
             meta.format_label,
             meta.quality_score,
-            time.time()
+            time.time(),
+            meta.total_discs,
+            meta.track_total,
+            # Metadata built elsewhere (tests, imports) uses the dataclass default.
+            getattr(meta, "extractor_version", AUDIO_EXTRACTOR_VERSION),
         )
 
     # --- Generic API / Key-Value Cache Methods ---
