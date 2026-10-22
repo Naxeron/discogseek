@@ -23,16 +23,14 @@ from discogseek.core.release_metadata import (
 from discogseek.core.text import normalize_text
 
 
-def scan_library_releases(
+def scan_library_tracks(
     cache: UnifiedCacheManager,
     library_dir: Optional[Path] = None,
     force_rescan: bool = False,
     threads: int = 16,
     on_progress: Optional[Callable[[int, int, str], None]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Scans music directory and aggregates all local audio files into grouped releases.
-    """
+) -> List[AudioMetadata]:
+    """Read cached or fresh metadata for every audio file, including loose tracks."""
     lib_path = Path(library_dir or Config.DEFAULT_LIBRARY_DIR).resolve()
     if not lib_path.exists():
         return []
@@ -98,6 +96,19 @@ def scan_library_releases(
         if pending_cache:
             cache.store_audio_metadata_batch(pending_cache, pending_fingerprints)
 
+    return all_tracks
+
+
+def scan_library_releases(
+    cache: UnifiedCacheManager,
+    library_dir: Optional[Path] = None,
+    force_rescan: bool = False,
+    threads: int = 16,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+) -> List[Dict[str, Any]]:
+    """Scan local audio files and aggregate them into grouped releases."""
+    lib_path = Path(library_dir or Config.DEFAULT_LIBRARY_DIR).resolve()
+    all_tracks = scan_library_tracks(cache, lib_path, force_rescan, threads, on_progress)
     releases_map = _group_releases(all_tracks, lib_path)
     release_list = [_finalize_release(rel) for rel in releases_map.values()]
 

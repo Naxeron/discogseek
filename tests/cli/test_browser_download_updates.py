@@ -9,6 +9,7 @@ import pytest
 from discogseek.cli import browser
 from discogseek.cli.browser import ReleaseBrowser, release_key, track_key
 from discogseek.cli.main import build_parser
+from discogseek.core.audio import AudioMetadata, AudioQualityAnalyzer
 from discogseek.core.transfers import DownloadHistory
 from discogseek.services.library import LibraryReleaseService
 from discogseek.services.library_browser import LibraryBrowserService
@@ -121,6 +122,62 @@ def test_finished_download_updates_status_then_retries_delayed_import(tui, servi
 
     service.release_service.slskd_client.get_downloads.assert_not_called()
     service.refresh_release.assert_not_called()
+
+
+def test_library_only_scan_keeps_downloaded_status_until_file_is_imported(tui, clock, tmp_path, monkeypatch):
+    music = tmp_path / "music"
+    library = music / "Library"
+    first = library / "Artist" / "Album" / "01 First.flac"
+    downloaded = music / "downloads" / "Album" / "02 Second.flac"
+    unsorted = music / "unsorted" / "Unsorted Album" / "01 Unsorted.flac"
+    for path in (first, downloaded, unsorted):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+
+    def metadata(path):
+        number, title = path.stem.split(" ", 1)
+        return AudioMetadata(
+            path=path, title=title, artist="Artist", album=path.parent.name,
+            track_number=number, format_label="FLAC", mb_release_ids={"edition-1"},
+            mb_rec_ids={f"rec-{int(number)}"},
+        )
+
+    analyze = Mock(side_effect=metadata)
+    monkeypatch.setattr(AudioQualityAnalyzer, "analyze_file", analyze)
+    mb = Mock()
+    mb.get_release_by_id.return_value = {
+        "id": "edition-1", "title": "Album", "artist-credit": [{"name": "Artist"}],
+        "medium-list": [{"position": "1", "track-list": [
+            {"number": str(number), "recording": {"id": f"rec-{number}", "title": title}}
+            for number, title in enumerate(["First", "Second"], 1)
+        ]}],
+    }
+    slskd = SimpleNamespace(get_downloads=Mock(return_value=transfers(transfer())))
+    service = LibraryBrowserService(LibraryReleaseService(mb_client=mb, slskd_client=slskd))
+    tui.args.music_dir = library
+    rows = list(service.iter_releases(library_dir=library))
+    assert len(rows) == 1 and rows[0]["missing_count"] == 1
+    remember(tui, rows[0])
+
+    check(tui, service)
+
+    waiting = tui.model.selected()
+    assert tui.model.track_status(waiting, waiting["tracks"][1]) == "downloaded"
+    assert waiting["missing_count"] == 1
+    assert tui.model.pending(waiting) == []
+    assert downloaded.exists()
+    analyze.assert_called_once_with(first)
+
+    imported_path = downloaded.rename(first.parent / downloaded.name)
+    clock.now += browser.DOWNLOAD_IMPORT_RETRY_INTERVAL
+    check(tui, service)
+
+    fresh = tui.model.releases[release_key(rows[0])]
+    assert tui.model.track_status(fresh, fresh["tracks"][1]) == "found"
+    assert fresh["missing_count"] == 0
+    assert tui.model.visible() == []
+    assert {call.args[0] for call in analyze.call_args_list} == {first, imported_path}
+    assert unsorted.exists()
 
 
 def test_finished_download_refreshes_real_audit_with_string_discs_and_local_bonus(tui, monkeypatch):

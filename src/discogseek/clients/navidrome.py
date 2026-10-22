@@ -93,6 +93,44 @@ class NavidromeScanner:
             raise RuntimeError(f"Navidrome scan failed ({endpoint}): {self.last_error}")
         return response
 
+    def scan_library_tracks(
+        self,
+        on_progress: Optional[Callable[[int, int, str], None]] = None,
+        page_size: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Read all indexed songs, including loose tracks, without opening audio files."""
+        if page_size < 1:
+            raise ValueError("Navidrome song page size must be positive")
+        songs: Dict[str, Dict[str, Any]] = {}
+        offset = 0
+        while True:
+            response = self._scan_request("search3", {
+                "query": "", "artistCount": 0, "albumCount": 0,
+                "songCount": page_size, "songOffset": offset,
+            })
+            result = response.get("searchResult3") if isinstance(response, dict) else None
+            if not isinstance(result, dict):
+                raise RuntimeError("Navidrome scan failed: missing or malformed song search result")
+            page = result.get("song", [])
+            if not isinstance(page, list):
+                raise RuntimeError("Navidrome scan failed: malformed song list")
+            if not page:
+                return list(songs.values())
+            new_ids = 0
+            for song in page:
+                song_id = song.get("id") if isinstance(song, dict) else None
+                if not isinstance(song_id, str) or not song_id.strip():
+                    raise RuntimeError("Navidrome scan failed: song has no valid ID")
+                if song_id not in songs:
+                    songs[song_id] = song
+                    new_ids += 1
+            if not new_ids:
+                raise RuntimeError("Navidrome scan failed: song pagination made no progress")
+            # Servers can cap songCount; only an empty page marks the end.
+            offset += len(page)
+            if on_progress:
+                on_progress(len(songs), 0, f"Read {len(songs)} Navidrome tracks...")
+
     def scan_library_releases(
         self,
         on_progress: Optional[Callable[[int, int, str], None]] = None,

@@ -16,6 +16,7 @@ Set environment variables or put them in a `.env` file:
 
 ```dotenv
 DISCOGSEEK_LIBRARY_DIR=/path/to/music
+DISCOGSEEK_BROWSER_LIBRARY_DIR=/mnt/music/Library
 DISCOGSEEK_CACHE_DIR=/path/to/cache/discogseek
 SLSKD_URL=http://localhost:5030
 SLSKD_API_KEY=your-api-key
@@ -30,7 +31,7 @@ NAVIDROME_PASSWORD=your-password
 
 `SUBSONIC_URL`, `SUBSONIC_USERNAME`, and `SUBSONIC_PASSWORD` are also accepted. Local and remote tracks are reconciled together. A configured remote library must be reachable before downloading.
 
-The cache defaults to `~/.cache/discogseek`. The local library defaults to `/mnt/music` when present, otherwise `./music`. Use `-d` to select a library or a release folder. An absent local directory is treated as empty, allowing remote-only audits or new discography downloads.
+The cache defaults to `~/.cache/discogseek`. For `audit` and `download`, the local library defaults to `/mnt/music` when present, otherwise `./music`. The browser defaults to `/mnt/music/Library`; set `DISCOGSEEK_BROWSER_LIBRARY_DIR` to change its default independently. Use `-d` to select a library or a release folder. An absent local directory is treated as empty, allowing remote-only audits or new discography downloads.
 
 ## Audit
 
@@ -56,7 +57,7 @@ Artist queries accept names or MusicBrainz artist MBIDs. For a release query, su
 ## Browse incomplete releases
 
 ```bash
-# Two-panel browser for your whole library
+# Two-panel browser for your organized library (/mnt/music/Library by default)
 discogseek browse
 
 # Start with an artist filter or a different library
@@ -66,7 +67,7 @@ discogseek browse --artist "Artist" -d /path/to/music
 discogseek browse --dry-run -f flac
 ```
 
-The left pane lists incomplete releases; the right shows every track in the selected release, including disc/track numbers and found, missing, matched, or queued status. The browser scans local files and every configured Navidrome/Subsonic album and reuses saved MusicBrainz audits for unchanged releases across launches. If an album is split across different edition tags, tracks with the same MusicBrainz recording ID and disc/track position count across editions with the same artist and album title. The first run builds this audit cache. New or changed releases are audited as needed; failed audits remain retryable. Use `r` to refresh a selected release from MusicBrainz or launch with `--force-refresh` to refresh all audits. It covers releases already represented in your library; use `download "Artist"` for entirely absent releases.
+The left pane lists incomplete releases; the right shows every track in the selected release, including disc/track numbers and found, missing, matched, or queued status. The browser scans local files under `/mnt/music/Library` (or the folder selected with `-d` or `DISCOGSEEK_BROWSER_LIBRARY_DIR`) and every configured Navidrome/Subsonic album, reusing saved MusicBrainz audits for unchanged releases across launches. Local downloads outside that folder are excluded, including during refreshes and download checks. Configure Navidrome to index the same organized library if unsorted downloads should stay out of the browser. If an album is split across different edition tags, tracks with the same MusicBrainz recording ID and disc/track position count across editions with the same artist and album title. The first run builds this audit cache. New or changed releases are audited as needed; failed audits remain retryable. Use `r` to refresh a selected release from MusicBrainz or launch with `--force-refresh` to refresh all audits. It covers releases already represented in your library; use `download "Artist"` for entirely absent releases.
 
 Verified editions in the same MusicBrainz release group share one album row. Press **e** to choose an edition; the menu shows its format, official track count, release date, country, and missing tracks. The browser initially selects the incomplete edition with the fewest missing tracks and remembers your choice during the session. Complete editions remain available while another edition of the album is incomplete. Tracks, refreshes, and downloads follow the selected edition. Editions with the same artist, album title, and full recording list at the same disc/track positions also share download status; other editions keep their own status. Releases without a verified album identity remain separate.
 
@@ -99,7 +100,7 @@ Library rechecks read and write audio metadata caches in batches. If the first a
 
 Downloads queued during the browser session update automatically. The background worker checks slskd every three seconds between operations, prioritizing overdue checks before the next waiting request, and refreshes affected releases when transfers finish. A running search or audit can delay these checks. Rejected, timed-out, or errored transfers get up to two automatic searches for another source per track per browser session. The browser stops the failed transfer's retries without deleting its history, rechecks the library, and skips previously failed sources. Missing transfer IDs, cancellation failures, no alternatives, or the recovery limit stop automatic recovery and leave `d`/`t` available for a manual retry. Cancelled or aborted transfers become missing again without automatic recovery. Healthy transfers, including `Queued, Remotely` with earlier retries, remain queued. Recovery applies only to downloads tracked during this browser session.
 
-`DOWNLOADED` means the transfer succeeded but the library has not picked up the file yet; the browser retries the library check every 15 seconds until it becomes `FOUND`, and complete releases leave the incomplete list. Files go to slskd's configured download destination, so they must be moved into the scanned library or indexed by Navidrome to count as found. Unverified releases cannot be downloaded from the browser. Browsing itself does not require slskd credentials. The UI uses Python's standard `curses` module on Linux/macOS and needs an interactive terminal of at least 72 columns by 14 rows.
+`DOWNLOADED` means the transfer succeeded but the library has not picked up the file yet; the browser retries the library check every 15 seconds until it becomes `FOUND`, and complete releases leave the incomplete list. Files go to slskd's configured download destination and remain `DOWNLOADED` until moved into the scanned library, for example by Picard, or indexed by Navidrome. Unverified releases cannot be downloaded from the browser. Browsing itself does not require slskd credentials. The UI uses Python's standard `curses` module on Linux/macOS and needs an interactive terminal of at least 72 columns by 14 rows.
 
 ## Download
 

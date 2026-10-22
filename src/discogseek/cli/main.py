@@ -45,7 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     browse = commands.add_parser("browse", help="Browse incomplete library releases in a two-pane terminal UI")
     browse.add_argument("--artist", help="Initial artist filter (editable with / in the browser)")
     browse.add_argument("-d", "--music-dir", "--library-dir", type=Path,
-                        default=Config.DEFAULT_LIBRARY_DIR, help="Local music library")
+                        default=Config.DEFAULT_BROWSER_LIBRARY_DIR,
+                        help="Organized local library (default: %(default)s)")
     browse.add_argument("--force-refresh", action="store_true", help="Refresh MusicBrainz metadata")
     browse.add_argument("--verbose", action="store_true", help="Show service progress in the browser")
     peers = commands.add_parser("peers", help="List or unblock persistently blocked Soulseek peers (offline)")

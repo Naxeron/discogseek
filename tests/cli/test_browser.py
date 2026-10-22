@@ -750,6 +750,14 @@ def test_preview_result_keeps_all_missing_tracks_available_to_download(tui):
     assert "preview; nothing queued" in tui.last_result
 
 
+def test_browse_defaults_to_its_own_library_directory():
+    parser = build_parser()
+
+    assert parser.parse_args(["browse"]).music_dir == Config.DEFAULT_BROWSER_LIBRARY_DIR
+    assert parser.parse_args(["audit", "Artist"]).music_dir == Config.DEFAULT_LIBRARY_DIR
+    assert parser.parse_args(["download", "Artist"]).music_dir == Config.DEFAULT_LIBRARY_DIR
+
+
 def test_browse_command_accepts_library_filter_and_download_options(tmp_path):
     args = build_parser().parse_args([
         "browse", "--artist", "Björk", "--library-dir", str(tmp_path), "--format", "mp3-320",

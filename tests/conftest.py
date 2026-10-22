@@ -13,6 +13,7 @@ def isolated_config(tmp_path, monkeypatch):
         "MB_CACHE_DIR": cache_dir / "mb_cache",
         "AUDIO_CACHE_DB": cache_dir / "audio.db",
         "DEFAULT_LIBRARY_DIR": tmp_path / "music",
+        "DEFAULT_BROWSER_LIBRARY_DIR": tmp_path / "music" / "Library",
         "SLSKD_URL": "http://127.0.0.1:9",
         "SLSKD_API_KEY": "offline-test-key",
         "SLSKD_USERNAME": "",
