@@ -339,6 +339,17 @@ REMASTER_OR_NOISE_PATTERNS = [
     re.compile(r"[\d.]+\s*bpm", re.IGNORECASE),
 ]
 
+# Uploader notes that only a bracket makes a note: '(Commission Song)', '(Remix pack in Description)'.
+# Unbracketed, 'Artist - Commission' is a song called 'Commission'.
+BRACKETED_NOTE_PATTERNS = [
+    re.compile(
+        r"commission(?:ed)?(?:\s+(?:song|work|track))?|"
+        r"(?:(?:remix|sample|stem)s?\s+(?:pack|stem)s?|stems?|free\s+(?:dl|download)|download|dl)"
+        r"\s+(?:in|on)\s+(?:the\s+)?description",
+        re.IGNORECASE,
+    ),
+]
+
 FEATURE_PATTERNS = [
     re.compile(r"[\(\[\{]\s*(?:feat\b\.?|ft\b\.?|featuring\b|with\b)\s*([^\(\)\[\]\{\}]+)[\)\]\}]", re.IGNORECASE),
     # Unbracketed credits end at a comma, a bracket, or a ' - ' separator ('Song ft. Jay-Z' keeps 'Jay-Z').
@@ -403,6 +414,8 @@ def _is_noise_content(content: str, opener: str = "(") -> bool:
     if not content:
         return False
     if any(pattern.fullmatch(content) for pattern in REMASTER_OR_NOISE_PATTERNS):
+        return True
+    if opener and any(pattern.fullmatch(content) for pattern in BRACKETED_NOTE_PATTERNS):
         return True
     if opener == "[" and re.fullmatch(r"[\d.]+", content):
         return True  # '[2]', '[128.5]' bpm or index tags
@@ -640,8 +653,17 @@ def _filename_title_variants(
 
     rest, kind, ambiguous = _strip_track_token(text, keep_ambiguous=keep_ambiguous)
     first_rest = rest
+    repeated_rest = ""
     if kind:
         rest, _, _ = _strip_track_token(rest, second=True)
+        # '13 13. $SSTFNMZ', '01 1. More Movement': the same position written twice. The
+        # reading without it is an alternative; a title may itself begin with '1. '.
+        lead = re.search(r"(\d+)\D*$", text[:len(text) - len(first_rest)])
+        repeat = re.match(r"(\d{1,3})\s*[.)]\s*(?=\S)|(\d{1,3})\s+-\s+(?=\S)", rest)
+        if (rest == first_rest and lead and repeat
+                and int(repeat.group(1) or repeat.group(2)) == int(lead.group(1))
+                and _has_title_content(rest[repeat.end():])):
+            repeated_rest = rest[repeat.end():]
 
     parts = _split_outside_brackets(rest)
     # 'Artist - Album - 03 - Title': inner position segments are not titles.
@@ -667,7 +689,7 @@ def _filename_title_variants(
     # A zero-padded number may begin the title: '05 - 007 (Shanty Town)', '01 - 00 00',
     # '007 (Shanty Town)'. Keep the readings without the second token and without a bare
     # leading number as alternatives.
-    for kept in (first_rest if first_rest != rest else "", text if kind == "number_space" else ""):
+    for kept in (first_rest if first_rest != rest else "", text if kind == "number_space" else "", repeated_rest):
         if kept:
             variants += _title_part_variants(
                 _fold_descriptors(_split_outside_brackets(kept)), scene=False, alternatives=True,
@@ -902,6 +924,58 @@ def _title_numbers(norm: str) -> Set[int]:
     return {int(token) for token in re.findall(r"\b\d+\b", norm)}
 
 
+# A word MusicBrainz printed with masked letters: 'fuXX' (letters, then an 'XX' run) or
+# 'f**k' (asterisks between letters). A trailing 'star*' is decoration, not a mask.
+_MASKED_WORD_RE = re.compile(r"^(?:([a-z]+)(X{2,})([a-z]*)|([a-z]+)(\*+)([a-z]+))$")
+# A masked title is never exact: outside its release's folder it needs its position too.
+_MASKED_TITLE_SCORE = 0.95
+
+
+@lru_cache(maxsize=4096)
+def _masked_title_pattern(expected_title: str) -> Optional["re.Pattern[str]"]:
+    """
+    'my fuXX Sound' as a pattern for normalized titles in which each masked letter is any
+    letter ('my fuck sound'), or None when the title masks no word. An all-'X' word
+    ('[XXXXXX]') is not a mask.
+    """
+    words = unicodedata.normalize("NFC", str(expected_title or "")).split()
+    parts, masked = [], False
+    for word in words:
+        match = _MASKED_WORD_RE.match(word.strip(".,!?\"'"))
+        if match:
+            before, mask, after = (match.group(1, 2, 3) if match.group(1) else match.group(4, 5, 6))
+            masked = True
+            parts.append(re.escape(before) + f"[a-z]{{{len(mask)}}}" + re.escape((after or "").lower()))
+        else:
+            norm = normalize_text(word)
+            if norm:
+                parts.append(r"\s+".join(re.escape(piece) for piece in norm.split()))
+    return re.compile(r"\s+".join(parts)) if masked and parts else None
+
+
+def _masked_title_matches(expected_title: str, remote: str, is_filename: bool) -> bool:
+    pattern = _masked_title_pattern(expected_title)
+    if pattern is None:
+        return False
+    return any(pattern.fullmatch(normalize_text(variant)) for variant in title_variants(remote, is_filename=is_filename))
+
+
+def _lone_descriptor_title_matches(expected_title: str, filename: str) -> bool:
+    """
+    A song called 'HD', 'Live' or 'Edit' in 'kyou1110 - Hd.flac' or '05 Live.mp3'. Filename
+    parsing reads such a last part as a version of the name before it ('kyou1110 (Hd)'), so
+    only the whole last part of a name with at most one part before it (the artist) is compared.
+    """
+    expected = _canonical_title(unicodedata.normalize("NFC", str(expected_title or "")).strip())
+    if not expected or not _is_descriptor(expected):
+        return False
+    stem = _strip_audio_extension(unicodedata.normalize("NFC", str(filename or "")).strip())
+    parts = _split_outside_brackets(_strip_track_token(_DASH_RE.sub("-", stem))[0])
+    if not parts or len(parts) > 2:
+        return False
+    return normalize_text(_strip_track_token(parts[-1])[0]) == normalize_text(expected)
+
+
 @lru_cache(maxsize=65536)
 def title_match_score(expected_title: str, remote: str, is_filename: bool = True) -> float:
     """
@@ -909,8 +983,18 @@ def title_match_score(expected_title: str, remote: str, is_filename: bool = True
     filename or title, over title_variants of both. 0.0 when no pair has compatible versions,
     or when a remote reading carries numbers the expected title lacks and no reading carries
     exactly its numbers ('3 Year Coma' for '4 Year Coma'). An unbracketed 'Gunshotta Lone Remix'
-    matches 'Gunshotta (Lone remix)'.
+    matches 'Gunshotta (Lone remix)'. A masked title ('my fuXX Sound') scores 0.95 against
+    the spelled-out one.
     """
+    score = _title_similarity(expected_title, remote, is_filename)
+    if score < _MASKED_TITLE_SCORE and _masked_title_matches(expected_title, remote, is_filename):
+        return _MASKED_TITLE_SCORE
+    return score
+
+
+def _title_similarity(expected_title: str, remote: str, is_filename: bool) -> float:
+    if is_filename and _lone_descriptor_title_matches(expected_title, remote):
+        return 1.0
     expected = [parse_track_title_structure(v, is_filename=False)
                 for v in title_variants(expected_title, is_filename=False)]
     remote_parsed = [parse_track_title_structure(v, is_filename=False)

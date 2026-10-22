@@ -30,6 +30,7 @@ from discogseek.core.text import (
     primary_artist,
     split_artist_credit,
     title_match_score,
+    title_variants,
 )
 from discogseek.core.submissions import SubmissionLog, row_identity, submission_source
 from discogseek.core.transfers import DownloadHistory, resolve_downloads_dir, source_key, transfer_states
@@ -95,14 +96,19 @@ _MIXED_RELEASE_FOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 # A requested release or track that is itself a mix, a live recording or a radio session
-# comes from such folders.
+# comes from such folders. Only a date may run into the word: 'Kyou1110 2011/12/11Live at
+# Fukuoka' is a live set, 'Born2Live' is not.
+_MIXED_WORD_START = r"(?:(?<![a-z0-9])|(?<=\d[/.,-]\d\d)|(?<=\d[/.,-]\d))"
 _MIXED_TITLE_RE = re.compile(
-    r"(?<![a-z0-9])(?:mix(?:es|ed|tapes?)?|radio|live|dj|sessions?|podcasts?|concert|broadcast|somafm|playlists?|"
+    _MIXED_WORD_START
+    + r"(?:mix(?:es|ed|tapes?)?|radio|live|dj|sessions?|podcasts?|concert|broadcast|somafm|playlists?|"
     r"boiler\s+room)"
     r"(?![a-z0-9])",
     re.IGNORECASE,
 )
-_MIXED_TRACK_TITLE_RE = re.compile(r"(?<![a-z0-9])(?:live|sessions?|mixed|dj\s?-?\s?mix)(?![a-z0-9])", re.IGNORECASE)
+_MIXED_TRACK_TITLE_RE = re.compile(
+    _MIXED_WORD_START + r"(?:live|sessions?|mixed|dj\s?-?\s?mix)(?![a-z0-9])", re.IGNORECASE,
+)
 # The unmixed edition of a mix compilation ('Balance 020 (Mixed By Deetron) [Un-Mixed Version]')
 # holds the full tracks.
 _UNMIXED_RE = re.compile(r"(?<![a-z0-9])(?:un|non)\s?-?\s?mixed(?![a-z0-9])", re.IGNORECASE)
@@ -111,6 +117,19 @@ _GENERIC_TITLE_RE = re.compile(
     r"^(?:intro|outro|interlude|prelude|untitled|skit|intermission|segue|hidden track|bonus track|silence)"
     r"(?: (?:no |number |part |pt )?(?:\d{1,3}|[ivx]{1,4}))?$"
 )
+
+
+# A bracketed part of a title, such as the credit note in 'Way Back More Back Mix (Kyou1110)'.
+_CREDIT_NOTE_RE = re.compile(r"\s*[\(\[]([^\(\)\[\]]+)[\)\]]")
+
+
+def _without_credit_note(credit: str) -> str:
+    """
+    'kyou1110 (Ghost:ねえ、お願い事があるの)' -> 'kyou1110': peers never name such a note. Only a
+    bracket with a colon is a note; 'ARM (IOSYS)' names the circle peers file it under.
+    """
+    text = re.sub(r"[\(\[\{][^\)\]\}]*[:：][^\)\]\}]*[\)\]\}]", " ", credit or "")
+    return re.sub(r"\s+", " ", text).strip() or (credit or "").strip()
 
 
 def _search_key(query: str) -> str:
@@ -442,11 +461,71 @@ def download_missing_tracks(
     known_tracks = [dict(track) for track in (official_tracks or complete_release_tracks or missing_tracks)]
     known_index = {track_key(track): index for index, track in enumerate(known_tracks)}
 
+    def remix_reading(track: Dict[str, Any], basename: str) -> bool:
+        """
+        On a remix single, MusicBrainz titles a remix like the original ('双頭の零', credited
+        to kyou1110) where peers write '双頭の零 (kyou1110 Remix)'. A row of the release's own
+        title credited to another artist than the release's is read as exactly that
+        remixer's remix: not a VIP, a joint remix or anyone else's.
+        """
+        if is_va or not release_artist:
+            return False
+        credit = _without_credit_note(track.get("artist") or "")
+        if not credit or is_various_artists(credit) or artist_credit_matches(credit, release_artist, other_names(track)):
+            return False
+        titles = expected_titles(track)
+        if (not any(normalize_text(title) == normalize_text(release_title) for title in titles)
+                or parse_track_title_structure(titles[0], is_filename=False)["version_type"]):
+            return False
+        bases = {parse_track_title_structure(title, is_filename=False)["base_norm"] for title in titles}
+        versions = {
+            normalize_text(f"{remixer} remix").replace(" ", "")
+            for remixer in [primary_artist(credit), *map(primary_artist, other_names(track)[:1])] if remixer
+        }
+        for reading in title_variants(basename):
+            parsed = parse_track_title_structure(reading, is_filename=False)
+            if (parsed["version_type"] == "remix" and parsed["base_norm"] in bases
+                    and (parsed["version_text"] or "").replace(" ", "") in versions):
+                return True
+        return False
+
+    expected_titles_seen: Dict[Tuple[Any, ...], List[str]] = {}
+
     def expected_titles(track: Dict[str, Any]) -> List[str]:
+        alternates = track.get("alt_titles")
+        key = (
+            track.get("title") or "", tuple(alternates) if isinstance(alternates, (list, tuple)) else (),
+            track.get("artist") or "", tuple(track.get("artist_names") or ()),
+        )
+        if key not in expected_titles_seen:
+            expected_titles_seen[key] = row_titles(track)
+        return list(expected_titles_seen[key])
+
+    def row_titles(track: Dict[str, Any]) -> List[str]:
         titles = [track.get("title") or ""]
         alternates = track.get("alt_titles")
         if isinstance(alternates, (list, tuple)):
             titles.extend(str(title) for title in alternates if title)
+        # 'Way Back More Back Mix (Kyou1110)': a bracket that only names the row's own
+        # artist is a credit note, which peers' filenames leave out. A version ('(Live)'
+        # by the band Live) or a guest stays.
+        credit = _without_credit_note(track.get("artist") or "")
+        names = {
+            normalize_text(name) for name in [primary_artist(credit), *(track.get("artist_names") or ())]
+            if name and not is_various_artists(name)
+        }
+        names.discard("")
+
+        def without_note(match: "re.Match[str]") -> str:
+            content = match.group(1)
+            if normalize_text(content) not in names or parse_track_title_structure(
+                f"Title ({content})", is_filename=False,
+            )["version_type"]:
+                return match.group(0)
+            return " "
+
+        if names:
+            titles += [re.sub(r"\s+", " ", _CREDIT_NOTE_RE.sub(without_note, title)).strip() for title in list(titles)]
         unique = []
         for title in titles:
             if title.strip() and normalize_text(title) not in {normalize_text(item) for item in unique}:
@@ -643,6 +722,18 @@ def download_missing_tracks(
         own = known_index.get(track_key(track))
         return len(directory_hits(user, filename) - {own}) >= 2
 
+    def other_names(track: Dict[str, Any]) -> List[str]:
+        """Other names of the row's credited artist ('kyou1110' for a 'Kyou' credit), main name first."""
+        return [name.strip() for name in track.get("artist_names") or () if name and name.strip()]
+
+    def main_name_query_artist(track: Dict[str, Any]) -> str:
+        """The artist's main name when the row's credit spells it otherwise ('Kyou'), for searches."""
+        names = other_names(track)
+        credit = (track.get("artist") or "").strip()
+        if not names or not credit or artist_credit_matches(names[0], credit) or not clean_search_phrase(names[0]):
+            return ""
+        return primary_artist(names[0])
+
     def credited_names(track: Dict[str, Any]) -> List[str]:
         """Names whose presence is artist evidence for the row."""
         credit = (track.get("artist") or "").strip()
@@ -650,8 +741,60 @@ def download_missing_tracks(
             names = [credit]
             if release_artist and artist_credit_matches(credit, release_artist):
                 names.append(release_artist)
-            return names
-        return [release_artist] if release_artist else []
+            return names + other_names(track)
+        return ([release_artist] if release_artist else []) + other_names(track)
+
+    def title_first_basename(track: Dict[str, Any], basename: str) -> str:
+        """
+        '7 - Title - Artist.mp3' as '7 - Title.mp3' when its last part is exactly a credited
+        name; 'Title - sabi_c Remix' keeps its version.
+        """
+        stem = _audio_stem(basename)
+        segments = _filename_segments(stem)
+        names = {
+            norm for name in credited_names(track)
+            for norm in (normalize_text(name), *split_artist_credit(name)) if norm
+        }
+        if len(segments) < 2 or normalize_text(segments[-1]) not in names:
+            return ""
+        return " - ".join(segments[:-1]) + basename[len(stem):]
+
+    def separated_basename(track: Dict[str, Any], basename: str) -> str:
+        """
+        '04_kyou1110_Izumikami.mp3' as '04 - kyou1110 - Izumikami.mp3': underscores are its
+        only separators, and the words after the position spell a credited artist.
+        """
+        stem = _audio_stem(basename)
+        if "_" not in stem or re.search(r"\s-+\s", stem):
+            return ""
+        words = re.sub(r"\s+", " ", stem.replace("_", " ")).strip().split(" ")
+        position = words.pop(0) if words and re.fullmatch(r"\d{1,3}", words[0]) else ""
+        names = {normalize_text(name).replace(" ", "") for name in credited_names(track)}
+        names.discard("")
+        # The longest run of leading words that is a credited name, leaving a title.
+        for end in range(len(words) - 1, 0, -1):
+            if normalize_text(" ".join(words[:end])).replace(" ", "") in names:
+                parts = [position] if position else []
+                return " - ".join(parts + [" ".join(words[:end]), " ".join(words[end:])]) + basename[len(stem):]
+        return ""
+
+    def release_note_basename(basename: str) -> str:
+        """'01. FBD [MW.-Mosaic World-].mp3' as '01. FBD.mp3': a bracket that names this release."""
+        stripped = _BRACKET_GROUP_RE.sub(
+            lambda match: " " if names_release(match.group(0)[1:-1]) else match.group(0), basename,
+        )
+        stripped = re.sub(r"\s+(?=\.[^.\s]+$)", "", re.sub(r"\s+", " ", stripped)).strip()
+        return stripped if stripped != basename and _audio_stem(stripped).strip(" .-") else ""
+
+    def exact_reading(track: Dict[str, Any], basename: str) -> bool:
+        """Whether the filename, or its underscore or title-first reading, has the exact title."""
+        titles = expected_titles(track)
+        if max(title_match_score(title, basename) for title in titles) >= _EXACT:
+            return True
+        return any(
+            max(title_match_score(title, name) for title in titles) >= _EXACT
+            for name in (separated_basename(track, basename), title_first_basename(track, basename)) if name
+        )
 
     def remote_structure(track: Dict[str, Any], stem: str) -> Tuple[List[str], List[str], Optional[str], bool]:
         """
@@ -839,7 +982,29 @@ def download_missing_tracks(
             return None
         titles = expected_titles(track)
         score = max(title_match_score(title, basename) for title in titles)
-        if score < (0.80 if individual else 0.85):
+        threshold = 0.80 if individual else 0.85
+        trailing_credit = False
+        if score < threshold:
+            # '01. FBD [MW.-Mosaic World-].mp3': SoundCloud rips add the release to the title.
+            unnoted = release_note_basename(basename)
+            unnoted_score = max(title_match_score(title, unnoted) for title in titles) if unnoted else 0.0
+            if unnoted_score >= threshold:
+                score, basename = unnoted_score, unnoted
+        if score < threshold:
+            # '04_kyou1110_Izumikami.mp3': the credited artist is a part of its own.
+            separated = separated_basename(track, basename)
+            separated_score = max(title_match_score(title, separated) for title in titles) if separated else 0.0
+            if separated_score >= threshold:
+                score, basename = separated_score, separated
+        if score < threshold:
+            # '7 - KounagiHisyouKa (CM Mix) - Kyou1110.mp3': the credited artist follows the title.
+            reordered = title_first_basename(track, basename)
+            reordered_score = max(title_match_score(title, reordered) for title in titles) if reordered else 0.0
+            if reordered_score >= threshold:
+                score, basename, trailing_credit = reordered_score, reordered, True
+        if score < threshold and remix_reading(track, basename):
+            score = 1.0
+        if score < threshold:
             return None
         stem = _audio_stem(basename)
         album_parts, artist_parts, token, names_release_in_name = remote_structure(track, stem)
@@ -847,7 +1012,7 @@ def download_missing_tracks(
         # A filename or tag that names another artist rules the file out.
         credit = (track.get("artist") or "").strip()
         known_credit = credit and not is_various_artists(credit) and credit.lower() != "unknown artist"
-        allowed = [name for name in ([credit] if known_credit else []) + [release_artist] if name]
+        allowed = [name for name in ([credit] if known_credit else []) + other_names(track) + [release_artist] if name]
         version_text = parse_track_title_structure(titles[0], is_filename=False)["version_text"] or ""
         version_text = version_text.replace(" ", "")
         tagged = (file.get("artist") or "").strip()
@@ -927,7 +1092,7 @@ def download_missing_tracks(
             # A live transfer in the release's folder at this position is what a search
             # chose on that evidence; a finished one may be another artist's album.
             live = "Succeeded" not in transfer_states(file)
-            evidence = (named_context and (is_va or not strict_names or (live and same_position))) or any(
+            evidence = trailing_credit or (named_context and (is_va or not strict_names or (live and same_position))) or any(
                 re.search(r"(?<!\w)" + re.escape(norm) + r"(?!\w)", folder_words)
                 or normalize_text(tagged) == norm
                 or any(norm in split_artist_credit(part) or normalize_text(part) == norm
@@ -948,7 +1113,8 @@ def download_missing_tracks(
             named_context and not require_artist and not title_is_release
             and (same_position or not generic_release)
         )
-        if not (artist_evidence or duration_match or folder_evidence or corroborated(track, user, filename)):
+        if not (artist_evidence or trailing_credit or duration_match or folder_evidence
+                or corroborated(track, user, filename)):
             return None
         return _Match(score, context, named_context, same_position, duration_match)
 
@@ -1293,9 +1459,7 @@ def download_missing_tracks(
         for track in complete_release_tracks if complete_release_tracks is not None else remaining_tracks():
             candidates = track_candidates(candidate_index, track)
             for candidate in sorted(candidates, key=lambda item: candidate_rank(item.user, item.raw_file)):
-                if complete_release_tracks is not None and max(
-                    title_match_score(title, candidate.base_filename) for title in expected_titles(track)
-                ) < _EXACT:
+                if complete_release_tracks is not None and not exact_reading(track, candidate.base_filename):
                     continue
                 directory = (candidate.user, candidate.dir_name)
                 matches = matches_by_directory.setdefault(directory, {})
@@ -1466,7 +1630,7 @@ def download_missing_tracks(
         if not clean_search_phrase(title):
             # A symbol-only title ('★') would search for the artist alone.
             return []
-        credit = (track.get("artist") or "").strip()
+        credit = _without_credit_note(track.get("artist") or "")
         known_artist = credit and not is_various_artists(credit) and credit.lower() != "unknown artist"
         # Peers name the primary artist; 'feat.' guests and joint credits narrow results.
         if known_artist:
@@ -1474,8 +1638,13 @@ def download_missing_tracks(
         else:
             query_artist = "Various Artists" if is_va else primary_artist(artist)
         separator = " " if search_scope == "track" else " - "
-        queries = [
-            f"{query_artist}{separator}{title}".strip(),
+        queries = [f"{query_artist}{separator}{title}".strip()]
+        # Peers file a 'Kyou' credit under the artist's main name ('kyou1110'), which
+        # Soulseek's whole-word search never finds from the credited spelling.
+        alternate = main_name_query_artist(track)
+        if alternate:
+            queries.append(clean_search_phrase(f"{alternate} {title}"))
+        queries += [
             clean_search_phrase(f"{query_artist} {title}"),
             fold_search_phrase(f"{query_artist} {title}"),
         ]
@@ -1496,27 +1665,31 @@ def download_missing_tracks(
         Peers match whole words inconsistently ('Sepalcure Lose' finds "All You've Got
         To Lose.mp3" where the full title does not). For a compilation or guest track
         the title searches missed, try the artist with the title's most distinctive
-        words, then the artist alone. An album's own artist was already searched with
-        the album, and MusicBrainz placeholder credits ('[unknown]') name nobody.
+        words, then the artist alone, and the same with the artist's main name when the
+        credit spells it otherwise ('Kyou' for kyou1110). An album's own artist was already
+        searched with the album, and MusicBrainz placeholder credits ('[unknown]') name nobody.
         """
         credit = (track.get("artist") or "").strip()
         if (not credit or is_various_artists(credit) or credit.lower() == "unknown artist"
                 or re.fullmatch(r"\[[^\]]+\]", credit)):
             return []
-        query_artist = primary_artist(credit)
-        if not is_va and normalize_text(query_artist) == normalize_text(primary_artist(artist)):
-            return []
-        if len(normalize_text(query_artist).replace(" ", "")) < 4 or not clean_search_phrase(query_artist):
-            return []
+        query_artist = primary_artist(_without_credit_note(credit))
+        # The credited spelling, then the artist's main name when peers may use that instead.
+        names = [query_artist] + [name for name in [main_name_query_artist(track)] if name]
         title = track.get("title", "")
         core = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*", " ", title).strip() or title
         words = [word for word in clean_search_phrase(core).split()
                  if len(word) >= 4 and word.isalpha() and normalize_text(word) not in DIR_STOP_WORDS]
         distinctive = sorted(words, key=len, reverse=True)[:2]
         queries = []
-        if distinctive:
-            queries.append(clean_search_phrase(f"{query_artist} {' '.join(w for w in words if w in distinctive)}"))
-        queries.append(clean_search_phrase(query_artist))
+        for name in names:
+            if not is_va and normalize_text(name) == normalize_text(primary_artist(artist)):
+                continue
+            if len(normalize_text(name).replace(" ", "")) < 4 or not clean_search_phrase(name):
+                continue
+            if distinctive:
+                queries.append(clean_search_phrase(f"{name} {' '.join(w for w in words if w in distinctive)}"))
+            queries.append(clean_search_phrase(name))
         return unique_queries(queries)
 
     def search_tracks(fallback: bool = False) -> None:

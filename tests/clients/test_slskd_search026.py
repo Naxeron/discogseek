@@ -461,3 +461,49 @@ def test_search_settings_can_be_overridden_from_the_environment(monkeypatch):
     assert _env_number("DISCOGSEEK_SEARCH_REUSE_MINUTES", 60, minimum=0.0) == 0
     monkeypatch.setenv("DISCOGSEEK_EMPTY_SEARCH_REUSE_MINUTES", "0")
     assert _env_number("DISCOGSEEK_EMPTY_SEARCH_REUSE_MINUTES", 15, minimum=0.0) == 0
+
+
+@pytest.mark.parametrize("method", ["search", "batch_search"])
+def test_dashes_at_word_edges_are_not_sent_as_exclusions(slskd, method):
+    # Soulseek reads '-十八時の音楽浴-' as 'exclude 十八時の音楽浴': the search found nothing.
+    client, fake = slskd
+    folder = "music\\_Compilations\\2016-09 - SHIFT THE CORE ANOTHER -十八時の音楽浴- [STCD-0010]"
+    fake.plan_search("SHIFT THE CORE ANOTHER 十八時の音楽浴", [peer("sprite9421", f"{folder}\\08 kyou1110.flac")])
+
+    result = run(client, method, "SHIFT THE CORE ANOTHER -十八時の音楽浴-", timeout=30)
+
+    assert posts(fake) == ["SHIFT THE CORE ANOTHER 十八時の音楽浴"]
+    assert len(result["responses"]) == 1
+
+
+def test_inner_dashes_stay_in_the_search_text(slskd):
+    client, fake = slskd
+
+    client.search("Jay-Z Tek-no-Logik - Re:-vive", timeout=30)
+
+    assert posts(fake) == ["Jay-Z Tek-no-Logik - Re:-vive"]
+
+
+@pytest.mark.parametrize("method", ["search", "batch_search"])
+def test_an_earlier_search_with_an_exclusion_is_not_reused(slskd, method):
+    # Stored exactly as sent, its exclusion found nothing; without the dash it reads the same.
+    client, fake = slskd
+    folder = "music\\_Compilations\\2016-09 - SHIFT THE CORE ANOTHER -十八時の音楽浴- [STCD-0010]"
+    fake.add_history("SHIFT THE CORE ANOTHER -十八時の音楽浴-", age=60.0)
+    fake.plan_search("SHIFT THE CORE ANOTHER 十八時の音楽浴", [peer("sprite9421", f"{folder}\\08 kyou1110.flac")])
+
+    result = run(client, method, "SHIFT THE CORE ANOTHER -十八時の音楽浴-", timeout=30)
+
+    assert posts(fake) == ["SHIFT THE CORE ANOTHER 十八時の音楽浴"]
+    assert len(result["responses"]) == 1
+
+
+def test_queries_that_differ_only_in_case_or_edge_dashes_are_searched_once(slskd):
+    client, fake = slskd
+    fake.plan_search("One Invitation Red Side", [peer("metabalvin", "MUSIC\\One Invitation -Red Side-\\13. Kyou - Goddamnation.mp3")])
+
+    results = client.batch_search(["One Invitation -Red Side-", "one invitation Red Side"], timeout=30)
+
+    assert posts(fake) == ["One Invitation Red Side"]
+    assert len(results["One Invitation -Red Side-"]["responses"]) == 1
+    assert len(results["one invitation Red Side"]["responses"]) == 1

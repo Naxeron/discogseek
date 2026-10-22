@@ -715,6 +715,14 @@ class SlskdArtistScraper:
 
         logging.getLogger(__name__).info(f"✔ Library Status: {len(found_items)} artist tracks / {len(self.local_found_releases)} releases already in library.")
 
+    def _artist_names(self) -> List[str]:
+        """The artist's main name, then its aliases: names peers may file its songs under."""
+        names: Dict[str, str] = {}
+        for name in [self.catalog.name, *sorted(self.catalog.aliases)]:
+            if name and normalize_text(name):
+                names.setdefault(normalize_text(name), name)
+        return list(names.values())
+
     def _credits_other_artist(self, credit_list: Any, aliases: Set[str]) -> bool:
         """Whether a track's MusicBrainz credit leaves out this artist."""
         if not credit_list:
@@ -845,7 +853,12 @@ class SlskdArtistScraper:
         # A dry run queues nothing: the songs found folders and files would queue
         # count as queued, so it plans the same searches as a real run.
         planned = self.covered_song_keys if self.dry_run else set()
+        names = self._artist_names()
         for audit in self.full_release_audits:
+            for track in audit.get("tracks", []):
+                if track.get("mb_track_id") in audit["artist_track_ids"]:
+                    # Credited as 'Kyou', the song may still be filed under 'kyou1110'.
+                    track["artist_names"] = names
             missing = [track for track in audit.get("tracks", []) if track.get("status") == "missing"]
             if not missing:
                 continue

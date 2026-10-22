@@ -109,6 +109,16 @@ def _any_files(rows: List[Dict[str, Any]]) -> bool:
     return any((row.get("fileCount") or 0) > 0 for row in rows)
 
 
+def search_text(query: str) -> str:
+    """
+    The text slskd is asked to search for. Soulseek reads a word starting with '-' as an
+    excluded term, so 'SHIFT THE CORE ANOTHER -十八時の音楽浴-' would drop exactly the
+    folders it names. Dashes at the edges of words are removed; inner ones ('Jay-Z') and
+    a lone ' - ' separator, which peers ignore, are kept.
+    """
+    return " ".join(word.strip("-") or word for word in str(query or "").split())
+
+
 def _search_hard_cap(timeout: float) -> float:
     return max(float(timeout or 0.0), SEARCH_MIN_WAIT) + SEARCH_GRACE_PERIOD
 
@@ -428,7 +438,7 @@ class SlskdClient:
     def _start_search(self, query: str) -> Dict[str, Any]:
         # slskd rejects overlapping POSTs, even though searches run concurrently.
         body = {
-            "searchText": query,
+            "searchText": search_text(query),
             "searchTimeout": SEARCH_TIMEOUT_MS,
             "responseLimit": SEARCH_RESPONSE_LIMIT,
             "fileLimit": SEARCH_FILE_LIMIT,
@@ -481,12 +491,13 @@ class SlskdClient:
         restart) and return no responses; both lists are ordered newest first.
         """
         now = time.time()
-        text = query.strip().lower()
+        text = search_text(query).lower()
         reusable: List[Tuple[float, Dict[str, Any]]] = []
         running: List[Tuple[float, Dict[str, Any]]] = []
         abandoned: List[Dict[str, Any]] = []
         for row in rows:
-            if not row.get("id") or str(row.get("searchText") or "").strip().lower() != text:
+            # A row stored with an exclusion ('-Red') searched for something else.
+            if not row.get("id") or " ".join(str(row.get("searchText") or "").split()).lower() != text:
                 continue
             started = _parse_timestamp(row.get("startedAt"))
             if _search_complete(row):
@@ -678,6 +689,11 @@ class SlskdClient:
         clean_queries = list(dict.fromkeys(q.strip() for q in queries if q and q.strip()))
         if not clean_queries:
             return {}
+        # Queries that differ only in case or edge dashes are one Soulseek search.
+        same_text: Dict[str, List[str]] = {}
+        for query in clean_queries:
+            same_text.setdefault(search_text(query).lower(), []).append(query)
+        clean_queries = [group[0] for group in same_text.values()]
 
         results: Dict[str, Dict[str, Any]] = {}
         cached_query_ids: Dict[str, List[str]] = {}
@@ -720,7 +736,7 @@ class SlskdClient:
                     running_searches[query] = (row["id"], time.time() - age)
                 if not reusable and not running:
                     for row in history:
-                        if (str(row.get("searchText") or "").strip().lower() == query.lower()
+                        if (" ".join(str(row.get("searchText") or "").split()).lower() == search_text(query).lower()
                                 and row.get("id") and _search_complete(row) and not row.get("fileCount")):
                             try:
                                 self.delete_search(row["id"])
@@ -802,6 +818,10 @@ class SlskdClient:
                     else:
                         _complete(query, "completed")
 
+        for group in same_text.values():
+            for query in group[1:]:
+                if group[0] in results:
+                    results[query] = results[group[0]]
         return results
 
     def get_search_results(self, search_id: str) -> Dict[str, Any]:
