@@ -60,3 +60,38 @@ def test_cached_rows_that_lost_stream_info_are_reread_once(tmp_path, version, du
     cache.store_audio_metadata_batch([AudioMetadata(path=path, title="Beta", track_number="2")])
     cached = cache.get_audio_metadata(path)
     assert cached is not None and cached.extractor_version == AUDIO_EXTRACTOR_VERSION
+
+
+def test_untagged_name_with_underscore_fields_takes_the_title_after_its_position(tmp_path):
+    folder = tmp_path / "Alternative Novo-Dub, Volume 2 - Clash and Diversion"
+    folder.mkdir()
+    path = untagged_flac(folder / "Various Artists_Alternative Novo-Dub, Volume 2 - Clash and Diversion_04_2 Thinghs Before You Leave.flac", 400.0)
+
+    assert AudioQualityAnalyzer.analyze_file(path).title == "2 Thinghs Before You Leave"
+
+
+@pytest.mark.parametrize("name, reread", [
+    ("Various Artists_Some Album - Part_04_Some Title.flac", True),
+    ("04_artist_some_title.flac", False),
+    ("04 - Some Title.flac", False),
+])
+def test_rows_of_names_with_underscore_fields_are_reread_once(tmp_path, name, reread):
+    path = tmp_path / name
+    path.write_bytes(b"audio")
+    cache = UnifiedCacheManager(tmp_path / "cache.db")
+    cache.store_audio_metadata_batch([AudioMetadata(
+        path=path, title="Some Title", track_number="4", duration=200.0, extractor_version=3,
+    )])
+
+    assert (cache.get_audio_metadata(path) is None) is reread
+
+    # Re-read once: the row the current extractor stores is served from then on.
+    cache.store_audio_metadata_batch([AudioMetadata(path=path, title="Some Title", track_number="4", duration=200.0)])
+    assert cache.get_audio_metadata(path) is not None
+
+
+def test_untagged_template_name_keeps_its_title(tmp_path):
+    path = untagged_flac(tmp_path / "Rotator_-_Ole Olew Junkyard_-_03_-_Gabba Track.flac", 200.0)
+
+    assert AudioQualityAnalyzer.analyze_file(path).title == "Gabba Track"
+

@@ -620,6 +620,36 @@ def _title_part_variants(parts: List[str], scene: bool, alternatives: bool = Fal
     return [v for v in variants if not (_BARE_DESCRIPTOR_RE.fullmatch(v) or _is_noise_content(v, ""))]
 
 
+# The last '_NN_' of a name that also has spaces: there underscores separate fields.
+_UNDERSCORE_POSITION_RE = re.compile(r"(?<=_)(\d{1,3})_(?=[^_\s])")
+
+
+def underscore_position_field(stem: str) -> str:
+    """
+    'Various Artists_Album, Volume 2 - Part_01_Title' as 'Various Artists - Album, Volume 2 -
+    Part - 01 - Title'. A name with spaces uses underscores to separate its fields: the last
+    underscore-delimited number is the position, and before it an underscore between two
+    words separates fields ('Vol_2' stays one). Names without spaces ('05_lone_big_world',
+    'Rotator_-_HXC_Militia_320') write spaces as underscores and stay as they are.
+    """
+    if not re.search(r"\s", stem) or re.search(r"_+-_+", stem):
+        # Spaces written as underscores, or an 'Artist_-_Album_-_NN_-_Title' template.
+        return stem
+    matches = list(_UNDERSCORE_POSITION_RE.finditer(stem))
+    if not matches:
+        return stem
+    last = matches[-1]
+    head = stem[:last.start() - 1]
+    # The position closes a field that has spaces ('… Diversion_01_Duboratory's Theme') after an
+    # 'Artist_Album' boundary: 'Squarepusher - Iambic_9_Poetry' and 'Studio_54_Nights' are titles.
+    field = re.split(r"\s+-+\s+", stem)
+    field = next((part for part in reversed(field) if last.group(0) in part), "")
+    if "_" not in head or not re.search(r"\s", field):
+        return stem
+    head = re.sub(r"(?<=[^\W\d_])_(?=[^\W\d_])", " - ", head)
+    return f"{head} - {last.group(1)} - {stem[last.end():]}"
+
+
 @lru_cache(maxsize=65536)
 def _filename_title_variants(
     stem: str, keep_ambiguous: bool = False, primary_only: bool = False,
@@ -640,6 +670,7 @@ def _filename_title_variants(
             variants += _title_part_variants(segments + [group], scene=True, alternatives=True)
         return tuple(_canonical_title(v) for v in variants), False
 
+    text = underscore_position_field(text)
     text = re.sub(r"\s+_\s+|_+-_+", " - ", text)
     text = re.sub(r"\s+", " ", text.replace("_", " ")).strip()
     tail = _TECH_TAIL_RE.search(text)
@@ -735,7 +766,26 @@ def title_variants(title: str, is_filename: bool = True) -> Tuple[str, ...]:
     inner = _strip_audio_extension(stem)
     if inner != stem:
         candidates += _filename_title_variants(inner)[0]
+    # Alternatives an uploader's additions hide: a leading release date ('20120615. No
+    # Surrenda !') and a scene bitrate tail ('Rotator_-_HXC_Militia_320', '…_320_pn').
+    for pattern in (_DATE_PREFIX_RE, _BITRATE_SUFFIX_RE):
+        bare = pattern.sub("", stem, count=1).strip()
+        if bare != stem and _has_title_content(bare):
+            candidates += _filename_title_variants(bare)[0]
+    # ... and an unbracketed 'Free Download !!!' after the title.
+    candidates += [
+        bare for bare in (_FREE_DOWNLOAD_RE.sub("", candidate).strip(" -") for candidate in candidates)
+        if bare and _has_title_content(bare)
+    ]
     return _dedupe_titles(candidates)
+
+
+# A release date before the title: '20120615. No Surrenda !', '2012-06-15 - Title'.
+_DATE_PREFIX_RE = re.compile(r"^(?:19|20)\d{2}(?:[-.]?)(?:0[1-9]|1[0-2])(?:[-.]?)(?:0[1-9]|[12]\d|3[01])(?:\s*[-.]\s*|\s+)(?=\S)")
+# A scene name's bitrate tail: '_320', '_320_pn'.
+_BITRATE_SUFFIX_RE = re.compile(r"_(?:128|160|192|224|256|320)(?:_pn)?$", re.IGNORECASE)
+# An uploader's unbracketed note after the title.
+_FREE_DOWNLOAD_RE = re.compile(r"\s+[-–]?\s*free\s*(?:download|dl)\b[\s!.\-]*$", re.IGNORECASE)
 
 
 @lru_cache(maxsize=65536)

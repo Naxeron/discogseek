@@ -154,6 +154,8 @@ class LibraryReleaseService:
         search_cache: Optional[Dict[str, Dict[str, Any]]] = None,
         use_existing: bool = True,
         downloads_dir: Optional[str] = None,
+        accept_source: Optional[Callable[[Dict[str, Any], str, Dict[str, Any]], bool]] = None,
+        release_is_mix: bool = False,
     ) -> Dict[str, Any]:
         """
         Find requested missing tracks, starting with a release or selected-track search.
@@ -161,7 +163,8 @@ class LibraryReleaseService:
         search_cache lets several calls of one run search each query once.
         use_existing=False searches the network again instead of reusing slskd's recent
         searches; downloads_dir (slskd's downloads folder, when already known) saves
-        reading slskd's options.
+        reading slskd's options. accept_source(row, user, file) can refuse a matching file;
+        release_is_mix marks a DJ-mix release.
         """
         optional: Dict[str, Any] = {}
         if official_tracks is not None:
@@ -172,6 +175,10 @@ class LibraryReleaseService:
             optional["use_existing"] = False
         if downloads_dir is not None:
             optional["downloads_dir"] = downloads_dir
+        if accept_source is not None:
+            optional["accept_source"] = accept_source
+        if release_is_mix:
+            optional["release_is_mix"] = True
         return library_download.download_missing_tracks(
             slskd_client=self.slskd_client,
             audit_release=self.audit_release,

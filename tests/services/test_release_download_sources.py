@@ -157,6 +157,8 @@ def test_names_with_radio_or_mix_are_not_mix_folders(artist, release, track, fil
     r"Music\_VA\DJ-KiCKS\2019-11-08 - DJ-KiCKS - Kamaal Williams (Mixed)",
     r"@@vhjrg\Треки\Новое\DRUM\VA-Rollercoaster_(Mixed_By_Drum_Origins)-TRIPLECD003-2002-sour",
     r"MoS Annuals\1998 - The Annual IV Mixed By Judge Jules & Boy George (2-CD) [ANNCD98]\CD2",
+    r"My Music\Drosstik Records\lossless\[DTK01-2] Brick Smack- Mix By DJ C64 [2003] [CD]",
+    r"Music\VA - Late Night Session (Mix By DJ Y)",
     r"@@fmycf\Music\We Are All Astronauts\DJ Mixes and Remixes\2014 - Blue Dot I (DJ Mix)",
     r"shared\Artists\M\Machinedrum\[2014-11-17] Vapor City Archives Mini-Mix",
     r"@@kuukf\Soulseek (2021)\Kerri Chandler Boiler Room",
@@ -181,6 +183,11 @@ def test_mix_and_radio_folders_are_recognised(folder):
     r"Mixes + Compilations\Mixmaster Morris - Hypnotic Highlights",
     r"@@gcqcv\music\++electronica++\va - Sci.Fi.Hi.Fi\Sci-Fi Hi-Fi- 04 - Funk D'Void [SOMA CD064 {UK} CD]",
     r"Music\Danny Daze - BLUE (Remixes)",
+    r"Music\Rotator\Rotator - Ole Olew Junkyard (Remix By Sickboy)",
+    # A remix credit is no DJ mix: 'Mix By' counts only where it opens a field.
+    r"Music\Artist - Song (Club Mix By DJ X) - Single",
+    r"Music\Artist - Title (Re-Mix By Someone) [12inch]",
+    r"Music\Artist - Song (Dub Mix by Mad Professor)",
     r"NTO-EM4\EMLPS\Merck Records NT\[MERCK MIX1] Merck Mix 1 - Spring 2003 (2003)",
     # The unmixed edition of a mix compilation holds the full tracks (seen in the corpus).
     r"@@vohmw\Rips\2011\Deetron-Balance 020 (Mixed By Deetron) [Un-Mixed Version] Un-Mixed Version-(Balance Music)"
@@ -254,3 +261,17 @@ def test_exclusive_title_comes_only_from_the_release_folder():
     assert picks(run(dict(track), album)) == [("peer", album)]
     assert run({**track, "exclusive_title": True}, album)["matched_count"] == 0
     assert picks(run({**track, "exclusive_title": True}, album, single)) == [("peer", single)]
+
+
+@pytest.mark.parametrize("release_is_mix, matched", [(True, 1), (False, 0)])
+def test_a_dj_mix_release_group_takes_tracks_from_mix_folders(release_is_mix, matched):
+    # 'Instructions on How to Draw Godzilla' is a DJ mix only by its MusicBrainz release group.
+    track = {"title": "Last Exit", "artist": "Repeater", "track_number": 5, "duration": 109.0}
+    file = {"filename": r"@@q\!LABELS\!Schematic\[none] Instructions How to Draw Godzilla (Mixed by Baseck) (DJ Mix)"
+                        r"\05 Repeater - Last Exit.mp3", "size": 1000, "length": 110}
+
+    result = download_missing_tracks(client_with([response("deeppeas", file)]), MagicMock(), "Baseck",
+                                     "Instructions on How to Draw Godzilla (Europe Edition)", [track],
+                                     search_scope="track", dry_run=True, release_is_mix=release_is_mix)
+
+    assert result["matched_count"] == matched

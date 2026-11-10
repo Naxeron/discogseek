@@ -26,9 +26,10 @@ from discogseek.core.text import (
 # Version 2: fixed tag precedence (not mutagen's hash-ordered Vorbis keys), MP4
 # 'trkn'/'disk' and MusicBrainz freeform atoms, APEv2 'Track', separate ID3
 # multi-value frames, and track totals. Version 3: stream info (duration, bitrate,
-# sample rate) of files without any tags. See UnifiedCacheManager for which older
-# rows are re-read.
-AUDIO_EXTRACTOR_VERSION = 3
+# sample rate) of files without any tags. Version 4: an untagged file named
+# 'Artist_Album - Part_NN_Title' takes its title after the underscore-delimited position.
+# See UnifiedCacheManager for which older rows are re-read.
+AUDIO_EXTRACTOR_VERSION = 4
 
 
 @dataclass

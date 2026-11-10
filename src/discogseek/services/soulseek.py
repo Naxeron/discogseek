@@ -17,6 +17,7 @@ from discogseek.core.constants import (
 from discogseek.core.text import (
     normalize_text,
     clean_tokens,
+    parse_track_title_structure,
     _tokenize_words_cached,
     artist_credit_matches,
     calculate_similarity,
@@ -35,10 +36,12 @@ from discogseek.clients.slskd import (
 )
 from discogseek.core.peer_policy import peer_key
 from discogseek.core.transfers import DownloadHistory, resolve_downloads_dir, source_key
-from discogseek.clients.musicbrainz import MusicBrainzClient, ArtistCatalog
+from discogseek.clients.musicbrainz import MusicBrainzClient, ArtistCatalog, split_artist_hint
 from discogseek.services.auditor import AuditorService
 from discogseek.services.library import LibraryReleaseService
-from discogseek.services.library_download import _search_key
+from discogseek.services.library_download import (
+    DURATION_CONFLICT_RATIO, DURATION_CONFLICT_SECONDS, DURATION_TOLERANCE, _search_key,
+)
 from discogseek.services.candidates import (
     CandidateDir,
     CandidateFile,
@@ -134,6 +137,26 @@ def _is_release_folder(path: str, release: str, aliases: FrozenSet[str] = frozen
     return len(sides) > 1 and any(
         len("".join(_title_words(side, aliases))) >= 6 and release_context(path, side) for side in sides
     )
+
+
+# Bracket groups of a title: '(Rotator BBB rmx)', '[pencil's Tekno Bootleg]', '（九八式旋回機関銃Remix）'.
+_VERSION_BRACKET_RE = re.compile(r"[(\[（［]([^()\[\]（）［］]+)[)\]）］]")
+# Words that follow a remixer's name in a version credit.
+_VERSION_WORDS = frozenset({
+    "remix", "rmx", "mix", "edit", "bootleg", "boot", "vip", "rework", "refix", "flip", "redux", "dub",
+    "version", "remake", "rerub", "remode", "reshape", "rewerk", "re", "mashup", "cover",
+})
+
+
+def _length_conflicts(expected: Any, length: Any) -> bool:
+    """Whether a file's length clearly differs from the track's (an edit, another mix), as release downloads judge it."""
+    try:
+        expected, length = float(expected), float(length)
+    except (TypeError, ValueError):
+        return False
+    if expected <= 0 or length <= 0:
+        return False
+    return abs(expected - length) > max(DURATION_CONFLICT_SECONDS, DURATION_CONFLICT_RATIO * expected)
 
 
 def _is_generic_title(title: str) -> bool:
@@ -288,8 +311,11 @@ class SlskdArtistScraper:
         search_missing_tracks: bool = True,
     ):
         self.artist_query = artist_query.strip()
-        # An MBID or MusicBrainz URL identifies the artist but is never a Soulseek search phrase.
-        self.search_artist: Optional[str] = None if is_artist_identifier(self.artist_query) else self.artist_query
+        # An MBID or MusicBrainz URL identifies the artist but is never a Soulseek search phrase,
+        # nor is the description that tells namesakes apart ('Repeater (breakcore)').
+        self.search_artist: Optional[str] = (
+            None if is_artist_identifier(self.artist_query) else split_artist_hint(self.artist_query)[0]
+        )
         self.client = slskd_client or SlskdClient()
         self.music_dir = Path(music_dir or Config.DEFAULT_LIBRARY_DIR).resolve() if (music_dir or Config.DEFAULT_LIBRARY_DIR) else None
         self.preferred_format = preferred_format.lower()
@@ -361,6 +387,7 @@ class SlskdArtistScraper:
         self._appearances: Optional[Dict[str, Set[Hashable]]] = None
         self._title_index: Optional[Dict[str, List[Dict[str, Any]]]] = None
         self._release_song_index: Optional[Dict[Tuple[str, ...], Set[Hashable]]] = None
+        self._lengths_by_title: Optional[Dict[str, List[float]]] = None
 
     def run(self) -> Dict[str, Any]:
         """Runs the complete Soulseek discography discovery and queueing pipeline."""
@@ -446,18 +473,21 @@ class SlskdArtistScraper:
         files: List[Dict[str, Any]] = []
         for plan in self._release_plans.values():
             taken: Set[int] = set()
+            # Each file names the release and track it was chosen for.
             for candidate in plan["candidates"]:
                 targets = self._slot_targets(plan, candidate)
                 for file in candidate["all_dir_files"]:
                     slot = targets.get(file.get("filename"))
                     if slot is not None and slot not in taken:
                         taken.add(slot)
-                        files.append({**file, "user": candidate["user"]})
-            for candidates in plan["track_slots"].values():
+                        files.append({**file, "user": candidate["user"], "release": plan["release"],
+                                      "track": plan["slots"][slot]["title"]})
+            for slot, candidates in plan["track_slots"].items():
                 files.append({**candidates[0].raw_file, "filename": candidates[0].full_filename,
-                              "user": candidates[0].user})
+                              "user": candidates[0].user, "release": plan["release"],
+                              "track": plan["slots"][slot]["title"]})
         for item in self.verified_compilation_tracks + self.verified_standalone_tracks:
-            files.append({**item["file"], "user": item["user"]})
+            files.append({**item["file"], "user": item["user"], "track": item.get("track", "")})
         return files
 
     # ------------------------------------------------------------------
@@ -634,6 +664,13 @@ class SlskdArtistScraper:
         )
         for slot in slots.values():
             info = slot["info"] or {}
+            # The numbering edition may have no lengths ('He Who Makes A Beast…' on 12"): another
+            # edition's length of the same song still rules out other edits.
+            slot["duration"] = info.get("duration") or next((
+                edition["positions"][key]["duration"] for edition in editions for track in slot["tracks"]
+                for key in sorted(track.get("track_ids") or ()) + sorted(track.get("recording_ids") or ())
+                if key in edition["positions"] and edition["positions"][key].get("duration")
+            ), None)
             slot["track"] = slot["tracks"][0]
             slot["title"] = info.get("title") or slot["track"].get("title", "")
             slot["position"] = (info["disc_number"], info["track_position"]) if info else None
@@ -829,22 +866,95 @@ class SlskdArtistScraper:
                 "is_va": appearance, "tracks": tracks,
                 "recording_candidates": recording_candidates,
             }, mb_release=metadata)
-            audit["artist_track_ids"] = {
-                track.get("id")
-                for medium in metadata.get("medium-list", [])
-                for track in medium.get("track-list", [])
-                if track.get("id") and any(
-                    isinstance(credit, dict) and credit.get("artist", {}).get("id") == self.catalog.mbid
-                    for credit in (track.get("artist-credit")
-                                   or track.get("recording", {}).get("artist-credit")
-                                   or metadata.get("artist-credit", []))
-                )
+            audit["artist_track_ids"] = self._artist_track_ids(metadata, own_release=not appearance)
+            group = metadata.get("release-group") or {}
+            # A DJ mix ('Instructions on How to Draw Godzilla') takes its tracks from mix folders too.
+            audit["release_is_mix"] = "dj-mix" in {
+                kind.lower() for kind in group.get("secondary-type-list") or group.get("secondary-types") or []
             }
             self.full_release_audits.append(audit)
             logging.getLogger(__name__).info(
                 "Full release: %s — %s found, %s missing", title,
                 audit.get("found_count", 0), audit.get("missing_count", 0),
             )
+
+    def _credits_remixer(self, title: str, names: List[str]) -> bool:
+        """Whether a bracket of the title credits the artist's version: '(Rotator BBB rmx)',
+        "(pencil's Tekno Bootleg)", '(Crazy Funky Rmx by Venetian Snares)'. A short name needs a
+        version word right after it: '(Lone Wolf Remix)' is Lone Wolf's."""
+        groups = [match.group(1) for match in _VERSION_BRACKET_RE.finditer(title or "")]
+        version = parse_track_title_structure(title or "", is_filename=False).get("version_text") or ""
+        for text in [normalize_text(group) for group in groups] + [version]:
+            words = text.split()
+            for name in names:
+                size = len(name.split())
+                if words[:size] == name.split():
+                    rest = words[size:]
+                    if not rest or rest[0] in _VERSION_WORDS or rest[0] == "s" and rest[1:2] and rest[1] in _VERSION_WORDS:
+                        return True
+                    if len(name.replace(" ", "")) >= 6 or size > 1:
+                        return True
+                if len(words) > size and words[-size - 1:] == ["by"] + name.split():
+                    return True
+        return False
+
+    def _artist_track_ids(self, metadata: Dict[str, Any], own_release: bool) -> Set[str]:
+        """Track IDs of a release that are this artist's songs.
+
+        Tracks whose credit names the artist. MusicBrainz credits a remix to the original
+        artist, so on a release credited to this artist a remix bracket naming it
+        ('The Power Has Returned (Rotator BBB rmx)') makes the track this artist's too; a
+        release credited to the artist with no such track ('Eat Drink Fuck (Sick as Fuck
+        remix)' credited to TechDiff) is the artist's in full, unless it is a DJ mix or a
+        compilation the artist curated, whose track credits are other artists' own songs.
+        """
+        tracks = [
+            track for medium in metadata.get("medium-list", [])
+            for track in medium.get("track-list", []) if track.get("id")
+        ]
+        own = {
+            track["id"] for track in tracks if any(
+                isinstance(credit, dict) and credit.get("artist", {}).get("id") == self.catalog.mbid
+                for credit in (track.get("artist-credit")
+                               or track.get("recording", {}).get("artist-credit")
+                               or metadata.get("artist-credit", []))
+            )
+        }
+        if not own_release:
+            return own
+        names = [name for name in {normalize_text(alias) for alias in self.catalog.aliases | {self.catalog.name}} if name]
+        for track in tracks:
+            # The printed title or the recording's own title.
+            titles = {track.get("title"), track.get("recording", {}).get("title")} - {None, ""}
+            if any(self._credits_remixer(title, names) for title in titles):
+                own.add(track["id"])
+        group = metadata.get("release-group") or {}
+        kinds = {kind.lower() for kind in group.get("secondary-type-list") or group.get("secondary-types") or []}
+        kinds.add((group.get("primary-type") or group.get("type") or "").lower())
+        if own or kinds & {"dj-mix", "compilation"}:
+            return own
+        return {track["id"] for track in tracks}
+
+    def _row_song_keys(self, row: Dict[str, Any]) -> FrozenSet[Hashable]:
+        """Song identity keys of an audited release row, as _song_keys gives for catalog tracks."""
+        recording = row.get("mb_recording_id")
+        if recording:
+            return frozenset({("rec", recording)} | self._catalog_appearances().get(recording, set()))
+        return frozenset({("title", normalize_text(row.get("title")))})
+
+    def _refuse_other_release_copies(self, release: str, refused: Dict[int, str]):
+        """accept_source for a release download: another release's copy is never this row's.
+
+        Refused rows map to the copy's folder in `refused`, so they can be reported.
+        """
+        def accept(row: Dict[str, Any], user: str, file: Dict[str, Any]) -> bool:
+            slot = {"keys": self._row_song_keys(row), "title": row.get("title", ""), "duration": row.get("duration")}
+            folder = self._other_release_copy(file, release, slot)
+            if folder is None:
+                return True
+            refused.setdefault(id(row), folder)
+            return False
+        return accept
 
     def _download_full_releases(self) -> None:
         """Prefer a verified complete release; otherwise fetch only this artist's tracks."""
@@ -863,6 +973,8 @@ class SlskdArtistScraper:
             if not missing:
                 continue
             title = audit.get("mb_release_title") or audit["title"]
+            # Folders of copies refused as another release's song, by row.
+            other_copies: Dict[int, str] = {}
             progress = lambda done, total, message: logger.info(
                 "%s [%s/%s tracks matched]", message, done, total,
             )
@@ -874,6 +986,7 @@ class SlskdArtistScraper:
                 complete_release_tracks=[track for track in audit["tracks"] if track.get("mb_track_id")],
                 search_cache=self.search_cache,
                 use_existing=self._reuse_searches(),
+                release_is_mix=audit.get("release_is_mix", False),
             )
             scope = "release"
             if not result.get("complete_release_available"):
@@ -886,12 +999,16 @@ class SlskdArtistScraper:
                     if not (track.get("mb_recording_id") and ("rec", track["mb_recording_id"]) in (
                         self.local_song_keys | self.queued_song_keys | planned))
                 ]
+                if not missing:
+                    logger.info(
+                        "No complete source verified for %s; no missing track of %s's remains on it.",
+                        title, self.catalog.name,
+                    )
+                    continue
                 logger.info(
                     "No complete source verified for %s; searching only %s's %s missing tracks.",
                     title, self.catalog.name, len(missing),
                 )
-                if not missing:
-                    continue
                 result = service.download_missing_tracks(
                     artist=audit["artist"], release_title=title, missing_tracks=missing,
                     preferred_format=self.preferred_format, search_timeout=self.search_timeout,
@@ -900,6 +1017,8 @@ class SlskdArtistScraper:
                     official_tracks=[track for track in audit["tracks"] if not track.get("is_extra")],
                     search_cache=self.search_cache,
                     use_existing=self._reuse_searches(),
+                    accept_source=self._refuse_other_release_copies(title, other_copies),
+                    release_is_mix=audit.get("release_is_mix", False),
                 )
                 scope = "artist_tracks"
             result["download_scope"] = scope
@@ -930,6 +1049,8 @@ class SlskdArtistScraper:
                     "disc": row.get("disc_number"), "position": row.get("position_token") or row.get("track_number"),
                     "reason": reason,
                 }
+                if id(row) not in reasons and id(row) in other_copies:
+                    entry.update(reason="only another release's copy found", folder=other_copies[id(row)])
                 unresolved.append(dict(entry, error=error) if error else entry)
             self._full_release_unresolved.extend(unresolved)
             if unresolved:
@@ -1052,6 +1173,49 @@ class SlskdArtistScraper:
     # Reconciliation
     # ------------------------------------------------------------------
 
+    def _catalog_lengths(self) -> Dict[str, List[float]]:
+        """MusicBrainz lengths (seconds) of every catalogued track, by normalized title."""
+        if self._lengths_by_title is None:
+            lengths: Dict[str, List[float]] = {}
+            raw = (self.catalog.raw_data if self.catalog else None) or {}
+            for release in raw.get("releases_artist", []) + raw.get("releases_track_artist", []):
+                for medium in release.get("medium-list", []):
+                    for track in medium.get("track-list", []):
+                        recording = track.get("recording") or {}
+                        try:
+                            seconds = int(track.get("length") or recording.get("length")) / 1000.0
+                        except (TypeError, ValueError):
+                            continue
+                        for title in {track.get("title"), recording.get("title")} - {None, ""}:
+                            key = normalize_text(title)
+                            if key and seconds > 0 and not _is_generic_title(title):
+                                lengths.setdefault(key, []).append(seconds)
+            self._lengths_by_title = lengths
+        return self._lengths_by_title
+
+    def _wrong_speed(self, files: List[CandidateFile]) -> bool:
+        """Whether a folder's songs all run clearly faster or slower than MusicBrainz times them
+        on any release: a rip at the wrong speed ('Meloko Dolomo' 262 s and 'Labba Labba' 192 s
+        for 368 s and 267 s). Mix segments and edits match some catalogued length or vary."""
+        lengths = self._catalog_lengths()
+        ratios = []
+        for cf in files:
+            known = lengths.get((cf.p_struct or {}).get("base_norm") or "")
+            try:
+                length = float(cf.raw_file.get("length"))
+            except (TypeError, ValueError):
+                continue
+            if known and length > 0:
+                ratios.append(min((length / seconds for seconds in known), key=lambda ratio: abs(ratio - 1)))
+        if len(ratios) < 2:
+            return False
+        low, high = min(ratios), max(ratios)
+        return (high < 0.88 or low > 1.12) and high / low < 1.08
+
+    def _wrong_speed_folder(self, user: str, dir_name: str) -> bool:
+        cd = self.candidate_index.dirs_map.get((user, dir_name)) if self.candidate_index else None
+        return bool(cd and cd.audio_files and self._wrong_speed(cd.audio_files))
+
     def _evaluate_indexed_directory(
         self,
         cd: CandidateDir,
@@ -1061,6 +1225,8 @@ class SlskdArtistScraper:
         track_keys: Optional[List[Hashable]] = None,
         positions: Optional[List[Optional[Tuple[Optional[int], Optional[int]]]]] = None,
     ) -> Optional[Dict[str, Any]]:
+        if cd.audio_files and self._wrong_speed(cd.audio_files):
+            return None
         return evaluate_directory(
             cd,
             parsed_expected,
@@ -1215,6 +1381,25 @@ class SlskdArtistScraper:
             def accepted(evaluation: Optional[Dict[str, Any]]) -> bool:
                 if not evaluation:
                     return False
+                if not _is_release_folder(evaluation["directory"], rel_title, frozenset(self.all_artist_aliases)):
+                    # Another folder holding these titles ('Fuck Shit Up X-Toxic' for 'Dissident
+                    # Sound Maniak') supplies only songs at their length: a mix CD's segment or
+                    # another edit is not this release's track, and already queued for its own release.
+                    length_of = {file.get("filename"): file.get("length") for file in evaluation["all_dir_files"]}
+                    kept = [
+                        match for match in evaluation["matched_tracks"]
+                        if not (isinstance(match.get("expected_index"), int) and match["expected_index"] < len(plan["slot_of"])
+                                and _length_conflicts(plan["slots"][plan["slot_of"][match["expected_index"]]].get("duration"),
+                                                      length_of.get(match["full_filename"])))
+                    ]
+                    if len(kept) < len(evaluation["matched_tracks"]):
+                        evaluation["matched_tracks"] = kept
+                        songs = evaluation.get("song_count") or len(plan["slots"]) or 1
+                        ratio = len(set(self._slot_targets(plan, evaluation).values())) / songs
+                        evaluation["total_score"] -= (evaluation["match_ratio"] - ratio) * 100
+                        evaluation["match_ratio"] = ratio
+                        if not kept:
+                            return False
                 matched = set(self._slot_targets(plan, evaluation).values())
                 # A folder is a copy of one edition: the union of every edition's
                 # bonus tracks must not hide a complete standard edition. A small
@@ -1336,6 +1521,9 @@ class SlskdArtistScraper:
                     )
                     if (cf.user, cf.full_filename) not in taken
                     and (not slot["repeated"] or (slot["position"] and cf.position()[1] == slot["position"][1]))
+                    # A loose copy of a clearly different length is another edit of the song.
+                    and not _length_conflicts(slot.get("duration"), cf.raw_file.get("length"))
+                    and not self._wrong_speed_folder(cf.user, cf.dir_name)
                     # Another song of the artist has this title: only a copy in
                     # this release's folder is this one.
                     and (slot["unique"] or _is_release_folder(cf.folder, rel_title, frozenset(self.all_artist_aliases)))
@@ -1448,12 +1636,20 @@ class SlskdArtistScraper:
         'unknown': a name the catalog does not know ('2015 - First Light').
         """
         aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
-        words = _folder_title_words(folder, aliases)
+        return self._words_place(_folder_title_words(folder, aliases), release, keys)
+
+    def _words_place(self, words: List[str], release: str, keys: FrozenSet[Hashable], lenient: bool = False) -> str:
+        """_folder_place for the significant words of a folder or file name. lenient reads a
+        plural like the singular ('Disaster must Comes' names 'Disaster Must Come')."""
         if not words:
             return "loose"
+        aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
         release_songs = self._release_songs()
-        own = tuple(_title_words(release, aliases))
-        named = [title for title in release_songs if title != own and is_sublist(list(title), words)]
+        stem = (lambda word: word[:-1] if len(word) >= 5 and word.endswith("s") else word) if lenient else (lambda word: word)
+        words = [stem(word) for word in words]
+        own = tuple(stem(word) for word in _title_words(release, aliases))
+        named = [title for title in release_songs
+                 if tuple(stem(word) for word in title) != own and is_sublist([stem(word) for word in title], words)]
         # 'First Light' names First Light, not also a release called 'Light'.
         named = [
             title for title in named
@@ -1475,6 +1671,38 @@ class SlskdArtistScraper:
             return False
         place = self._folder_place(folder, release, slot["keys"])
         return place == "other" or (place == "unknown" and _is_generic_title(slot["title"]))
+
+    def _other_release_copy(self, file: Dict[str, Any], release: str, slot: Dict[str, Any]) -> Optional[str]:
+        """The folder of a peer file that is another release's song, else None.
+
+        Its folder names a catalogued release without the song, or its own name does once
+        the song's title is left out: 'ROTATOR, STAZMA, ... - VA - Insized -2CD- - 21 Rotator
+        - No Surrenda !!!.mp3' in a folder called 'ROTATOR- STAZMA-' is Insized's copy. A name
+        that only repeats the song's title ('Rotator - HXC Militia.mp3') or names this release
+        says nothing. A generic title ('Rain', 'Intro') in a folder the catalog does not know
+        is another release's unless its length matches the song's (slot 'duration').
+        """
+        folder, basename = extract_dir_and_filename(file.get("filename") or "")
+        aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
+        if _is_release_folder(folder, release, aliases):
+            return None
+        place = self._words_place(_folder_title_words(folder, aliases), release, slot["keys"], lenient=True)
+        if place == "other":
+            return folder
+        if place == "unknown" and _is_generic_title(slot["title"]):
+            try:
+                same_length = abs(float(slot.get("duration")) - float(file.get("length"))) <= DURATION_TOLERANCE
+            except (TypeError, ValueError):
+                same_length = False
+            if not same_length:
+                return folder
+        title = set(_title_words(slot["title"], aliases))
+        words = [word for word in _title_words(Path(basename).stem, aliases) if word not in title]
+        own = [word for word in _title_words(release, aliases) if word not in title]
+        if own and is_sublist(own, words):
+            # 'Mosaic World Remix Series Vol.10 - 01 - F>B>D' names its own release, not 'Mosaic World'.
+            return None
+        return folder if self._words_place(words, release, slot["keys"], lenient=True) == "other" else None
 
     def _set_item_meta(self, item: Dict[str, Any], meta: Dict[str, Any]) -> None:
         self._item_meta[id(item)] = (item, meta)
@@ -2049,10 +2277,17 @@ class SlskdArtistScraper:
         aliases = set(self.catalog.aliases) | {self.catalog.name}
         credit = track.get("artist_credit") or release_artist
         artist = release_artist if artist_credit_matches(self.catalog.name, credit, aliases) else credit
-        alt_titles = [
-            name for name in dict.fromkeys((info.get("recording_title"), track.get("title")))
-            if name and normalize_text(name) != normalize_text(title)
-        ]
+        names = [info.get("recording_title"), track.get("title")]
+        if len(plan["slots"]) == 1:
+            # A one-song release is that song: peers name its file after the release
+            # ('ROTATOR - Orgasmic Nightmare - PoFF Night After Movie Soundtrack.mp3'), unless
+            # the release title drops the song's version ('Song A' holding 'Song A (Instrumental)').
+            version = parse_track_title_structure(title, is_filename=False).get("version_type")
+            if not version or version == parse_track_title_structure(plan["release"], is_filename=False).get("version_type"):
+                names.append(plan["release"])
+        alt_titles = list(dict.fromkeys(
+            name for name in names if name and normalize_text(name) != normalize_text(title)
+        ))
         row = {
             "title": title,
             "alt_titles": alt_titles,
@@ -2066,7 +2301,7 @@ class SlskdArtistScraper:
             "medium_track_count": info.get("medium_track_count"),
             "mb_track_id": info.get("mb_track_id") or next(iter(sorted(track.get("track_ids") or ())), None),
             "mb_recording_id": info.get("mb_recording_id") or next(iter(sorted(track.get("recording_ids") or ())), None),
-            "duration": info.get("duration"),
+            "duration": slot.get("duration"),
         }
         return {key: value for key, value in row.items() if value is not None}
 
@@ -2091,6 +2326,20 @@ class SlskdArtistScraper:
                 continue
             release_artist = self._release_artist(plan)
             rows = [self._missing_row(plan, slot_id, release_artist) for slot_id in slots]
+            slot_of_row = {id(row): slot_id for slot_id, row in zip(slots, rows)}
+
+            def accept(row: Dict[str, Any], user: str, file: Dict[str, Any], plan=plan, slot_of_row=slot_of_row) -> bool:
+                # A copy in another release's folder ('First Light\\01 Intro') is that
+                # release's song: never queued for this one, only reported.
+                slot_id = slot_of_row.get(id(row))
+                if slot_id is None:
+                    return True
+                folder = self._other_release_copy(file, plan["release"], plan["slots"][slot_id])
+                if folder is not None:
+                    plan["other_release"].setdefault(slot_id, folder)
+                    return False
+                return True
+
             # Search the release first only when nothing of it was found yet.
             scope = "track" if plan["has_local"] or plan["candidates"] or plan["track_slots"] else "release"
             logger.info("Searching %s missing tracks of %s individually...", len(rows), plan["release"])
@@ -2102,6 +2351,7 @@ class SlskdArtistScraper:
                     excluded_sources=set(self._unavailable_sources) or None,
                     search_cache=self.search_cache,
                     use_existing=self._reuse_searches(),
+                    accept_source=accept,
                 )
             except (SlskdAPIError, ValueError) as error:
                 self.queue_errors.append(f"{plan['release']}: {error}")
@@ -2122,24 +2372,13 @@ class SlskdArtistScraper:
                 row.get("mb_track_id") or (normalize_text(row.get("title")), row.get("disc_number"), row.get("track_number"))
                 for row in resolved_rows if isinstance(row, dict)
             }
-            folders: Dict[Tuple[str, int], List[str]] = {}
-            for file in result.get("queued_files") or []:
-                folders.setdefault((normalize_text(file.get("title")), file.get("disc_number") or 1), []).append(
-                    extract_dir_and_filename(file.get("filename") or "")[0],
-                )
             for slot_id, row in zip(slots, rows):
                 identity = row.get("mb_track_id") or (normalize_text(row.get("title")), row.get("disc_number"), row.get("track_number"))
                 if not (any(row is item for item in resolved_rows) or identity in resolved_ids):
                     continue
-                slot = plan["slots"][slot_id]
-                # A copy in another release's folder ('First Light\\01 Intro') is that
-                # release's song, even when it is already downloading: the track is still missing.
-                sources = folders.get((normalize_text(row.get("title")), row.get("disc_number") or 1), [])
-                if sources and all(self._names_other_release(folder, plan["release"], slot) for folder in sources):
-                    plan["other_release"][slot_id] = sources[0]
-                    continue
+                # Every chosen copy passed accept(): none is another release's song.
                 plan["resolved"].add(slot_id)
-                self.queued_song_keys |= slot["keys"]
+                self.queued_song_keys |= plan["slots"][slot_id]["keys"]
             # Tell a failed search or submission apart from a track nobody shares.
             reasons = track_failures(result)
             for slot_id, row in zip(slots, rows):

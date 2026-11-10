@@ -25,12 +25,14 @@ from discogseek.core.text import (
     artist_credit_matches,
     clean_search_phrase,
     fold_search_phrase,
+    is_sublist,
     normalize_text,
     parse_track_title_structure,
     primary_artist,
     split_artist_credit,
     title_match_score,
     title_variants,
+    underscore_position_field,
 )
 from discogseek.core.submissions import SubmissionLog, row_identity, submission_source
 from discogseek.core.transfers import DownloadHistory, resolve_downloads_dir, source_key, transfer_states
@@ -89,7 +91,9 @@ _MIXED_SOURCE_RE = re.compile(
 _MIXED_RELEASE_FOLDER_RE = re.compile(
     r"(?<![a-z0-9])(?:"
     r"playlists?(?![\s:\-–]*the\s+very\s+best)|"
-    r"dj\s?-?\s?(?:mix(?:es|ed)?|sets?)|mixed\s+by|[(\[{,]\s*mixed\s*(?:cd)?\s*[)\]},]|"
+    r"dj\s?-?\s?(?:mix(?:es|ed)?|sets?)|mixed\s+by|"
+    # 'Brick Smack- Mix By DJ C64', '(Mix By X)'; not a remix credit ('Club Mix By DJ X', 'Re-Mix By').
+    r"(?:(?<=[(\[{,])\s*|(?<=[-–])\s+)mix\s+by|[(\[{,]\s*mixed\s*(?:cd)?\s*[)\]},]|"
     r"(?:continuous|guest|mini|live)\s?-?\s?mix|live\s?-?\s?sets?|mix\s?-?\s?tapes?|boiler\s+room|"
     r"(?:bbc|peel|maida\s+vale)\s+sessions?|live\s+(?:at|from)|live\s*@|in\s+concert"
     r")(?![a-z0-9])",
@@ -182,6 +186,7 @@ def _filename_segments(stem: str) -> List[str]:
     if not re.search(r"\s", text) and "-" in text:
         parts = re.split(r"-+", text)
     else:
+        text = underscore_position_field(text)
         text = re.sub(r"-\[(\d{1,3})\]-", r" - \1 - ", text)
         text = re.sub(r"\s*[~～〜]\s*", " - ", text)
         parts = re.split(r"\s+-+\s+|\s*_+-_+\s*", text)
@@ -309,6 +314,8 @@ def download_missing_tracks(
     search_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     use_existing: bool = True,
     downloads_dir: Optional[str] = None,
+    accept_source: Optional[Callable[[Dict[str, Any], str, Dict[str, Any]], bool]] = None,
+    release_is_mix: bool = False,
 ) -> Dict[str, Any]:
     """
     Orchestrates Soulseek discovery and queueing for missing tracks of a release.
@@ -328,7 +335,10 @@ def download_missing_tracks(
     query results between calls of one run, so identical queries are searched once.
     use_existing=False asks the Soulseek network again instead of reusing slskd's
     recent searches. downloads_dir is slskd's downloads folder when the caller already
-    knows it; otherwise it is read from slskd's options.
+    knows it; otherwise it is read from slskd's options. accept_source(row, user, file),
+    called with the caller's row, can refuse a matching file before it is chosen, queued or
+    counted from history (an artist download refuses another release's copy). release_is_mix
+    marks a DJ-mix release whose title does not say so: its tracks may come from mix folders.
     """
     if search_scope not in {"release", "track"}:
         raise ValueError("search_scope must be 'release' or 'track'")
@@ -564,7 +574,7 @@ def download_missing_tracks(
         return bool(_GENERIC_TITLE_RE.match(title_identity(track)[0]))
 
     # A mix, live or radio release comes from such folders; so does a live or mixed track.
-    release_is_mix = bool(_MIXED_TITLE_RE.search(release_title or ""))
+    release_is_mix = release_is_mix or bool(_MIXED_TITLE_RE.search(release_title or ""))
     mixed_folders: Dict[str, bool] = {}
 
     def mixed_source(track: Dict[str, Any], folder: str) -> bool:
@@ -647,6 +657,8 @@ def download_missing_tracks(
 
     release_words = normalize_text(release_title).split()
     release_sig_words = {word for word in release_words if word not in DIR_STOP_WORDS} or set(release_words)
+    # The release title's significant words in order ('Volume'/'Vol.' left out).
+    release_sequence = [word for word in release_words if word not in DIR_STOP_WORDS]
     release_core = (release_sig_words - _ARTICLES) or release_sig_words
     # Words a folder may add around a one-word title: the release artist, or 'VA'.
     release_artist_words = (
@@ -842,6 +854,16 @@ def download_missing_tracks(
             return list(dict.fromkeys(option for option in options if option))
 
         release_index = [index for index, part in enumerate(parts) if names_release(part)]
+        if not release_index and len(release_sequence) > 1:
+            # 'Album, Volume 2 - Clash and Diversion': the release title split at its own dash.
+            # The parts must spell it in order: 'Hardcore Remixes Vol 2 - Repeater' holds the
+            # words of 'Repeater Remixes' but names another release.
+            release_index = next((
+                list(range(start, end)) for end in range(2, len(parts) + 1) for start in range(end - 2, -1, -1)
+                if is_sublist(release_sequence, [
+                    word for word in normalize_text(" ".join(parts[start:end])).split() if word not in DIR_STOP_WORDS
+                ])
+            ), [])
         if release_index:
             # 'Album Artist - Album - NN - Title' and 'Compiler - Compilation - Artist - Title'.
             first = release_index[0]
@@ -1029,6 +1051,9 @@ def download_missing_tracks(
         if allowed and (
             (artist_parts and not any(plausible_artist(reading) for reading in artist_parts))
             or (tagged and not plausible_artist(tagged))
+            # 'Somebody - Greatest Hits - Volume 2 - 03 - Intro' is Somebody's release. A
+            # compilation is filed under its curator, so only an artist's release checks this.
+            or (album_parts and not is_va and not any(plausible_artist(reading) for reading in album_parts))
         ):
             return None
 
@@ -1363,10 +1388,16 @@ def download_missing_tracks(
                 found[id(candidate)] = candidate
         return list(found.values()) if found else list(index.all_audio_files)
 
+    def refused(track: Dict[str, Any], user: str, file: Dict[str, Any]) -> bool:
+        """Whether the caller refuses this file for the row."""
+        return accept_source is not None and not accept_source(
+            requested_by_key.get(track_key(track), track), user, file,
+        )
+
     def candidate_available(track: Dict[str, Any], user: str, file: Dict[str, Any], individual: bool,
                             require_artist: bool = False) -> Optional[_Match]:
         match = candidate_matches(track, file, individual, user=user, require_artist=require_artist)
-        if match is None:
+        if match is None or refused(track, user, file):
             return None
         if history.is_protected(user, file.get("filename", "")):
             # A finished download from another release would be imported there.
@@ -1396,7 +1427,7 @@ def download_missing_tracks(
             # A transfer submitted for this very row stands for it wherever its folder is.
             satisfying = sorted(
                 ((user, file) for user, file in submitted_transfers.get(identities.get(track_key(track)) or "", ())
-                 if not mixed_transfer(track, file)),
+                 if not mixed_transfer(track, file) and not refused(track, user, file)),
                 key=lambda item: candidate_rank(*item),
             )
             chosen = {source_key(user, file["filename"]) for user, file in satisfying}
@@ -1407,7 +1438,7 @@ def download_missing_tracks(
                 # Require the exact title and artist evidence outside the title (or
                 # the release folder for compilations with unknown track credits).
                 match = candidate_matches(track, file, True, user=candidate.user, strict=True)
-                if match is None:
+                if match is None or refused(track, candidate.user, file):
                     continue
                 source = source_key(candidate.user, file["filename"])
                 if source in stale_records:
@@ -1498,7 +1529,8 @@ def download_missing_tracks(
                 rank = (
                     -int(context_by_directory.get((user, folder), 0) > 0),
                     -sum(is_preferred(file) for file in files), -len(matches),
-                    -placed_by_directory.get((user, folder), 0),
+                    -(placed_by_directory.get((user, folder), 0)
+                      if len(known_tracks) > 1 or context_by_directory.get((user, folder), 0) else 0),
                     *_health_rank(peer_meta.get(peer_key(user))),
                     -sum(qualities), user.casefold(), folder.casefold(),
                 )

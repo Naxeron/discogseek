@@ -69,3 +69,29 @@ def test_uploader_notes_do_not_hide_versions():
 def test_an_unbracketed_note_word_is_a_title():
     assert title_match_score("Commission", "kyou1110 - Commission.mp3") == 1.0
     assert title_match_score("kyou1110", "kyou1110 - Commission.mp3") < 0.9
+
+
+@pytest.mark.parametrize("title, filename", [
+    # Seen for Rotator's digital singles: a release date before the title, an uploader's note after it.
+    ("No Surrenda!", "20120615. No Surrenda ! Free Download !!!.flac"),
+    ("Song", "2012-06-15 - Song.mp3"),
+    ("Song", "Artist - Song - Free DL.mp3"),
+    # A scene name's bitrate tail.
+    ("HXC Militia", "Rotator_-_HXC_Militia_320.mp3"),
+    ("The Power Has Returned (Rotator remix)", "10_Scrubber_Fox_-_The_Power_Has_Returned_(Rotator_remix)_320_pn.mp3"),
+])
+def test_uploader_additions_around_a_title(title, filename):
+    assert title_match_score(title, filename) == 1.0
+
+
+@pytest.mark.parametrize("title, filename", [
+    ("Area", "Area 320.mp3"),          # a spaced number may be the title's
+    ("Song", "2012 - Song 2.mp3"),     # a year alone is no date
+    ("Free", "Artist - Free Download.mp3"),
+])
+def test_numbers_and_notes_that_may_belong_to_the_title_stay(title, filename):
+    assert title_match_score(title, filename) < 0.999
+
+
+def test_a_title_that_is_the_note_itself_still_matches():
+    assert title_match_score("Free Download", "01 - Free Download.mp3") == 1.0

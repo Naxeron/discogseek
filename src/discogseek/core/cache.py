@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Any, Set, Iterator, Tuple
 
 from discogseek.config import Config
 from discogseek.core.audio import AUDIO_EXTRACTOR_VERSION, AudioMetadata
+from discogseek.core.text import underscore_position_field
 
 
 # Rows written before extractor version 2 are re-read only where the old extraction
@@ -22,9 +23,12 @@ from discogseek.core.audio import AUDIO_EXTRACTOR_VERSION, AudioMetadata
 # with NUL, and folders whose cached album artists disagree (Vorbis key-order
 # lottery, see library_scan), are re-read selectively. Before version 3 a file
 # without any tags (an untagged peer download, a WAV) lost its stream info; only
-# rows without a duration are re-read for that.
+# rows without a duration are re-read for that. Before version 4 an untagged name with
+# an underscore-delimited position ('Artist_Album - Part_01_Title') kept the fields in its
+# title; only files named that way are re-read.
 REREAD_LEGACY_EXTENSIONS = {".m4a", ".mp4", ".m4b", ".aac", ".alac", ".ape", ".wv", ".mpc"}
 _STREAM_INFO_VERSION = 3
+_UNDERSCORE_FIELDS_VERSION = 4
 _LEGACY_TEXT_COLUMNS = (
     "title", "artist", "album_artist", "album", "mb_track_ids", "mb_rec_ids",
     "mb_artist_ids", "mb_release_ids",
@@ -38,6 +42,8 @@ def _is_outdated_audio_row(file_path: Path, row: sqlite3.Row) -> bool:
     if version >= AUDIO_EXTRACTOR_VERSION:
         return False
     if version < _STREAM_INFO_VERSION and not (row["duration"] if "duration" in keys else None):
+        return True
+    if version < _UNDERSCORE_FIELDS_VERSION and underscore_position_field(file_path.stem) != file_path.stem:
         return True
     if version >= 2:
         return False

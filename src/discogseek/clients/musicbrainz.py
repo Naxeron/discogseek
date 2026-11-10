@@ -6,6 +6,7 @@ import re
 import json
 import time
 import logging
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any
 
@@ -33,6 +34,140 @@ musicbrainzngs.set_useragent(
     Config.MB_APP_VERSION,
     Config.MB_APP_CONTACT
 )
+
+# 'Repeater (breakcore)': an artist name followed by words from its MusicBrainz description,
+# which may hold brackets of its own ('John Stewart (singer-songwriter (Kingston Trio))').
+_ARTIST_HINT_RE = re.compile(r"^(?P<name>[^()]*?\S)\s*\((?P<hint>.*\w.*)\)\s*$")
+_FULLWIDTH_BRACKETS = str.maketrans({"\uff08": "(", "\uff09": ")"})
+
+# Artist searches return this many candidates, enough to see artists sharing a name.
+ARTIST_SEARCH_LIMIT = 25
+# artist_search_cache.json entries written since names shared by several artists are no
+# longer resolved to MusicBrainz's top hit; older entries are not trusted.
+ARTIST_SEARCH_CACHE_VERSION = 2
+
+
+def split_artist_hint(query: str) -> Tuple[str, str]:
+    """('Repeater', 'breakcore') for 'Repeater (breakcore)' or 'Repeater（breakcore）';
+    (query, '') without a trailing bracket."""
+    text = (query or "").strip()
+    match = _ARTIST_HINT_RE.match(text.translate(_FULLWIDTH_BRACKETS))
+    return (match.group("name"), match.group("hint").strip()) if match else (text, "")
+
+
+def _name_key(name: Any) -> str:
+    """A name as written, ignoring case and character width: 'sHimaU' is 'shimau', '李剑' is not '李健'."""
+    return unicodedata.normalize("NFKC", str(name or "")).casefold().strip()
+
+
+def _artist_aliases(artist: Dict[str, Any]) -> List[str]:
+    """Alias names in either search-result ('aliases') or lookup ('alias-list') form."""
+    names = []
+    for alias in artist.get("aliases") or artist.get("alias-list") or []:
+        if isinstance(alias, dict):
+            names.append(alias.get("name") or alias.get("alias") or "")
+        elif alias:
+            names.append(str(alias))
+    return [name for name in names if name]
+
+
+def _artist_description_words(artist: Dict[str, Any]) -> Set[str]:
+    """Normalized words of what MusicBrainz says about an artist besides its name."""
+    parts = [
+        artist.get("disambiguation"), artist.get("country"), artist.get("type"), artist.get("gender"),
+        (artist.get("area") or {}).get("name"), (artist.get("begin-area") or {}).get("name"),
+        str((artist.get("life-span") or {}).get("begin") or "")[:4],
+    ]
+    parts += [tag.get("name") for tag in artist.get("tags") or artist.get("tag-list") or [] if isinstance(tag, dict)]
+    words: Set[str] = set()
+    for part in parts:
+        words.update(normalize_text(part).split())
+    return words
+
+
+def describe_artist(artist: Dict[str, Any]) -> str:
+    """'Repeater (Long Beach, CA rock band) [US, Group]' for listing artists that share a name."""
+    text = artist.get("name", "")
+    if artist.get("disambiguation"):
+        text += f" ({artist['disambiguation']})"
+    details = [value for value in (artist.get("country"), artist.get("type")) if value]
+    tags = sorted(
+        (tag for tag in artist.get("tags") or artist.get("tag-list") or [] if isinstance(tag, dict) and tag.get("name")),
+        key=lambda tag: -int(tag.get("count") or 0),
+    )
+    details += [tag["name"] for tag in tags[:3]]
+    return text + (f" [{', '.join(details)}]" if details else "")
+
+
+class AmbiguousArtistError(ValueError):
+    """Several MusicBrainz artists bear the queried name and nothing in the query tells them apart."""
+
+    def __init__(self, name: str, candidates: List[Dict[str, Any]], hint: str = "", hint_fits: bool = True):
+        self.name = name
+        self.hint = hint
+        self.candidates = candidates
+        if not hint:
+            heading = f'Several MusicBrainz artists are named "{name}":'
+        elif hint_fits:
+            heading = f'Several MusicBrainz artists named "{name}" match "{hint}":'
+        else:
+            heading = f'No MusicBrainz artist named "{name}" matches "{hint}". Artists with that name:'
+        lines = [heading] + [f"  {artist.get('id', '')}  {describe_artist(artist)}" for artist in candidates]
+        example = next((artist for artist in candidates if artist.get("disambiguation")), None)
+        advice = "Use the artist's MBID"
+        if example:
+            words = " ".join(re.sub(r"[()（）]", " ", example["disambiguation"]).split())
+            advice += f', or add words from its description in brackets, e.g. "{name} ({words})"'
+        lines.append(advice + ".")
+        super().__init__("\n".join(lines))
+
+
+def _artists_named(name: str, artists: List[Dict[str, Any]], strict: bool = False) -> List[Dict[str, Any]]:
+    """Artists bearing the queried name: as written (case and width aside), else spelled
+    alike (spacing, punctuation, accents), else as an alias. strict keeps the first only."""
+    exact_key = _name_key(name)
+    if not exact_key:
+        return []
+    exact = [artist for artist in artists if _name_key(artist.get("name")) == exact_key]
+    if exact or strict:
+        return exact
+    key = normalize_text(name)
+    for named in (
+        [artist for artist in artists if key and normalize_text(artist.get("name")) == key],
+        [artist for artist in artists if any(_name_key(alias) == exact_key for alias in _artist_aliases(artist))],
+        [artist for artist in artists if key and any(normalize_text(alias) == key for alias in _artist_aliases(artist))],
+    ):
+        if named:
+            return named
+    return []
+
+
+def choose_artist(query: str, artists: List[Dict[str, Any]], strict: bool = False) -> Optional[Dict[str, Any]]:
+    """The artist a name query means among MusicBrainz candidates, or None when none bears the name.
+
+    A name several artists share is told apart by words from one artist's description in a
+    trailing bracket ('Repeater (breakcore)'): its disambiguation, country, area, type or tags.
+    Raises AmbiguousArtistError when the name alone, or with its bracket, still fits several
+    artists, or when the bracket fits none of them. strict (fetched artists, without a search
+    to show their namesakes) accepts only the name as written, never an alias.
+    """
+    text = (query or "").strip()
+    named, name, hint = _artists_named(text, artists, strict), text, ""
+    if not named:
+        name, hint = split_artist_hint(text)
+        named = _artists_named(name, artists, strict) if hint else []
+    if not named:
+        return None
+    unique = list({artist.get("id") or id(artist): artist for artist in named}.values())
+    if hint:
+        wanted = set(normalize_text(hint).split())
+        fitting = [artist for artist in unique if wanted <= _artist_description_words(artist)]
+        if len(fitting) == 1:
+            return fitting[0]
+        raise AmbiguousArtistError(name, fitting or unique, hint, hint_fits=bool(fitting))
+    if len(unique) == 1:
+        return unique[0]
+    raise AmbiguousArtistError(name, unique)
 
 
 class ArtistCatalog:
@@ -386,42 +521,45 @@ class MusicBrainzClient:
             artist_info = musicbrainzngs.get_artist_by_id(mbid)
             return mbid, artist_info['artist'].get('name', 'Unknown Artist')
 
-        # 3. Check persistent search cache
+        # 3. Check persistent search cache: answers a search chose among the artists it
+        # listed. Entries of the old list form took the top hit even among namesakes.
         search_cache = {}
         if self.use_cache and search_cache_file.exists():
             try:
                 with open(search_cache_file, "r", encoding="utf-8") as f:
                     search_cache = json.load(f)
                 cached = search_cache.get(query_strip.lower())
-                if cached:
-                    mbid, name, disambiguation, country = cached
-                    logging.getLogger(__name__).info(f"✔ Matched Artist (from cache): {name}{disambiguation}{country} (MBID: {mbid})")
-                    return mbid, name
+                if isinstance(cached, dict) and cached.get("version") == ARTIST_SEARCH_CACHE_VERSION and cached.get("mbid"):
+                    logging.getLogger(__name__).info(
+                        f"✔ Matched Artist (from cache): {cached.get('description') or cached.get('name')} "
+                        f"(MBID: {cached['mbid']})"
+                    )
+                    return cached["mbid"], cached.get("name") or query_strip
             except Exception:
-                pass
+                search_cache = {}
 
-        # 4. Check cached artist files
+        # 4. Check cached artist files: an artist fetched before answers its name as written
+        # while no other fetched artist bears it. Not remembered: a namesake fetched later
+        # makes the name ambiguous again.
         if self.use_cache and self.cache_dir.exists():
-            try:
-                for json_file in self.cache_dir.glob("artist_*.json"):
+            cached_artists = []
+            for json_file in self.cache_dir.glob("artist_*.json"):
+                try:
                     with open(json_file, "r", encoding="utf-8") as f:
-                        cached_data = json.load(f)
-                    c_artist = cached_data.get("artist", {})
-                    c_name = c_artist.get("name", "")
-                    c_mbid = c_artist.get("id", "")
-                    c_aliases = [a.get("alias", "") if isinstance(a, dict) else str(a) for a in c_artist.get("aliases", [])]
-                    if c_name.lower() == query_strip.lower() or any(a.lower() == query_strip.lower() for a in c_aliases):
-                        logging.getLogger(__name__).info(f"✔ Matched Artist (from cache): {c_name} (MBID: {c_mbid})")
-                        if self.use_cache:
-                            search_cache[query_strip.lower()] = [c_mbid, c_name, "", ""]
-                            try:
-                                with open(search_cache_file, "w", encoding="utf-8") as f:
-                                    json.dump(search_cache, f, indent=2)
-                            except Exception:
-                                pass
-                        return c_mbid, c_name
-            except Exception:
-                pass
+                        c_artist = json.load(f).get("artist") or {}
+                except Exception:
+                    continue
+                if isinstance(c_artist, dict) and c_artist.get("id"):
+                    cached_artists.append(c_artist)
+            try:
+                chosen = choose_artist(query_strip, cached_artists, strict=True)
+            except AmbiguousArtistError:
+                chosen = None  # several fetched artists share the name: the search lists them all
+            if chosen:
+                logging.getLogger(__name__).info(
+                    f"✔ Matched Artist (from cache): {describe_artist(chosen)} (MBID: {chosen['id']})"
+                )
+                return chosen["id"], chosen.get("name", query_strip)
 
         # 5. Search API
         logging.getLogger(__name__).info(f"Searching MusicBrainz for artist: {query_strip}...")
@@ -430,7 +568,7 @@ class MusicBrainzClient:
         try:
             r = requests.get(
                 "https://musicbrainz.org/ws/2/artist",
-                params={"query": query_strip, "fmt": "json", "limit": 10},
+                params={"query": query_strip, "fmt": "json", "limit": ARTIST_SEARCH_LIMIT},
                 headers=headers,
                 timeout=12
             )
@@ -441,7 +579,7 @@ class MusicBrainzClient:
 
         if not artist_list:
             try:
-                res = musicbrainzngs.search_artists(query=query_strip, limit=10)
+                res = musicbrainzngs.search_artists(query=query_strip, limit=ARTIST_SEARCH_LIMIT)
                 artist_list = res.get('artist-list', [])
             except Exception:
                 pass
@@ -449,18 +587,32 @@ class MusicBrainzClient:
         if not artist_list:
             raise ValueError(f"No artist found on MusicBrainz matching query '{query_strip}'.")
 
-        top_match = artist_list[0]
+        # An artist bearing the queried name, told apart from namesakes by the query's
+        # bracketed description; otherwise MusicBrainz's best match for a misspelled name.
+        top_match = choose_artist(query_strip, artist_list)
+        if top_match is None:
+            name_part, hint = split_artist_hint(query_strip)
+            if hint:
+                # The description's words find other artists ('Breakcore' for 'Repeatr
+                # (breakcore)'): without the name itself there is nothing to tell apart.
+                listed = "\n".join(f"  {artist.get('id', '')}  {describe_artist(artist)}" for artist in artist_list[:5])
+                raise ValueError(
+                    f'No MusicBrainz artist is named "{name_part}". The search for "{query_strip}" found:\n'
+                    f"{listed}\nUse the artist's exact name or MBID."
+                )
+            top_match = artist_list[0]
         mbid = top_match['id']
         name = top_match.get('name', query_strip)
-        disambiguation = f" ({top_match.get('disambiguation')})" if top_match.get('disambiguation') else ""
-        country = f" [{top_match.get('country')}]" if top_match.get('country') else ""
-        logging.getLogger(__name__).info(f"✔ Matched Artist: {name}{disambiguation}{country} (MBID: {mbid})")
+        logging.getLogger(__name__).info(f"✔ Matched Artist: {describe_artist(top_match)} (MBID: {mbid})")
 
         if self.use_cache:
-            search_cache[query_strip.lower()] = [mbid, name, disambiguation, country]
+            search_cache[query_strip.lower()] = {
+                "version": ARTIST_SEARCH_CACHE_VERSION, "mbid": mbid, "name": name,
+                "description": describe_artist(top_match),
+            }
             try:
                 with open(search_cache_file, "w", encoding="utf-8") as f:
-                    json.dump(search_cache, f, indent=2)
+                    json.dump(search_cache, f, indent=2, ensure_ascii=False)
             except Exception:
                 pass
 

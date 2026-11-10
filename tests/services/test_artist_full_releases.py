@@ -511,3 +511,101 @@ def test_artist_compilation_fallback_uses_exact_artist_credit_ids(monkeypatch, c
     assert [file["filename"] for file in client.accepted] == [files[0]["filename"]]
     assert result["release_downloads"][0]["download_scope"] == "artist_tracks"
     assert result["unresolved_releases"] == []
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_remix_credited_to_original_artist_is_the_artists_track_on_its_own_release(monkeypatch, dry_run):
+    # MusicBrainz credits a remix to the original artist; the release credit names the remixer.
+    metadata = release(
+        media=[[("Heretic", "Gore Tech"), ("Heretic (Target Artist 666% FxxK remix)", "Gore Tech")]],
+        artist="Gore Tech / Target Artist", title="Heretic EP",
+    )
+    files = release_files(metadata)
+
+    result, client = run_artist(monkeypatch, metadata, primary=True, files=files[1:], dry_run=dry_run)
+
+    # No complete copy of the EP: only the artist's remix is fetched, never the original.
+    download = result["release_downloads"][0]
+    assert download["download_scope"] == "artist_tracks"
+    assert [file["filename"] for file in download["queued_files"]] == [files[1]["filename"]]
+    assert [file["filename"] for file in client.accepted] == ([] if dry_run else [files[1]["filename"]])
+    assert result["unresolved_releases"] == []
+
+
+def test_own_release_without_an_identifiable_track_is_the_artists_in_full(monkeypatch):
+    # 'Eat Drink Fuck (Sick as Fuck remix)': credited to the remixer, its remix to the original artist.
+    metadata = release(
+        media=[[("Eat Drink Fuck (Sick as Fuck remix)", "TechDiff"), ("Eat Drink Fuck (Dub)", "TechDiff")]],
+        artist=TARGET_NAME, title="Eat Drink Fuck Remixes",
+    )
+    files = release_files(metadata)
+
+    result, client = run_artist(monkeypatch, metadata, primary=True, files=files[:1])
+
+    assert [file["filename"] for file in client.accepted] == [files[0]["filename"]]
+    assert result["release_downloads"][0]["download_scope"] == "artist_tracks"
+    # The other remix is still missing and reported, not silently dropped.
+    assert [track["title"] for track in result["unresolved_tracks"]] == ["Eat Drink Fuck (Dub)"]
+
+
+def test_dj_mix_credited_to_the_artist_is_not_the_artists_in_full(monkeypatch):
+    # A DJ mix credits its DJ, but its tracks are other artists' own songs.
+    metadata = release(
+        media=[[("Derek Went Mad", "Shut Up and Dance"), ("Spliffhead", "Ragga Twins")]],
+        artist=TARGET_NAME, title="FACT Mix 493",
+    )
+    metadata["release-group"]["secondary-type-list"] = ["DJ-mix"]
+    files = [
+        {"filename": r"Music\Shut Up and Dance\Dance Before the Police Come!\01 - Shut Up and Dance - Derek Went Mad.flac",
+         "size": 25000000, "artist": "Shut Up and Dance"},
+    ]
+
+    result, client = run_artist(monkeypatch, metadata, primary=True, files=files)
+
+    assert client.accepted == []
+    assert not any(download["download_scope"] == "artist_tracks" for download in result["release_downloads"])
+
+
+@pytest.mark.parametrize("title, own", [
+    ("Heretic (Target Artist 666% FxxK remix)", True),
+    ("Ole Olew Junkyard Remix(Target Artist's Tekno Bootleg)", True),
+    ("Dun Di Place (Target Artist's Juked Out)", True),
+    ("Hôte #04 (Crazy Funky Rmx by Target Artist)", True),
+    ("Song (Target Artist Mix) (Radio Edit)", True),
+    ("Other Song (Target Artistry Remix)", False),
+    ("Other Song (Original Mix)", False),
+])
+def test_remixer_brackets_on_the_artists_own_release(title, own):
+    scraper = SlskdArtistScraper(TARGET_NAME, slskd_client=FakeSlskdClient([]))
+    scraper.catalog = Mock(mbid=TARGET_ID, aliases={"target artist"})
+    scraper.catalog.name = TARGET_NAME
+    metadata = release(media=[[(title, "Gore Tech"), ("Plain", TARGET_NAME)]], artist=TARGET_NAME, title="EP")
+
+    ids = scraper._artist_track_ids(metadata, own_release=True)
+
+    assert ("track-1-1" in ids) is own
+
+
+def test_a_short_name_needs_a_version_word_to_credit_a_remix():
+    scraper = SlskdArtistScraper("Lone", slskd_client=FakeSlskdClient([]))
+    names = ["lone"]
+    assert scraper._credits_remixer("Other Song (Lone Remix)", names)
+    assert scraper._credits_remixer("Other Song (Lone's Rework)", names)
+    assert not scraper._credits_remixer("Other Song (Lone Wolf Remix)", names)
+    assert not scraper._credits_remixer("Lone Star", names)
+
+
+def test_dry_run_labels_each_matched_file_with_its_release_and_track(monkeypatch):
+    metadata = release(media=[[("Neon Memory", TARGET_NAME), ("Midnight Echo", TARGET_NAME)]],
+                       artist=TARGET_NAME, title="Own Album")
+    raw_data = {"artist": {"id": TARGET_ID, "name": TARGET_NAME}, "releases_artist": [metadata],
+                "releases_track_artist": [], "recordings": []}
+    files = [{"filename": rf"Music\Target Artist\Own Album\0{number} - Target Artist - {title}.flac", "size": 25000000}
+             for number, title in ((1, "Neon Memory"), (2, "Midnight Echo"))]
+
+    result, client = run_artist(monkeypatch, metadata, primary=True, dry_run=True, files=files, raw_data=raw_data)
+
+    assert sorted((file["release"], file["track"]) for file in result["matched_files"]) == [
+        ("Own Album", "Midnight Echo"), ("Own Album", "Neon Memory"),
+    ]
+
