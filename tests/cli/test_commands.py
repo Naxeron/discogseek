@@ -222,7 +222,7 @@ def test_download_progress_is_visible_before_connecting(workflow, monkeypatch, c
     assert main([command, "Target Artist", "--dry-run"]) == 0
     output = capsys.readouterr()
     assert "Scanning local and configured remote libraries" in output.err
-    assert "Executing parallel Soulseek searches" in output.err
+    assert "Searching Soulseek for the artist" in output.err
     assert "matched files (dry run" in output.out
     assert "\x1b" not in output.err
     assert workflow == []
@@ -245,7 +245,9 @@ def test_download_reports_search_counts(request, monkeypatch, capsys):
     })
     assert main(["download", "Target Artist", "--dry-run"]) == 0
     output = capsys.readouterr().err
-    assert "Soulseek searches: 3/3 cached — " in output
+    # The artist's name first; the release by name because that search showed no copy of it.
+    assert "Soulseek searches: 1/1 cached — Target Artist" in output
+    assert "Soulseek searches: 2/2 cached — " in output
     assert "checked — " not in output
 
 

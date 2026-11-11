@@ -94,3 +94,74 @@ def test_album_recording_on_a_compilation_is_not_searched_again(monkeypatch, dry
         assert client.calls == []
     else:
         assert sorted(client.enqueued_names()) == sorted(album)
+
+
+def test_first_searches_of_several_appearances_run_together(monkeypatch):
+    raw = raw_catalog([])
+    second = compilation_with("va-rec-b")
+    second.update(id="va-2", title="Second Night Signals")
+    second["release-group"] = {"id": "va-group-2", "primary-type": "Album"}
+    for number, track in enumerate(second["medium-list"][0]["track-list"], 1):
+        track["id"] = f"va-b-track-{number}"
+    raw["releases_track_artist"] = [compilation_with("va-rec-a"), second]
+    client = FakeArtistClient()
+    batches = []
+    batch_search = client.batch_search
+    client.batch_search = lambda queries, **kwargs: batches.append(list(queries)) or batch_search(queries, **kwargs)
+
+    run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    # slskd runs two searches at a time: the releases' first searches share them.
+    assert ["Shared Night Signals", "Second Night Signals"] in batches
+    assert Counter(client.queries)["Shared Night Signals"] == 1
+    assert Counter(client.queries)["Second Night Signals"] == 1
+
+
+def test_appearance_track_the_artist_search_showed_in_its_release_folder_needs_no_search(monkeypatch):
+    raw = raw_catalog([])
+    raw["releases_track_artist"] = [compilation_with("va-rec-a")]
+    copy = "@@c\\Music\\VA - Shared Night Signals (2020)\\01 Target Artist - Signal Alpha.flac"
+    client = FakeArtistClient(responder=lambda query: [response("peer", copy)] if query == ARTIST else [])
+
+    result = run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    # The artist's name and the compilation as a whole; nothing for the track itself.
+    assert client.queries == [ARTIST, "Shared Night Signals"]
+    assert [file["filename"] for download in result["release_downloads"] for file in download["queued_files"]] == [copy]
+
+
+def test_loose_copy_from_the_artist_search_waits_for_the_tracks_own_search(monkeypatch):
+    raw = raw_catalog([])
+    raw["releases_track_artist"] = [compilation_with("va-rec-a")]
+    loose = "@@l\\Music\\Target Artist\\Target Artist - Signal Alpha.mp3"
+    copy = "@@c\\Music\\VA - Shared Night Signals (2020)\\01 Target Artist - Signal Alpha.flac"
+    client = FakeArtistClient(responder=lambda query: (
+        [response("loose", loose)] if query == ARTIST
+        else [response("peer", copy)] if query == "Target Artist Signal Alpha" else []
+    ))
+
+    result = run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    assert "Target Artist Signal Alpha" in client.queries
+    assert [file["filename"] for download in result["release_downloads"] for file in download["queued_files"]] == [copy]
+
+
+def test_joint_credit_track_the_artist_search_showed_in_its_release_folder_needs_no_search(monkeypatch):
+    # 'Other Artist with Target Artist' is searched as Other Artist; the artist search already
+    # showed the file in the album's folder.
+    album = compilation_with("va-rec-a")
+    album["artist-credit"] = [{"artist": {"id": "other", "name": "Other Artist"}, "name": "Other Artist"}]
+    album["medium-list"][0]["track-list"][0]["artist-credit"] = [
+        {"artist": {"id": "other", "name": "Other Artist"}, "name": "Other Artist", "joinphrase": " with "},
+        {"artist": {"id": ARTIST_ID, "name": ARTIST}, "name": ARTIST},
+    ]
+    raw = raw_catalog([])
+    raw["releases_track_artist"] = [album]
+    copy = "@@c\\Music\\Other Artist - Shared Night Signals\\01 - Signal Alpha (with Target Artist).mp3"
+    client = FakeArtistClient(responder=lambda query: [response("peer", copy)] if query == ARTIST else [])
+
+    result = run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    # The artist's name and the album as a whole; nothing for the track itself.
+    assert client.queries == [ARTIST, "Other Artist Shared Night Signals", "Shared Night Signals"]
+    assert [file["filename"] for download in result["release_downloads"] for file in download["queued_files"]] == [copy]

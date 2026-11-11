@@ -22,7 +22,7 @@ def test_query_generation_includes_user_query_and_canonical():
     scraper = SlskdArtistScraper(artist_query="Stellabee", dry_run=True)
     scraper.catalog = cat
 
-    queries = scraper._generate_all_search_queries()
+    queries = scraper._artist_search_queries() + scraper._release_search_queries(cat.primary_releases[0])
     # Must include user query, canonical name, and release queries
     assert "Stellabee" in queries
     assert "すてらべえ" in queries

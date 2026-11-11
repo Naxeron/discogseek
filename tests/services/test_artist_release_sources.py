@@ -369,3 +369,88 @@ def test_a_folder_the_peer_did_not_list_is_not_browsed_again_for_the_next_releas
     scraper._reconcile_primary_releases()
 
     assert client.browsed == [("peer", folder)]
+
+
+def test_folder_file_named_after_the_editions_printed_title_is_its_track():
+    # MusicBrainz prints 'Moebius' on the collection for the recording 'Moebius (2024 Mix)',
+    # which the catalog first met on the EP.
+    ep = release("Moebius", ["Moebius (2024 Mix)", "Moebius (First Mix)"], 0,
+                 recordings=["r-2024", "r-first"], primary_type="EP")
+    titles = ["Moebius", "Sakebi", "Anaconda", "Beatrix"]
+    collection = release("The Singles vol.1", titles, 1, recordings=["r-2024", "r-sakebi", "r-anaconda", "r-beatrix"])
+    collection["medium-list"][0]["track-list"][0]["recording"]["title"] = "Moebius (2024 Mix)"
+    client = FakeArtistClient()
+    scraper = scraper_for(raw_catalog([ep, collection]), client)
+    files = add_dir(scraper, "peer", "Music\\Target Artist\\The Singles vol.1",
+                    [f"{number:02d} - {title}" for number, title in enumerate(titles, 1)])
+    build_index(scraper)
+
+    scraper._reconcile_primary_releases()
+    scraper._queue_downloads()
+
+    assert client.calls == [("peer", files)]
+
+
+def test_printed_title_of_another_release_does_not_name_a_differently_printed_track():
+    # The EP prints the mix in full: a bare 'Moebius' in its folder is not that track,
+    # although the collection prints the same recording that way.
+    ep_titles = ["Moebius (2024 Mix)", "Sakebi", "Anaconda", "Tin Stars", "Ember Road"]
+    ep = release("Moebius", ep_titles, 0, recordings=["r-2024", "r-sakebi", "r-anaconda", "r-tin", "r-ember"],
+                 primary_type="EP")
+    titles = ["Moebius", "Beatrix", "Sodom", "Punx", "Frenzy"]
+    collection = release("The Singles vol.1", titles, 1,
+                         recordings=["r-2024", "r-beatrix", "r-sodom", "r-punx", "r-frenzy"])
+    collection["medium-list"][0]["track-list"][0]["recording"]["title"] = "Moebius (2024 Mix)"
+    client = FakeArtistClient()
+    scraper = scraper_for(raw_catalog([ep, collection]), client)
+    ep_files = add_dir(scraper, "p1", "Music\\Target Artist\\Moebius",
+                       ["01 - Moebius", "02 - Sakebi", "03 - Anaconda", "04 - Tin Stars", "05 - Ember Road"])
+    files = add_dir(scraper, "p2", "Music\\Target Artist\\The Singles vol.1",
+                    [f"{number:02d} - {title}" for number, title in enumerate(titles, 1)])
+    build_index(scraper)
+
+    scraper._reconcile_primary_releases()
+    scraper._queue_downloads()
+
+    assert client.calls == [("p1", ep_files[1:]), ("p2", files)]
+
+
+def glass_season_editions():
+    standard = [f"Season {number}" for number in range(1, 9)]
+    bonus = ["Glass Demo", "Night Version", "Coda"]
+    shared = [f"rec-std-{number}" for number in range(len(standard))]
+    raw = raw_catalog([
+        release("Glass Season", standard, 0, group="rg-glass", recordings=shared),
+        release("Glass Season", standard + bonus, 1, group="rg-glass",
+                recordings=shared + [f"rec-bonus-{number}" for number in range(len(bonus))]),
+    ])
+    return raw, standard, bonus
+
+
+def test_folder_with_the_fullest_edition_supplies_the_release_alone():
+    raw, standard, bonus = glass_season_editions()
+    client = FakeArtistClient()
+    scraper = scraper_for(raw, client)
+    # A complete standard edition from a peer with a shorter queue, and the expanded one.
+    add_dir(scraper, "p1", "Music\\Target Artist\\Glass Season", numbered(standard), queue=0)
+    files = add_dir(scraper, "p2", "Music\\Target Artist\\Glass Season (2024)", numbered(standard + bonus), queue=40)
+    build_index(scraper)
+
+    scraper._reconcile_primary_releases()
+    scraper._queue_downloads()
+
+    assert client.calls == [("p2", files)]
+
+
+def test_fuller_edition_in_a_worse_format_only_adds_its_bonus_tracks():
+    raw, standard, bonus = glass_season_editions()
+    client = FakeArtistClient()
+    scraper = scraper_for(raw, client)
+    lossless = add_dir(scraper, "p1", "Music\\Target Artist\\Glass Season", numbered(standard))
+    lossy = add_dir(scraper, "p2", "Music\\Target Artist\\Glass Season (2024)", numbered(standard + bonus), ext="mp3")
+    build_index(scraper)
+
+    scraper._reconcile_primary_releases()
+    scraper._queue_downloads()
+
+    assert client.calls == [("p1", lossless), ("p2", lossy[len(standard):])]

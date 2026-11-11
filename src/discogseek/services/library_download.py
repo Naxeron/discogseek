@@ -145,6 +145,16 @@ def _variant_key(query: str) -> str:
     return _search_key(clean_search_phrase(query) or query)
 
 
+def first_release_query(artist: str, release_title: str) -> str:
+    """The search a release download starts with: '<artist> <title>', or the bare title of a
+    compilation ('Various Artists <title>' finds a subset of the bare title's results)."""
+    title_query = clean_search_phrase(release_title) or release_title
+    if is_various_artists(artist):
+        return title_query
+    album_query = f"{artist} {release_title}"
+    return clean_search_phrase(album_query) or album_query
+
+
 def _mixed_source_folder(folder: str, release_folder: Optional[str] = None) -> bool:
     """
     Whether a peer folder holds a radio capture, a DJ mix, a podcast, a live set or a
@@ -990,7 +1000,8 @@ def download_missing_tracks(
         Whether a peer file is the requested track. Positions are enforced in this release's
         folder (or for repeated titles); elsewhere the title must be exact. Every match needs
         evidence beyond its title: the credited artist, this release's folder, two other tracks
-        of the release in the folder, or the duration. Outside the release's folder a clearly
+        of the release in the folder, or the duration (require_artist, for the results of a
+        title-only search, takes neither the folder's name nor the duration alone). Outside the release's folder a clearly
         different duration rules the file out, a radio capture, DJ mix, podcast, live set or
         playlist dump never qualifies (unless the release or the row is such a recording), and
         a generic title ('Intro') needs a matching duration. A row marked exclusive_title
@@ -1138,7 +1149,10 @@ def download_missing_tracks(
             named_context and not require_artist and not title_is_release
             and (same_position or not generic_release)
         )
-        if not (artist_evidence or trailing_credit or duration_match or folder_evidence
+        # A title-only search returns every artist's songs of that title, and among hundreds
+        # of them one runs as long as the song by chance ('Jabberwocky', 226 s, 1969): there
+        # only the artist's name or the release's other tracks identify the file.
+        if not (artist_evidence or trailing_credit or (duration_match and not require_artist) or folder_evidence
                 or corroborated(track, user, filename)):
             return None
         return _Match(score, context, named_context, same_position, duration_match)
@@ -1172,13 +1186,17 @@ def download_missing_tracks(
         """
         A transfer submitted for this row fulfils it. Otherwise a live transfer that
         matches the row fulfils it, and a finished one only when it came from this release.
+        A release verified complete is fetched from its own folder: there a live transfer
+        of the song filed under another release (the artist's album, queued a moment ago
+        by the same artist download) does not stand for the row either, or the release
+        would lack that track until a later run.
         Matching already refused another release's 'Intro', a mix segment and an exclusive
         title outside this release, wherever a transfer is queued.
         """
         if submitted_for(track, user, file):
             return True
         record = protected_records.get((peer_key(user), source_key(user, file.get("filename", ""))[1]), {})
-        if "Succeeded" in transfer_states(record):
+        if "Succeeded" in transfer_states(record) or complete_release_tracks is not None:
             return match.named_context
         return True
 
@@ -1577,13 +1595,11 @@ def download_missing_tracks(
         if not release_title or not remaining_tracks():
             return
         title_query = clean_search_phrase(release_title) or release_title
+        first = [first_release_query(effective_artist, release_title)]
         if is_va:
-            # 'Various Artists <title>' finds a subset of the bare title's results.
-            first = [title_query]
             rest = [release_title]
         else:
             album_query = f"{artist} {release_title}"
-            first = [album_query]
             rest = [clean_search_phrase(album_query)]
             lead = primary_artist(artist)
             if lead and normalize_text(lead) != normalize_text(artist):
@@ -1724,24 +1740,37 @@ def download_missing_tracks(
             queries.append(clean_search_phrase(name))
         return unique_queries(queries)
 
-    def search_tracks(fallback: bool = False) -> None:
+    def search_tracks(fallback: bool = False, cached_only: bool = False) -> None:
+        """
+        Search the remaining rows one query round at a time. cached_only reads only searches
+        this run already made (an artist download's searches for the artist's names) and
+        takes from them only files in the release's own folder, so it costs no search.
+        """
         remaining = remaining_tracks()
         if not remaining:
             return
-        plan = fallback_queries if fallback else track_queries
+
+        def searched_names(track: Dict[str, Any]) -> List[str]:
+            # A joint credit ('Cement Tea with Coakira') is searched as its first artist;
+            # the run's searches are those for the requested artist's own names.
+            return unique_queries(fallback_queries(track) + [primary_artist(name) for name in other_names(track)])
+
+        plan = searched_names if cached_only else fallback_queries if fallback else track_queries
         queries_by_track = {track_key(track): plan(track) for track in remaining}
 
         for round_index in range(max((len(queries) for queries in queries_by_track.values()), default=0)):
             query_tracks: Dict[str, List[Dict[str, Any]]] = {}
             for track in remaining_tracks():
                 queries = queries_by_track.get(track_key(track), [])
-                if round_index < len(queries):
+                if round_index < len(queries) and (
+                        not cached_only or search_cache.get(_search_key(queries[round_index])) is not None):
                     query_tracks.setdefault(queries[round_index], []).append(track)
             if not query_tracks:
                 continue
             detail = (next(iter(query_tracks)) if len(query_tracks) == 1
                       else f"{len(query_tracks)} queries for {len(remaining_tracks())} remaining tracks")
-            report_progress(f"Track search round {round_index + 1}: {detail}…")
+            if not cached_only:
+                report_progress(f"Track search round {round_index + 1}: {detail}…")
             results, errors = run_searches(list(query_tracks), solo=search_scope == "track")
             record_search_errors(errors, query_tracks)
             if errors and len(errors) == len(query_tracks):
@@ -1760,6 +1789,11 @@ def download_missing_tracks(
                         continue
                     peer_meta[peer_key(user)] = _peer_meta(response)
                     for file in response.get("files", []):
+                        # Artist-wide results can hold tens of thousands of files: only a
+                        # path that spells the release can be its own copy.
+                        if cached_only and not release_sig_words.issubset(
+                                normalize_text(re.sub(r"[\\/]+", " ", file.get("filename", ""))).split()):
+                            continue
                         note_seen(user, file)
                         candidates.append((user, file))
                 candidates.sort(key=lambda item: candidate_rank(*item))
@@ -1774,6 +1808,10 @@ def download_missing_tracks(
                         if fallback and not (match.score >= _EXACT or match.named_context):
                             # Artist-wide results hold the artist's other songs: only the
                             # exact title, or this release's own folder, can stand for the row.
+                            continue
+                        if cached_only and not match.named_context:
+                            # Before the row's own searches only this release's copy is taken:
+                            # they may still show a better one than a loose file seen so far.
                             continue
                         available.append((user, file, match))
                         if match.named_context:
@@ -1816,6 +1854,8 @@ def download_missing_tracks(
         if complete_release_tracks is not None:
             search_album()
         elif search_scope == "track":
+            # What this run's artist-wide searches already show of the release's own folder.
+            search_tracks(fallback=True, cached_only=True)
             search_tracks()
             search_album()
             search_tracks(fallback=True)

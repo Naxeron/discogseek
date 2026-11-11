@@ -9,6 +9,8 @@ from tests.helpers.artist_mode import (
     FakeArtistClient,
     raw_catalog,
     release,
+    response,
+    run_scraper,
     scraper_for,
 )
 from discogseek.services.soulseek import SlskdArtistScraper
@@ -33,10 +35,86 @@ def test_artist_identifier_is_never_sent_as_search_text(query):
     scraper = SlskdArtistScraper(query, slskd_client=FakeArtistClient(), dry_run=True)
     scraper.catalog = machinedrum_catalog()
 
-    queries = scraper._generate_all_search_queries()
+    queries = scraper._artist_search_queries()
+    for rel in scraper.catalog.primary_releases:
+        queries += scraper._release_search_queries(rel)
 
     assert queries == ["Machinedrum", "Machinedrum Bidnezz", "Bidnezz", "Machinedrum Let It", "Let It"]
     assert not any(MBID in item or "musicbrainz" in item.lower() for item in queries)
+
+
+def test_only_the_artists_names_are_searched_before_releases_are_checked():
+    client = FakeArtistClient()
+    scraper = scraper_for(raw_catalog([release("Night Signals", ["Neon Memory"])], aliases=["Target Alias"]), client)
+
+    scraper._discover_soulseek_candidates()
+
+    assert client.queries == ["Target Artist", "target alias"]
+
+
+SIGNALS = [f"Signal {word}" for word in ("Alpha", "Bravo", "Charlie", "Delta")]
+
+
+def folder_files(folder, extension="flac"):
+    return [f"{folder}\\{number:02d} {title}.{extension}" for number, title in enumerate(SIGNALS, 1)]
+
+
+def test_release_the_artist_search_shows_complete_is_not_searched_by_name(monkeypatch):
+    raw = raw_catalog([release("Phonetic Dreams", SIGNALS)])
+    album = folder_files("@@a\\Music\\Target Artist\\Phonetic Dreams")
+    client = FakeArtistClient(responder=lambda query: [response("peer", *album)] if query == "Target Artist" else [])
+
+    result = run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    assert client.queries == ["Target Artist"]
+    assert sorted(file["filename"] for file in result["matched_files"]) == album
+
+
+def test_release_the_artist_search_does_not_show_is_searched_by_name(monkeypatch):
+    raw = raw_catalog([release("Phonetic Dreams", SIGNALS)])
+    # Filed under its label: only the title finds it, and its files name the artist.
+    album = [name.replace("\\0", "\\Target Artist - 0") for name in folder_files("@@a\\Music\\Night Label - Phonetic Dreams")]
+    client = FakeArtistClient(responder=lambda query: [response("peer", *album)] if query == "Phonetic Dreams" else [])
+
+    result = run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    assert client.queries == ["Target Artist", "Target Artist Phonetic Dreams", "Phonetic Dreams"]
+    assert sorted(file["filename"] for file in result["matched_files"]) == album
+
+
+def test_release_shown_only_in_a_lossy_copy_is_searched_by_name_for_a_lossless_one(monkeypatch):
+    raw = raw_catalog([release("Phonetic Dreams", SIGNALS)])
+    lossy = folder_files("@@a\\Music\\Target Artist\\Phonetic Dreams", "mp3")
+    lossless = folder_files("@@b\\Music\\Target Artist - Phonetic Dreams [FLAC]")
+    client = FakeArtistClient(responder=lambda query: (
+        [response("lossy", *lossy)] if query == "Target Artist"
+        else [response("lossless", *lossless)] if query == "Target Artist Phonetic Dreams" else []
+    ))
+
+    result = run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    assert "Target Artist Phonetic Dreams" in client.queries
+    assert sorted(file["filename"] for file in result["matched_files"]) == lossless
+
+
+def test_single_collected_on_a_release_found_whole_is_not_searched_by_name(monkeypatch):
+    single = release("Signal Bravo", ["Signal Bravo"], 1, recordings=["rec-0-1-2"], primary_type="Single")
+    raw = raw_catalog([single, release("Phonetic Dreams", SIGNALS)])
+    album = folder_files("@@a\\Music\\Target Artist\\Phonetic Dreams")
+    client = FakeArtistClient(responder=lambda query: [response("peer", *album)] if query == "Target Artist" else [])
+
+    result = run_scraper(scraper_for(raw, client, dry_run=True), monkeypatch, raw)
+
+    assert client.queries == ["Target Artist"]
+    assert result["unresolved_tracks"] == []
+
+
+def test_made_up_romanization_of_a_kanji_name_is_not_searched():
+    client = FakeArtistClient()
+    # ArtistCatalog also keeps each alias as unidecode spells it ('zuo teng huang').
+    scraper = scraper_for(raw_catalog([release("Night Signals", ["Neon Memory"])], aliases=["佐藤晃"]), client)
+
+    assert scraper._artist_search_queries() == ["Target Artist", "佐藤晃"]
 
 
 @pytest.mark.parametrize("options,use_existing", [
@@ -61,6 +139,7 @@ def test_failed_searches_are_reported():
     scraper = scraper_for(raw_catalog([release("Night Signals", ["Neon Memory"])]), client)
 
     scraper._discover_soulseek_candidates()
+    scraper._search_release(scraper.catalog.primary_releases[0])
 
     assert scraper.search_errors == [{"query": "Night Signals", "error": "HTTP 409: search exists"}]
 
