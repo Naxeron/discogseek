@@ -529,6 +529,8 @@ class PeerCandidateIndex:
         album_sig_words: Set[str] = set()
         for pe in parsed_expected:
             album_sig_words.update(pe["sig_words"])
+            for alternate in pe.get("alternates", ()):
+                album_sig_words.update(alternate["sig_words"])
 
         cand_dirs_set: Dict[int, CandidateDir] = {}
 
@@ -571,7 +573,8 @@ def pre_parse_single_track(track_title: str) -> Dict[str, Any]:
     """Pre-parses and tokenizes a MusicBrainz or tag title for fast matching.
 
     The title is parsed as a title, not a filename: leading numbers ('2 Is 8')
-    and ' - ' segments belong to it.
+    and ' - ' segments belong to it. Callers may add 'alternates': the same
+    track parsed under its other titles (see evaluate_directory).
     """
     p_struct = parse_track_title_structure(track_title, is_filename=False)
     clean_base = p_struct["base_norm"] or normalize_text(track_title)
@@ -946,13 +949,20 @@ def evaluate_directory(
     pairs: List[Tuple[float, int, int]] = []
     for expected_index, pe in enumerate(parsed_expected):
         position = positions[expected_index] if positions and expected_index < len(positions) else None
+        # The track under each of its titles: an edition may print another one than the
+        # recording bears ('Moebius' for 'Moebius (2024 Mix)' on a singles collection).
+        titles = [pe, *pe.get("alternates", ())]
         for file_index, cf in enumerate(audio_files):
-            tier = track_match_tier(
-                pe, pe["words"], pe["clean_words"], pe["sig_words"], pe["concat"], cf, artist_aliases, rel_title,
-            )
-            if not tier or not _has_short_title_context(
-                pe.get("core_concat") or pe["concat"], cf, artist_aliases, rel_title, cd.dir_name,
-            ):
+            tier = max((
+                track_match_tier(
+                    title, title["words"], title["clean_words"], title["sig_words"], title["concat"],
+                    cf, artist_aliases, rel_title,
+                ) for title in titles
+                if _has_short_title_context(
+                    title.get("core_concat") or title["concat"], cf, artist_aliases, rel_title, cd.dir_name,
+                )
+            ), default=0)
+            if not tier:
                 continue
             score = float(tier)
             if position and position[1] is not None:

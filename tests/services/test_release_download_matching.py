@@ -419,6 +419,28 @@ def test_title_only_album_results_need_artist_evidence():
     assert result["matched_tracks"] == []
 
 
+def test_title_only_results_of_a_single_need_more_than_a_matching_length():
+    """Hundreds of songs are called 'Jabberwocky'; one of them runs as long as the wanted one."""
+    track = {"title": "Jabberwocky", "artist": "Coakira", "track_number": 1, "duration": 226.0}
+    other = {"filename": r"@@m\## Alice through the Looking Glass - 1969 +\03 - Jabberwocky.flac",
+             "size": 1000, "length": 226}
+    client = fake_client([other], only=lambda query: query == "Jabberwocky")
+
+    result = download_missing_tracks(client, MagicMock(), "Coakira", "Jabberwocky", [track], dry_run=True)
+
+    assert result["matched_tracks"] == []
+
+
+def test_title_only_results_still_give_the_artists_own_copy():
+    track = {"title": "Jabberwocky", "artist": "Coakira", "track_number": 1, "duration": 226.0}
+    own = {"filename": r"@@m\Music\Coakira\[2026] Jabberwocky\01 Jabberwocky.flac", "size": 1000, "length": 226}
+    client = fake_client([own], only=lambda query: query == "Jabberwocky")
+
+    result = download_missing_tracks(client, MagicMock(), "Coakira", "Jabberwocky", [track], dry_run=True)
+
+    assert [file["filename"] for file in result["queued_files"]] == [own["filename"]]
+
+
 # artist-download-complete-verify-recording-titles: printed titles in complete-release verification.
 def test_complete_release_accepts_alternative_titles():
     official = [

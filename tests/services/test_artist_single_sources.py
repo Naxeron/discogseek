@@ -320,3 +320,107 @@ def test_a_mix_cd_holding_an_eps_titles_does_not_stand_for_the_ep(monkeypatch):
 
     assert sorted((user, len(files)) for user, files in client.calls) == [("geqgiuq", 4), ("rederik", 6)]
     assert result["unresolved_tracks"] == []
+
+
+@pytest.mark.parametrize("album,folder", [
+    # A digit inside a word spells a letter; it is no catalog number.
+    ("ZombiN8or", r"@@b\Music\Target Artist\2014-08 - ZombiN8or [MDSTCD-046]"),
+    # Every word of the title is one folders use for anything.
+    ("The Singles vol.1", r"@@b\Music\Fujimi Records (Target Artist) - The Singles vol.1 [FIR168] (M3-53)"),
+])
+def test_copy_in_a_folder_of_a_release_with_an_unusual_title_is_that_releases(monkeypatch, album, folder):
+    titles = ["Come Get Some", "Bit Genocide", "Dam Dam", "Tengu"]
+    raw = raw_catalog([
+        release(album, titles, 0),
+        release("Bit Genocide", ["Bit Genocide"], 1, primary_type="Single"),
+    ])
+    copy = folder + r"\02 - Target Artist - Bit Genocide.flac"
+    client = FakeArtistClient(responder=lambda query: [response("bpeer", copy)] if "Genocide" in query else [])
+    library = [local_track(raw, 0, number) for number in range(1, 5)]
+
+    result = run_scraper(scraper_for(raw, client), monkeypatch, raw, library=library)
+
+    assert client.enqueued_names() == []
+    assert [(entry["release"], entry["reason"], entry.get("folder")) for entry in result["unresolved_tracks"]] == [
+        ("Bit Genocide", "only another release's copy found", folder),
+    ]
+
+
+@pytest.mark.parametrize("folder", [
+    r"@@b\Music\Target Artist\The Singles vol.10",   # another volume the catalog does not list
+    r"@@b\Music\Target Artist\Singles",              # a folder of loose singles
+    r"@@b\Music\Target Artist [FIR115] 2019",        # codes and years name no release
+])
+def test_copy_in_a_folder_that_names_no_catalogued_release_is_taken(monkeypatch, folder):
+    titles = ["Come Get Some", "Bit Genocide", "Dam Dam", "Tengu"]
+    raw = raw_catalog([
+        release("The Singles vol.1", titles, 0),
+        release("Bit Genocide", ["Bit Genocide"], 1, primary_type="Single"),
+    ])
+    copy = folder + r"\Target Artist - Bit Genocide.flac"
+    client = FakeArtistClient(responder=lambda query: [response("bpeer", copy)] if "Genocide" in query else [])
+    library = [local_track(raw, 0, number) for number in range(1, 5)]
+
+    result = run_scraper(scraper_for(raw, client), monkeypatch, raw, library=library)
+
+    assert client.enqueued_names() == [copy]
+    assert result["unresolved_tracks"] == []
+
+
+ARCHIVE_TITLES = ["Itaconate", "Missing Link", "Front Line", "Hydrogen"]
+
+
+def archive_catalog():
+    """An album titled in Japanese, and a compilation with its own recording of one of its songs."""
+    raw = raw_catalog([release("夜の信号アーカイブス", ARCHIVE_TITLES, 0)])
+    raw["releases_track_artist"] = [compilation("va-1", "Twenty Years of Noise", [
+        ("Itaconate", ARTIST, ARTIST_ID, "va-rec-itaconate"), ("Other Song", "Other Artist", "other", "va-rec-other"),
+    ])]
+    return raw
+
+
+def test_folder_holding_another_releases_tracklist_is_that_release_whatever_its_name(monkeypatch):
+    raw = archive_catalog()
+    # The peer names the album in English: nothing in the folder's name says which release it is.
+    folder = r"@@a\Music\(2018.04.29) - Target Artist - Night Signal Archives - (flac)"
+    files = [f"{folder}\\1-{number:02d} - Target Artist - {title}.flac" for number, title in enumerate(ARCHIVE_TITLES, 1)]
+    client = FakeArtistClient(responder=lambda query: [response("apeer", *files)] if query == ARTIST else [])
+    library = [local_track(raw, 0, number) for number in range(1, 5)]
+
+    result = run_scraper(scraper_for(raw, client), monkeypatch, raw, library=library)
+
+    assert client.enqueued_names() == []
+    assert [(entry["release"], entry["title"], entry["reason"], entry.get("folder"))
+            for entry in result["unresolved_tracks"]] == [
+        ("Twenty Years of Noise", "Itaconate", "only another release's copy found", folder),
+    ]
+
+
+def test_folder_with_a_few_songs_of_another_release_is_no_copy_of_it(monkeypatch):
+    raw = archive_catalog()
+    folder = r"@@a\Music\Target Artist - Favourites"
+    files = [f"{folder}\\Target Artist - {title}.flac" for title in ARCHIVE_TITLES[:3]]
+    client = FakeArtistClient(responder=lambda query: [response("apeer", *files)] if query == ARTIST else [])
+    library = [local_track(raw, 0, number) for number in range(1, 5)]
+
+    result = run_scraper(scraper_for(raw, client), monkeypatch, raw, library=library)
+
+    assert client.enqueued_names() == [files[0]]
+    assert result["unresolved_tracks"] == []
+
+
+def test_same_named_folder_of_a_peer_that_showed_few_files_is_that_release_too(monkeypatch):
+    raw = archive_catalog()
+    whole = r"@@a\Music\(2018.04.29) - Target Artist - Night Signal Archives - (flac)"
+    files = [f"{whole}\\1-{number:02d} - Target Artist - {title}.flac" for number, title in enumerate(ARCHIVE_TITLES, 1)]
+    # This peer's client cut its search response: one file of the same folder.
+    cut = r"@@b\Doujin\Target Artist\Target Artist - Night Signal Archives\01. Target Artist - Itaconate.flac"
+    client = FakeArtistClient(responder=lambda query: (
+        [response("apeer", *files), response("bpeer", cut)] if query == ARTIST else []
+    ))
+    library = [local_track(raw, 0, number) for number in range(1, 5)]
+
+    result = run_scraper(scraper_for(raw, client), monkeypatch, raw, library=library)
+
+    assert client.enqueued_names() == []
+    assert [entry["reason"] for entry in result["unresolved_tracks"]] == ["only another release's copy found"]

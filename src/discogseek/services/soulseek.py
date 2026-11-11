@@ -39,8 +39,9 @@ from discogseek.core.transfers import DownloadHistory, resolve_downloads_dir, so
 from discogseek.clients.musicbrainz import MusicBrainzClient, ArtistCatalog, split_artist_hint
 from discogseek.services.auditor import AuditorService
 from discogseek.services.library import LibraryReleaseService
+from discogseek.services.library_audit import audit_release
 from discogseek.services.library_download import (
-    DURATION_CONFLICT_RATIO, DURATION_CONFLICT_SECONDS, DURATION_TOLERANCE, _search_key,
+    DURATION_CONFLICT_RATIO, DURATION_CONFLICT_SECONDS, DURATION_TOLERANCE, _search_key, first_release_query,
 )
 from discogseek.services.candidates import (
     CandidateDir,
@@ -94,6 +95,9 @@ _FOLDER_NOISE_WORDS = _GENERIC_FOLDERS | {
     "discography", "kbps", "bit", "khz", "aac", "ogg", "opus", "m4a", "wav", "alac", "aiff",
     "hires", "hi", "res", "lossy", "unknown", "artist", "new", "folder", "files", "the",
 }
+
+# Release downloads whose first searches run together (within the run cache's bound).
+_RELEASE_SEARCH_BATCH = 24
 
 _PEER_ERRORS = (SlskdPeerUnavailableError, SlskdPeerBlockedError, SlskdTransferFailedError)
 # Submissions slskd definitely did not queue (apart from the error's queued_files):
@@ -175,6 +179,11 @@ def _folder_title_words(path: str, aliases: FrozenSet[str]) -> List[str]:
     return _title_words(_release_folder_name(path), aliases)
 
 
+# A digit inside a word spells a letter ('ZombiN8or', 'Disintegr8or'); years, catalog codes
+# ('FIR115', 'C88') and format tags ('16bit', 'mp3') begin or end with their digits.
+_LEET_WORD_RE = re.compile(r"[^\W\d_]\d+[^\W\d_]")
+
+
 def _title_words(name: str, aliases: FrozenSet[str]) -> List[str]:
     """Significant words of a release or folder name, without the artist's names."""
     words = normalize_text(name).split()
@@ -188,7 +197,7 @@ def _title_words(name: str, aliases: FrozenSet[str]) -> List[str]:
                 index += 1
     return [
         word for word in words
-        if len(word) >= 3 and not any(char.isdigit() for char in word)
+        if len(word) >= 3 and (not any(char.isdigit() for char in word) or _LEET_WORD_RE.search(word))
         and word not in DIR_STOP_WORDS and word not in _FOLDER_NOISE_WORDS
     ]
 
@@ -347,10 +356,16 @@ class SlskdArtistScraper:
         self.local_found_releases: Set[str] = set()
         self.local_song_keys: Set[Hashable] = set()
         self.local_release_ids: Set[str] = set()
+        # The scanned library, and per release the song IDs it holds as part of that release.
+        self._library_tracks: List[Dict[str, Any]] = []
+        self._held_cache: Dict[Any, FrozenSet[str]] = {}
 
         self.peer_directories: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.candidate_index: Optional[PeerCandidateIndex] = None
         self.searches_performed: Set[str] = set()
+        # Set once the artist's names were searched: releases those searches leave
+        # incomplete are then searched by name while they are reconciled.
+        self._release_searches = False
         self._browse_attempted: Set[Tuple[str, str]] = set()
 
         self.reconciled_release_keys: Set[str] = set()
@@ -387,6 +402,12 @@ class SlskdArtistScraper:
         self._appearances: Optional[Dict[str, Set[Hashable]]] = None
         self._title_index: Optional[Dict[str, List[Dict[str, Any]]]] = None
         self._release_song_index: Optional[Dict[Tuple[str, ...], Set[Hashable]]] = None
+        # Songs of catalogued releases whose titles have no significant word, by all their words.
+        self._plain_title_songs: Dict[Tuple[str, ...], Set[Hashable]] = {}
+        # Per catalogued release (normalized title), its songs by base title; and the releases
+        # whose tracklist a discovered folder holds.
+        self._release_tracklists: Optional[Dict[str, Dict[str, Set[Hashable]]]] = None
+        self._tracklist_cache: Dict[Tuple[str, str, int], List[Tuple[str, Set[Hashable]]]] = {}
         self._lengths_by_title: Optional[Dict[str, List[float]]] = None
 
     def run(self) -> Dict[str, Any]:
@@ -622,7 +643,12 @@ class SlskdArtistScraper:
         return max(local or editions, key=lambda edition: edition["track_count"], default=None)
 
     def _plan_release(self, rel: Dict[str, Any], expected_tracks: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Group a release's expected tracks into songs and find those missing locally."""
+        """Group a release's expected tracks into songs and decide which of them to fetch.
+
+        'needed' lists the songs the release lacks: all it does not hold itself when it is
+        fetched whole, otherwise only those nothing holds yet ('fresh'). Call it in claim
+        order: songs covered by releases planned earlier count as held elsewhere.
+        """
         editions = self._release_editions(rel)
         chosen = self._chosen_edition(editions)
         positions = chosen["positions"] if chosen else {}
@@ -676,7 +702,22 @@ class SlskdArtistScraper:
             slot["position"] = (info["disc_number"], info["track_position"]) if info else None
             slot["repeated"] = title_counts[normalize_text(slot["title"])] > 1
             slot["unique"] = not slot["repeated"] and self._title_is_unique(slot["track"].get("title", ""), slot["keys"])
-        needed = [slot_id for slot_id, slot in slots.items() if not (slot["keys"] & self.local_song_keys)]
+        # Songs the library holds as part of this release, and songs nothing holds yet: neither
+        # the library (under any release) nor a release planned earlier in this run.
+        held_ids = self._held_ids(rel)
+        held = {
+            slot_id for slot_id, slot in slots.items()
+            if any(held_ids.intersection(track.get("recording_ids") or ())
+                   or held_ids.intersection(track.get("track_ids") or ()) for track in slot["tracks"])
+        }
+        elsewhere = self.local_song_keys | self.covered_song_keys
+        fresh = {slot_id for slot_id, slot in slots.items() if slot_id not in held and not (slot["keys"] & elsewhere)}
+        # A release is fetched whole when at least half of it is new or already here as this
+        # release: its songs held only on another release (an album track on a compilation)
+        # are then fetched again, so that no downloaded release has holes. A release that is
+        # mostly held elsewhere (a best-of, a single taken from an album) only adds its new songs.
+        whole = 2 * (len(fresh) + len(held)) >= len(slots)
+        needed = [slot_id for slot_id in slots if slot_id not in held and (whole or slot_id in fresh)]
 
         def on_edition(track: Dict[str, Any], edition: Dict[str, Any]) -> bool:
             ids = set(track.get("track_ids") or ()) | set(track.get("recording_ids") or ())
@@ -686,6 +727,18 @@ class SlskdArtistScraper:
             {slot_of[index] for index, track in enumerate(expected_tracks) if on_edition(track, edition)}
             for edition in editions
         ]
+        # Other titles of each expected track: what its editions print and what its recording
+        # is called, where the catalog's title (the first release seen) says something else.
+        alt_titles: List[List[str]] = []
+        for track in expected_tracks:
+            names: Dict[str, str] = {}
+            for edition in editions:
+                for key in sorted(track.get("track_ids") or ()) + sorted(track.get("recording_ids") or ()):
+                    info = edition["positions"].get(key) or {}
+                    for name in (info.get("title"), info.get("recording_title")):
+                        if name and normalize_text(name) != normalize_text(track.get("title")):
+                            names.setdefault(normalize_text(name), name)
+            alt_titles.append(list(names.values()))
         return {
             "release": rel.get("title", ""),
             "release_id": rel.get("id"),
@@ -694,8 +747,13 @@ class SlskdArtistScraper:
             "slot_of": slot_of,
             "slots": slots,
             "positions": track_positions,
+            "alt_titles": alt_titles,
             "editions": [songs for songs in edition_slots if songs],
             "needed": needed,
+            # Needed songs nothing holds; the other needed songs are held on another release and
+            # come only from this release's own folder.
+            "fresh": fresh,
+            "whole": whole,
             "has_local": len(needed) < len(slots),
             "candidates": [],
             "dir_slots": set(),
@@ -719,6 +777,8 @@ class SlskdArtistScraper:
         local_tracks = AuditorService(mb_client=self.mb_client).scan_library(
             self.catalog, self.music_dir, full_scan=self.full_scan, threads=self.threads,
         )
+        self._library_tracks = list(local_tracks)
+        self._held_cache = {}
         self._audit_full_releases(local_tracks)
 
         logging.getLogger(__name__).info("Comparing %s library tracks with the discography...", len(local_tracks))
@@ -746,7 +806,8 @@ class SlskdArtistScraper:
             if not rel_tracks:
                 continue
 
-            if all(self._song_keys(t) & self.local_song_keys for t in rel_tracks):
+            # Nothing of it is needed: complete here, or every song is held on other releases.
+            if not self._plan_release(rel, rel_tracks)["needed"]:
                 self.local_found_releases.add(norm_rel)
                 self.reconciled_release_keys.add(norm_rel)
 
@@ -772,6 +833,91 @@ class SlskdArtistScraper:
             return self.catalog.mbid not in ids
         display = ArtistCatalog.format_credit(credit_list)
         return bool(display) and not artist_credit_matches(self.catalog.name, display, aliases)
+
+    def _release_library_tracks(
+        self, metadata: Dict[str, Any], appearance: bool, library_tracks: List[Dict[str, Any]],
+    ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """(release artist, the library's files of one MusicBrainz release, recording candidates).
+
+        A file is the release's when it is tagged with its ID, tagged with its album title
+        under a fitting album artist, or untagged in a folder named after it. Files tagged
+        as another edition are candidates that can only supply their exact recording.
+        """
+        release_id = metadata.get("id")
+        title = metadata.get("title", "")
+        norm_title = normalize_text(title)
+        artist = ArtistCatalog.format_credit(
+            metadata.get("artist-credit"),
+            default="Various Artists" if appearance else self.catalog.name,
+        )
+        credited_artists: Set[str] = set()
+        credited_names = {
+            name for credit in metadata.get("artist-credit") or [] if isinstance(credit, dict)
+            for name in (credit.get("name"), credit.get("artist", {}).get("name")) if name
+        }
+        for medium in metadata.get("medium-list", []):
+            for track in medium.get("track-list", []):
+                credit_list = track.get("artist-credit") or track.get("recording", {}).get("artist-credit")
+                credit = ArtistCatalog.format_credit(credit_list)
+                if credit:
+                    credited_artists.add(normalize_text(credit))
+                for credit in credit_list or []:
+                    if isinstance(credit, dict):
+                        credited_artists.update(normalize_text(name) for name in (
+                            credit.get("name"), credit.get("artist", {}).get("name"),
+                        ) if name)
+        release_names = credited_names | set(self.catalog.aliases) | {self.catalog.name}
+        named_folder = re.compile(r"(?<!\w)" + re.escape(norm_title) + r"(?!\w)") if norm_title else None
+        tracks, recording_candidates = [], []
+        for track in library_tracks:
+            release_ids = track.get("mb_release_ids") or set()
+            if release_id in release_ids:
+                tracks.append(dict(track))
+                continue
+            album = normalize_text(track.get("album") or track.get("norm_album", ""))
+            if album != norm_title:
+                # Untagged audio can still be grouped by its release folder; the file's
+                # own name is no folder ('06 Sickle.flac' is a song, not the album).
+                folder = normalize_text(str(Path(str(track.get("path") or "")).parent))
+                if album or named_folder is None or not named_folder.search(folder):
+                    continue
+            album_artist = track.get("album_artist")
+            # Tags often name one credited artist, another joiner ('x', 'vs')
+            # or another credited spelling of the same release credit.
+            if (album_artist and not is_various_artists(album_artist)
+                    and (is_various_artists(artist)
+                         or not artist_credit_matches(artist, album_artist, release_names))):
+                track_artists = {normalize_text(name) for name in track.get("artists", [])}
+                if not is_various_artists(artist) or not track_artists.intersection(credited_artists):
+                    continue
+            # Other tagged editions can only supply exact recordings at the
+            # same position, as in the incomplete-release browser.
+            (recording_candidates if release_ids else tracks).append(dict(track))
+        return artist, tracks, recording_candidates
+
+    def _held_ids(self, rel: Dict[str, Any]) -> FrozenSet[str]:
+        """Recording and track IDs the library holds as part of this release (any edition).
+
+        A song filed under another release (a compilation it also appears on) is not held:
+        the browser, like any library organized by release, would show this one incomplete.
+        """
+        key = rel.get("id") or id(rel)
+        if key not in self._held_cache:
+            held: Set[str] = set()
+            for metadata in self._release_family(rel) if self._library_tracks else []:
+                artist, tracks, candidates = self._release_library_tracks(metadata, False, self._library_tracks)
+                if not tracks and not candidates:
+                    continue
+                # The release audit the browser uses, on the catalog's own metadata (no lookup).
+                audit = audit_release(self.mb_client, {
+                    "artist": artist, "title": metadata.get("title", ""), "mb_release_id": metadata.get("id"),
+                    "is_va": False, "tracks": tracks, "recording_candidates": candidates,
+                }, mb_release=metadata)
+                for row in audit.get("tracks", []):
+                    if row.get("status") == "found" and not row.get("is_extra"):
+                        held.update(value for value in (row.get("mb_recording_id"), row.get("mb_track_id")) if value)
+            self._held_cache[key] = frozenset(held)
+        return self._held_cache[key]
 
     def _audit_full_releases(self, library_tracks: List[Dict[str, Any]]) -> None:
         """Audit complete appearances and splits using the shared library inventory."""
@@ -799,7 +945,6 @@ class SlskdArtistScraper:
                 for medium in metadata.get("medium-list", [])
                 for track in medium.get("track-list", [])
             ]
-            credits = [ArtistCatalog.format_credit(credit_list) for credit_list in credit_lists]
             if appearance:
                 # MusicBrainz often returns the same album in both artist searches.
                 if release_id in primary_ids or group_id in primary_groups:
@@ -816,51 +961,7 @@ class SlskdArtistScraper:
                     if release.get("release_group_id") == group_id
                 )
             title = metadata.get("title", "")
-            norm_title = normalize_text(title)
-            artist = ArtistCatalog.format_credit(
-                metadata.get("artist-credit"),
-                default="Various Artists" if appearance else self.catalog.name,
-            )
-            credited_artists = {normalize_text(credit) for credit in credits if credit}
-            credited_names = {
-                name for credit in metadata.get("artist-credit") or [] if isinstance(credit, dict)
-                for name in (credit.get("name"), credit.get("artist", {}).get("name")) if name
-            }
-            for medium in metadata.get("medium-list", []):
-                for track in medium.get("track-list", []):
-                    for credit in (track.get("artist-credit")
-                                   or track.get("recording", {}).get("artist-credit") or []):
-                        if isinstance(credit, dict):
-                            credited_artists.update(normalize_text(name) for name in (
-                                credit.get("name"), credit.get("artist", {}).get("name"),
-                            ) if name)
-            release_names = credited_names | set(self.catalog.aliases) | {self.catalog.name}
-            tracks, recording_candidates = [], []
-            for track in library_tracks:
-                release_ids = track.get("mb_release_ids") or set()
-                if release_id in release_ids:
-                    tracks.append(dict(track))
-                    continue
-                album = normalize_text(track.get("album") or track.get("norm_album", ""))
-                if album != norm_title:
-                    # Untagged audio can still be grouped by its release folder.
-                    path = normalize_text(str(track.get("path", "")))
-                    if album or not norm_title or not re.search(
-                        r"(?<!\w)" + re.escape(norm_title) + r"(?!\w)", path,
-                    ):
-                        continue
-                album_artist = track.get("album_artist")
-                # Tags often name one credited artist, another joiner ('x', 'vs')
-                # or another credited spelling of the same release credit.
-                if (album_artist and not is_various_artists(album_artist)
-                        and (is_various_artists(artist)
-                             or not artist_credit_matches(artist, album_artist, release_names))):
-                    track_artists = {normalize_text(name) for name in track.get("artists", [])}
-                    if not is_various_artists(artist) or not track_artists.intersection(credited_artists):
-                        continue
-                # Other tagged editions can only supply exact recordings at the
-                # same position, as in the incomplete-release browser.
-                (recording_candidates if release_ids else tracks).append(dict(track))
+            artist, tracks, recording_candidates = self._release_library_tracks(metadata, appearance, library_tracks)
             audit = service.audit_release({
                 "artist": artist, "title": title, "mb_release_id": release_id,
                 "is_va": appearance, "tracks": tracks,
@@ -949,12 +1050,37 @@ class SlskdArtistScraper:
         """
         def accept(row: Dict[str, Any], user: str, file: Dict[str, Any]) -> bool:
             slot = {"keys": self._row_song_keys(row), "title": row.get("title", ""), "duration": row.get("duration")}
-            folder = self._other_release_copy(file, release, slot)
+            folder = self._other_release_copy(file, release, slot, user)
             if folder is None:
                 return True
             refused.setdefault(id(row), folder)
             return False
         return accept
+
+    def _prefetch_release_searches(self, audits: List[Dict[str, Any]]) -> None:
+        """Run the first search of several release downloads together.
+
+        Each release download starts with one search; one at a time they leave one of
+        slskd's two search slots idle. The results land in the run's search cache, where
+        the release downloads find them; a failed search is repeated by its release.
+        """
+        queries = list(dict.fromkeys(
+            first_release_query(audit["artist"], audit.get("mb_release_title") or audit["title"]) for audit in audits
+        ))
+        queries = [query for query in queries if query and self.search_cache.get(_search_key(query)) is None]
+        if len(queries) < 2:
+            return
+        logging.getLogger(__name__).info("Searching %s releases together...", len(queries))
+        try:
+            results = self.client.batch_search(
+                queries, timeout=self.search_timeout, use_existing=self._reuse_searches(),
+            )
+        except Exception as error:
+            logging.getLogger(__name__).info("Could not search releases together: %s", error)
+            return
+        for query, data in (results or {}).items():
+            if isinstance(data, dict) and "error" not in data:
+                self.search_cache[_search_key(query)] = data
 
     def _download_full_releases(self) -> None:
         """Prefer a verified complete release; otherwise fetch only this artist's tracks."""
@@ -964,7 +1090,15 @@ class SlskdArtistScraper:
         # count as queued, so it plans the same searches as a real run.
         planned = self.covered_song_keys if self.dry_run else set()
         names = self._artist_names()
+        pending = [
+            audit for audit in self.full_release_audits
+            if any(track.get("status") == "missing" for track in audit.get("tracks", []))
+        ]
+        batch_start = {id(audit): index for index, audit in enumerate(pending) if index % _RELEASE_SEARCH_BATCH == 0}
         for audit in self.full_release_audits:
+            if id(audit) in batch_start:
+                start = batch_start[id(audit)]
+                self._prefetch_release_searches(pending[start:start + _RELEASE_SEARCH_BATCH])
             for track in audit.get("tracks", []):
                 if track.get("mb_track_id") in audit["artist_track_ids"]:
                     # Credited as 'Kyou', the song may still be filed under 'kyou1110'.
@@ -1061,73 +1195,59 @@ class SlskdArtistScraper:
     # Soulseek discovery
     # ------------------------------------------------------------------
 
-    def _generate_all_search_queries(self) -> List[str]:
-        queries: List[str] = []
-        search_artist = self.search_artist or ""
-
-        # 1. Primary Artist Names (User query + Canonical MB Name)
-        if search_artist:
-            q_user = clean_search_phrase(search_artist)
-            if q_user and q_user not in queries:
-                queries.append(q_user)
-
-        if self.catalog and self.catalog.name:
-            q_name = clean_search_phrase(self.catalog.name)
-            if q_name and q_name not in queries:
-                queries.append(q_name)
-
-        # 2. Targeted Primary Release Queries (User Query + Release, Canonical Name + Release, Release Title)
-        if self.catalog:
-            for rel in self.catalog.primary_releases:
-                if rel.get("id") in self._full_release_ids:
-                    continue
-                rel_title = rel.get("title", "")
-                norm_rel = normalize_text(rel_title)
-                if not rel_title or norm_rel in self.local_found_releases:
-                    continue
-
-                clean_rel = clean_search_phrase(rel_title)
-
-                # Query with user artist query (e.g. "Stellabee Breakcore Forever")
-                if search_artist:
-                    q_user_rel = clean_search_phrase(f"{search_artist} {rel_title}")
-                    if q_user_rel and q_user_rel not in queries:
-                        queries.append(q_user_rel)
-
-                # Query with canonical name (e.g. "すてらべえ Breakcore Forever")
-                if self.catalog.name and self.catalog.name.lower() != search_artist.lower():
-                    q_canon_rel = clean_search_phrase(f"{self.catalog.name} {rel_title}")
-                    if q_canon_rel and q_canon_rel not in queries:
-                        queries.append(q_canon_rel)
-
-                # If the release title is distinctive (len >= 4 and not generic noise), add release title query
-                if clean_rel and len(clean_rel) >= 4 and clean_rel.lower() not in DIR_STOP_WORDS and clean_rel.lower() not in GENERIC_OR_COMMON_WORDS:
-                    if clean_rel not in queries:
-                        queries.append(clean_rel)
-
-        # 3. Artist Aliases (Ordered by relevance, skipping overly short/symbolic noise)
-        if self.catalog:
-            for alias in self.catalog.aliases:
-                alias_clean = clean_search_phrase(alias)
-                if alias_clean and len(alias_clean) >= 3 and alias_clean.lower() != search_artist.lower() and alias_clean.lower() != self.catalog.name.lower():
-                    if alias_clean not in queries:
-                        queries.append(alias_clean)
-
+    @staticmethod
+    def _search_texts(queries: List[str]) -> List[str]:
+        """Each usable search text once: at least three characters, never an artist identifier."""
         return list(dict.fromkeys(q for q in queries if q and len(q) >= 3 and not is_artist_identifier(q)))
+
+    def _artist_search_queries(self) -> List[str]:
+        """The artist's names as search text: the user's query, the canonical name, then aliases."""
+        search_artist = self.search_artist or ""
+        name = (self.catalog.name if self.catalog else "") or ""
+        queries = [clean_search_phrase(text) for text in (search_artist, name) if text]
+        aliases = sorted(self.catalog.aliases) if self.catalog else []
+        # unidecode spells Han characters as Mandarin syllables ('zuo teng huang' for 佐藤晃):
+        # a made-up romanization no peer files the artist under.
+        romanized = {
+            unidecode(alias).strip().lower() for alias in aliases
+            if any("\u4e00" <= char <= "\u9fff" for char in alias)
+        }
+        for alias in aliases:
+            alias_clean = clean_search_phrase(alias)
+            if (alias_clean and len(alias_clean) >= 3 and alias not in romanized
+                    and alias_clean.lower() not in (search_artist.lower(), name.lower())):
+                queries.append(alias_clean)
+        return self._search_texts(queries)
+
+    def _release_search_queries(self, rel: Dict[str, Any]) -> List[str]:
+        """One release as search text: with the user's artist query, with the canonical
+        name, and its title alone when that is distinctive."""
+        rel_title = rel.get("title", "")
+        if not rel_title:
+            return []
+        search_artist = self.search_artist or ""
+        name = (self.catalog.name if self.catalog else "") or ""
+        queries = []
+        # The user's spelling (e.g. "Stellabee Breakcore Forever") ...
+        if search_artist:
+            queries.append(clean_search_phrase(f"{search_artist} {rel_title}"))
+        # ... and the canonical one (e.g. "すてらべえ Breakcore Forever").
+        if name and name.lower() != search_artist.lower():
+            queries.append(clean_search_phrase(f"{name} {rel_title}"))
+        clean_rel = clean_search_phrase(rel_title)
+        if (clean_rel and len(clean_rel) >= 4 and clean_rel.lower() not in DIR_STOP_WORDS
+                and clean_rel.lower() not in GENERIC_OR_COMMON_WORDS):
+            queries.append(clean_rel)
+        return self._search_texts(queries)
 
     def _reuse_searches(self) -> bool:
         """Whether every search of this run may reuse slskd's recent results; a refresh asks the network again."""
         return not (self.force_refresh or self.refresh_searches)
 
-    def _discover_soulseek_candidates(self) -> None:
+    def _index_search_results(self, batch_results: Dict[str, Dict[str, Any]]) -> Set[Tuple[str, str]]:
+        """Add search results to the peer folders; returns the folders that gained files."""
         logger = logging.getLogger(__name__)
-        all_queries = self._generate_all_search_queries()
-        logger.info(f"\nExecuting parallel Soulseek searches ({len(all_queries)} targeted queries)...")
-
-        batch_results = self.client.batch_search(
-            all_queries, timeout=self.search_timeout, poll_interval=1.0, use_existing=self._reuse_searches(),
-        )
-        total_files = 0
+        touched: Set[Tuple[str, str]] = set()
         for query_str, s_data in batch_results.items():
             if s_data.get("error"):
                 logger.warning("Soulseek search '%s' failed: %s", query_str, s_data["error"])
@@ -1164,10 +1284,51 @@ class SlskdArtistScraper:
                     if fn_norm not in self.peer_directories[key]["_seen_files"]:
                         self.peer_directories[key]["_seen_files"].add(fn_norm)
                         self.peer_directories[key]["matched_search_files"].append(f)
-                        total_files += 1
+                        touched.add(key)
+        return touched
 
+    def _discover_soulseek_candidates(self) -> None:
+        """Search Soulseek for the artist's names.
+
+        Everything filed under the artist answers these searches, so a release is searched
+        by name only when they leave it without a complete copy (see _search_release).
+        """
+        logger = logging.getLogger(__name__)
+        queries = self._artist_search_queries()
+        logger.info(f"\nSearching Soulseek for the artist ({len(queries)} queries)...")
+
+        batch_results = self.client.batch_search(
+            queries, timeout=self.search_timeout, poll_interval=1.0, use_existing=self._reuse_searches(),
+        )
+        self._index_search_results(batch_results)
+        total_files = sum(len(info["matched_search_files"]) for info in self.peer_directories.values())
         logger.info(f"✔ Soulseek Discovery: Found {len(self.peer_directories)} candidate directories ({total_files} candidate files).")
         self.candidate_index = PeerCandidateIndex(self.peer_directories)
+        self._release_searches = True
+
+    def _search_release(self, rel: Dict[str, Any]) -> bool:
+        """Search one release by name, once per run; True when that showed files not seen before."""
+        if not self._release_searches or self.candidate_index is None:
+            return False
+        queries = [query for query in self._release_search_queries(rel) if query not in self.searches_performed]
+        if not queries:
+            return False
+        logger = logging.getLogger(__name__)
+        logger.info("Searching Soulseek for %s (%s queries)...", rel.get("title", ""), len(queries))
+        try:
+            batch_results = self.client.batch_search(
+                queries, timeout=self.search_timeout, poll_interval=1.0, use_existing=self._reuse_searches(),
+            )
+        except Exception as error:
+            logger.warning("Soulseek searches for %s failed: %s", rel.get("title", ""), error)
+            for query in queries:
+                self.searches_performed.add(query)
+                self.search_errors.append({"query": query, "error": str(error)})
+            return False
+        touched = self._index_search_results(batch_results)
+        for user, directory in sorted(touched):
+            self.candidate_index.update_directory(user, directory, self.peer_directories[(user, directory)])
+        return bool(touched)
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -1263,7 +1424,9 @@ class SlskdArtistScraper:
         threshold = 0.9 * len(songs)
         hits: Dict[Tuple[str, str], Set[int]] = {}
         for index in edition:
-            for cf in self.candidate_index.files_with_base(parsed_expected[index]["p_struct"]["base_norm"]):
+            parsed = parsed_expected[index]
+            bases = {title["p_struct"]["base_norm"] for title in [parsed, *parsed.get("alternates", ())]}
+            for cf in (cf for base in sorted(bases) for cf in self.candidate_index.files_with_base(base)):
                 hits.setdefault((cf.user, cf.dir_name), set()).add(plan["slot_of"][index])
                 group = self.candidate_index.group_for(cf.user, cf.dir_name)
                 if group is not None:
@@ -1334,15 +1497,47 @@ class SlskdArtistScraper:
             entries.extend(unresolved)
             rel = plan["rel"]
             listed = any(item is rel for item in self.unresolved_releases)
+            # Every song it lacked is queued by now, here or with another release (a single
+            # whose song comes with a compilation fetched whole).
+            supplied = all(
+                slot_id in plan["resolved"] or plan["slots"][slot_id]["keys"] & self.queued_song_keys
+                for slot_id in plan["needed"] if slot_id in plan["fresh"]
+            )
             if unresolved and not listed:
                 self.unresolved_releases.append(rel)
-            elif not unresolved and listed and (plan["resolved"] or plan["candidates"] or plan["track_slots"]):
+            elif not unresolved and listed and (
+                    plan["resolved"] or plan["candidates"] or plan["track_slots"] or supplied):
                 self.unresolved_releases = [item for item in self.unresolved_releases if item is not rel]
         self.unresolved_tracks = entries + self._full_release_unresolved
 
+    def _claim_order(self, rel: Dict[str, Any]) -> Tuple[int, int]:
+        """Sort key for the order in which releases claim the songs they share.
+
+        Albums and EPs first, then compilations, then singles and EPs of up to three songs
+        (digital two-track 'EPs'), and within each the release with the most songs: a single
+        taken from an album, or one collected on a singles compilation, then adds nothing,
+        and an album repackaged in a compilation stays whole.
+        """
+        kinds: Set[str] = set()
+        recordings: Set[str] = set()
+        for metadata in self._release_family(rel):
+            group = metadata.get("release-group") or {}
+            kinds.update(kind.lower() for kind in group.get("secondary-type-list") or group.get("secondary-types") or [])
+            kinds.add((group.get("primary-type") or group.get("type") or rel.get("type") or "").lower())
+            recordings.update(
+                (track.get("recording") or {}).get("id") or track.get("id") or ""
+                for medium in metadata.get("medium-list", []) for track in medium.get("track-list", [])
+            )
+        compilation = "compilation" in kinds
+        # A short album is still an album; a compilation of three songs is a small release.
+        small = len(recordings) <= 3 and ("album" not in kinds or compilation)
+        rank = 2 if "single" in kinds or small else 1 if compilation else 0
+        return rank, -len(recordings)
+
     def _reconcile_primary_releases(self) -> None:
         logger = logging.getLogger(__name__)
-        primary_rels = self.catalog.primary_releases
+        # Stable: releases of one kind and size keep their catalog order.
+        primary_rels = sorted(self.catalog.primary_releases, key=self._claim_order)
         logger.info(f"\nVerifying Primary Releases ({len(primary_rels)} releases)...")
 
         if self.candidate_index is None:
@@ -1366,8 +1561,12 @@ class SlskdArtistScraper:
                 continue
             self._release_plans[norm_rel] = plan
             needed = set(plan["needed"])
+            fresh = plan["fresh"]
+            aliases = frozenset(self.all_artist_aliases)
 
             parsed_expected = pre_parse_expected_tracks(expected_tracks)
+            for parsed, titles in zip(parsed_expected, plan["alt_titles"]):
+                parsed["alternates"] = [pre_parse_single_track(title) for title in titles]
             clean_rel = clean_tokens(rel_title)
             rel_words = [w for w in _tokenize_words_cached(rel_title) if w not in DIR_STOP_WORDS]
             rel_sig_words = {w for w in rel_words if len(w) >= 3}
@@ -1378,10 +1577,16 @@ class SlskdArtistScraper:
                     track_keys=plan["slot_of"], positions=plan["positions"],
                 )
 
+            def supplied(evaluation: Dict[str, Any]) -> Set[int]:
+                """Needed songs a folder may supply. A song held on another release is fetched
+                again only from this release's own folder; any accepted folder supplies new ones."""
+                return (needed if evaluation.get("own_folder") else fresh)
+
             def accepted(evaluation: Optional[Dict[str, Any]]) -> bool:
                 if not evaluation:
                     return False
-                if not _is_release_folder(evaluation["directory"], rel_title, frozenset(self.all_artist_aliases)):
+                evaluation["own_folder"] = _is_release_folder(evaluation["directory"], rel_title, aliases)
+                if not evaluation["own_folder"]:
                     # Another folder holding these titles ('Fuck Shit Up X-Toxic' for 'Dissident
                     # Sound Maniak') supplies only songs at their length: a mix CD's segment or
                     # another edit is not this release's track, and already queued for its own release.
@@ -1412,106 +1617,136 @@ class SlskdArtistScraper:
                 evaluation["edition_ratio"] = edition_ratio
                 evaluation["total_score"] += (ratio - evaluation["match_ratio"]) * 100
                 # A source must supply at least one track that is still missing.
-                return ratio >= self.min_match_ratio and bool(needed & matched)
+                return ratio >= self.min_match_ratio and bool(supplied(evaluation) & matched)
 
-            cand_dirs = self.candidate_index.get_candidate_dirs_for_release(rel_title, parsed_expected, len(expected_tracks))
-            evidence_dirs = self._tracklist_evidence_dirs(plan, parsed_expected)
-            known = {id(cd) for cd in cand_dirs}
-            cand_dirs += [cd for cd in evidence_dirs if id(cd) not in known]
-            evidence_ids = {id(cd) for cd in evidence_dirs}
-            # Keyed by folder; a merged multi-disc copy is kept apart from its parent folder's own files.
-            candidate_matches: Dict[Tuple[str, str, bool], Dict[str, Any]] = {}
+            def folders() -> List[Dict[str, Any]]:
+                """Accepted folders of the release among the indexed ones, best first."""
+                cand_dirs = self.candidate_index.get_candidate_dirs_for_release(rel_title, parsed_expected, len(expected_tracks))
+                evidence_dirs = self._tracklist_evidence_dirs(plan, parsed_expected)
+                known = {id(cd) for cd in cand_dirs}
+                cand_dirs += [cd for cd in evidence_dirs if id(cd) not in known]
+                evidence_ids = {id(cd) for cd in evidence_dirs}
+                # Keyed by folder; a merged multi-disc copy is kept apart from its parent folder's own files.
+                candidate_matches: Dict[Tuple[str, str, bool], Dict[str, Any]] = {}
 
-            def match_key(cd: CandidateDir) -> Tuple[str, str, bool]:
-                return cd.user, cd.dir_name, bool(cd.dir_info.get("merged"))
+                def match_key(cd: CandidateDir) -> Tuple[str, str, bool]:
+                    return cd.user, cd.dir_name, bool(cd.dir_info.get("merged"))
 
-            # Phase 1: Evaluate candidate directories with already indexed search files
-            browse_pool: List[Tuple[CandidateDir, Optional[Dict[str, Any]]]] = []
-            for cd in cand_dirs:
-                if not is_dir_name_match_fast(clean_rel, rel_sig_words, cd) and id(cd) not in evidence_ids:
-                    continue
-                evaluation = evaluate(cd) if cd.audio_files else None
-                if accepted(evaluation):
-                    candidate_matches[match_key(cd)] = evaluation
-                if (not cd.audio_files or len(cd.audio_files) < len(plan["slots"])) and self._is_unbrowsed(cd):
-                    browse_pool.append((cd, evaluation))
-
-            # Phase 2: browse the most promising folders when missing songs remain uncovered.
-            covered = {slot for candidate in candidate_matches.values() for slot in self._slot_targets(plan, candidate).values()}
-            if needed - covered and browse_pool:
-                browse_pool.sort(key=lambda item: self._browse_rank(rel_title, *item))
-                to_browse = browse_pool[:6]
-                requests = list(dict.fromkeys(
-                    (cd.user, folder) for cd, _ in to_browse for folder in cd.disc_dirs
-                    if self._needs_browse(cd.user, folder)
-                ))
-                # Search results may show only some discs of a multi-disc copy:
-                # also ask for the disc folders its naming implies ('CD1' -> 'CD2').
-                disc_count = max(((slot["info"] or {}).get("disc_number") or 1 for slot in plan["slots"].values()), default=1)
-                guessed: Dict[Tuple[str, str], Dict[str, Any]] = {}
-                for cd, _ in to_browse:
-                    if len(cd.disc_dirs) >= disc_count:
+                # Phase 1: Evaluate candidate directories with already indexed search files
+                browse_pool: List[Tuple[CandidateDir, Optional[Dict[str, Any]]]] = []
+                for cd in cand_dirs:
+                    if not is_dir_name_match_fast(clean_rel, rel_sig_words, cd) and id(cd) not in evidence_ids:
                         continue
-                    for folder in cd.disc_dirs:
-                        for sibling in _sibling_disc_folders(folder, disc_count):
-                            if (cd.user, sibling) not in self.peer_directories and (cd.user, sibling) not in self._browse_attempted:
-                                guessed.setdefault((cd.user, sibling), cd.dir_info)
-                requests += [key for key in guessed if key not in requests]
-                self._browse_attempted.update(requests)
-                logger.info("Browsing %s peer directories for %s...", len(requests), rel_title)
-                try:
-                    browse_res = self.client.browse_directories_batch(requests, max_workers=6)
-                except Exception as error:
-                    logger.warning("Could not browse peer directories for %s: %s", rel_title, error)
-                    browse_res = {}
-                for (user, directory), remote_files in browse_res.items():
-                    if remote_files and (user, directory) in guessed:
-                        source = guessed[(user, directory)]
-                        self.peer_directories[(user, directory)] = {
-                            "user": user, "directory": directory, "speed": source.get("speed", 0),
-                            "queue": source.get("queue", 0), "has_slot": source.get("has_slot", True),
-                            "matched_search_files": [], "full_directory_files": None, "_seen_files": set(),
-                        }
-                    if remote_files and (user, directory) in self.peer_directories:
-                        self.peer_directories[(user, directory)]["full_directory_files"] = remote_files
-                        self.candidate_index.update_directory(user, directory, self.peer_directories[(user, directory)])
-                browsed: Dict[int, CandidateDir] = {}
-                for cd, _ in to_browse:
-                    updated = (
-                        self.candidate_index.disc_groups.get((cd.user, cd.dir_name))
-                        if cd.dir_info.get("merged") else self.candidate_index.dirs_map.get((cd.user, cd.dir_name))
-                    )
-                    # A browsed disc folder also completes the release folder it belongs to.
-                    for item in (updated, self.candidate_index.group_for(cd.user, cd.dir_name)):
-                        if item is not None and item is not cd and item.audio_files:
-                            browsed[id(item)] = item
-                for updated in browsed.values():
-                    evaluation = evaluate(updated)
+                    evaluation = evaluate(cd) if cd.audio_files else None
                     if accepted(evaluation):
-                        candidate_matches[match_key(updated)] = evaluation
+                        candidate_matches[match_key(cd)] = evaluation
+                    if (not cd.audio_files or len(cd.audio_files) < len(plan["slots"])) and self._is_unbrowsed(cd):
+                        browse_pool.append((cd, evaluation))
 
-            ranked = sorted(candidate_matches.values(), key=lambda item: item["total_score"], reverse=True)
+                # Phase 2: browse the most promising folders when missing songs remain uncovered.
+                covered = {slot for candidate in candidate_matches.values() for slot in self._slot_targets(plan, candidate).values()}
+                if needed - covered and browse_pool:
+                    browse_pool.sort(key=lambda item: self._browse_rank(rel_title, *item))
+                    to_browse = browse_pool[:6]
+                    requests = list(dict.fromkeys(
+                        (cd.user, folder) for cd, _ in to_browse for folder in cd.disc_dirs
+                        if self._needs_browse(cd.user, folder)
+                    ))
+                    # Search results may show only some discs of a multi-disc copy:
+                    # also ask for the disc folders its naming implies ('CD1' -> 'CD2').
+                    disc_count = max(((slot["info"] or {}).get("disc_number") or 1 for slot in plan["slots"].values()), default=1)
+                    guessed: Dict[Tuple[str, str], Dict[str, Any]] = {}
+                    for cd, _ in to_browse:
+                        if len(cd.disc_dirs) >= disc_count:
+                            continue
+                        for folder in cd.disc_dirs:
+                            for sibling in _sibling_disc_folders(folder, disc_count):
+                                if (cd.user, sibling) not in self.peer_directories and (cd.user, sibling) not in self._browse_attempted:
+                                    guessed.setdefault((cd.user, sibling), cd.dir_info)
+                    requests += [key for key in guessed if key not in requests]
+                    self._browse_attempted.update(requests)
+                    logger.info("Browsing %s peer directories for %s...", len(requests), rel_title)
+                    try:
+                        browse_res = self.client.browse_directories_batch(requests, max_workers=6)
+                    except Exception as error:
+                        logger.warning("Could not browse peer directories for %s: %s", rel_title, error)
+                        browse_res = {}
+                    for (user, directory), remote_files in browse_res.items():
+                        if remote_files and (user, directory) in guessed:
+                            source = guessed[(user, directory)]
+                            self.peer_directories[(user, directory)] = {
+                                "user": user, "directory": directory, "speed": source.get("speed", 0),
+                                "queue": source.get("queue", 0), "has_slot": source.get("has_slot", True),
+                                "matched_search_files": [], "full_directory_files": None, "_seen_files": set(),
+                            }
+                        if remote_files and (user, directory) in self.peer_directories:
+                            self.peer_directories[(user, directory)]["full_directory_files"] = remote_files
+                            self.candidate_index.update_directory(user, directory, self.peer_directories[(user, directory)])
+                    browsed: Dict[int, CandidateDir] = {}
+                    for cd, _ in to_browse:
+                        updated = (
+                            self.candidate_index.disc_groups.get((cd.user, cd.dir_name))
+                            if cd.dir_info.get("merged") else self.candidate_index.dirs_map.get((cd.user, cd.dir_name))
+                        )
+                        # A browsed disc folder also completes the release folder it belongs to.
+                        for item in (updated, self.candidate_index.group_for(cd.user, cd.dir_name)):
+                            if item is not None and item is not cd and item.audio_files:
+                                browsed[id(item)] = item
+                    for updated in browsed.values():
+                        evaluation = evaluate(updated)
+                        if accepted(evaluation):
+                            candidate_matches[match_key(updated)] = evaluation
+
+                # Folders named after the release first: only they supply every needed song, and
+                # a release's files stay together when one of them holds it all.
+                return sorted(candidate_matches.values(), key=lambda item: (not item["own_folder"], -item["total_score"]))
+
+            def supplies(candidate: Dict[str, Any]) -> Set[int]:
+                return {slot for slot in self._slot_targets(plan, candidate).values() if slot in supplied(candidate)}
+
+            ranked = folders()
+            # The artist searches show everything filed under the artist: the release is
+            # searched by name only when they leave a needed song without a folder in the
+            # preferred format.
+            preferred = [
+                candidate for candidate in ranked
+                if self.preferred_format != "flac" or "FLAC" in candidate["format_label"]
+            ]
+            if needed - {slot for candidate in preferred for slot in supplies(candidate)} and self._search_release(rel):
+                ranked = folders()
             for candidate in ranked:
                 targets = self._slot_targets(plan, candidate)
-                missing_files = {filename for filename, slot in targets.items() if slot in needed}
+                missing_files = {filename for filename, slot in targets.items() if slot in supplied(candidate)}
                 candidate["all_dir_files"] = [
                     f for f in candidate["all_dir_files"] if f.get("filename") in missing_files
                 ]
                 candidate["release"] = rel_title
             # A candidate holding only local tracks supplies nothing.
             ranked = [candidate for candidate in ranked if candidate["all_dir_files"]]
-            plan["candidates"] = ranked
-            plan["dir_slots"] = {
-                slot for candidate in ranked for slot in self._slot_targets(plan, candidate).values() if slot in needed
-            }
 
-            # Missing songs no folder supplies: loose files with the artist's name.
+            plan["dir_slots"] = {slot for candidate in ranked for slot in supplies(candidate)}
+            # One folder that supplies everything the folders can, in a format as good as the
+            # best-ranked one's, goes first: a complete smaller edition from a healthier peer
+            # would otherwise leave the bonus tracks to another peer's differently named files.
+            if len(ranked) > 1 and not plan["dir_slots"] <= supplies(ranked[0]):
+                complete = next((
+                    candidate for candidate in ranked[1:]
+                    if candidate["own_folder"] == ranked[0]["own_folder"]
+                    and candidate["format_score"] >= ranked[0]["format_score"]
+                    and plan["dir_slots"] <= supplies(candidate)
+                ), None)
+                if complete is not None:
+                    ranked = [complete] + [candidate for candidate in ranked if candidate is not complete]
+            plan["candidates"] = ranked
+
+            # Missing songs no folder supplies: loose files with the artist's name. A song
+            # held on another release is not fetched again from a loose file.
             taken = {
                 (candidate["user"], filename) for candidate in ranked
                 for filename in self._slot_targets(plan, candidate)
             }
             for slot_id in plan["needed"]:
-                if slot_id in plan["dir_slots"]:
+                if slot_id in plan["dir_slots"] or slot_id not in fresh:
                     continue
                 slot = plan["slots"][slot_id]
                 files = [
@@ -1565,7 +1800,9 @@ class SlskdArtistScraper:
                 slot = plan["slots"][slot_id]
                 self.covered_song_keys |= slot["keys"]
                 self.covered_track_titles.add(normalize_text(slot["title"]))
-            if not ranked and not plan["track_slots"]:
+            # Nothing found for a release that lacks a song; one that only wants its own copy
+            # of songs held elsewhere misses nothing.
+            if not ranked and not plan["track_slots"] and fresh:
                 self.unresolved_releases.append(rel)
         self._refresh_unresolved()
 
@@ -1618,13 +1855,18 @@ class SlskdArtistScraper:
         if self._release_song_index is None:
             aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
             release_songs: Dict[Tuple[str, ...], Set[Hashable]] = {}
+            plain_titles: Dict[Tuple[str, ...], Set[Hashable]] = {}
             for track in (self.catalog.tracks if self.catalog else []):
                 keys = self._song_keys(track)
                 for title in set(track.get("all_releases") or ()) | {track.get("release_title") or ""}:
                     words = tuple(_title_words(title, aliases))
                     if words:
                         release_songs.setdefault(words, set()).update(keys)
+                    elif len(normalize_text(title).split()) >= 2:
+                        # 'The Singles vol.1': every word is one folders use for anything.
+                        plain_titles.setdefault(tuple(normalize_text(title).split()), set()).update(keys)
             self._release_song_index = release_songs
+            self._plain_title_songs = plain_titles
         return self._release_song_index
 
     def _folder_place(self, folder: str, release: str, keys: FrozenSet[Hashable]) -> str:
@@ -1636,15 +1878,27 @@ class SlskdArtistScraper:
         'unknown': a name the catalog does not know ('2015 - First Light').
         """
         aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
-        return self._words_place(_folder_title_words(folder, aliases), release, keys)
+        return self._words_place(
+            _folder_title_words(folder, aliases), release, keys, name=_release_folder_name(folder),
+        )
 
-    def _words_place(self, words: List[str], release: str, keys: FrozenSet[Hashable], lenient: bool = False) -> str:
+    def _words_place(self, words: List[str], release: str, keys: FrozenSet[Hashable], lenient: bool = False,
+                     name: str = "") -> str:
         """_folder_place for the significant words of a folder or file name. lenient reads a
-        plural like the singular ('Disaster must Comes' names 'Disaster Must Come')."""
+        plural like the singular ('Disaster must Comes' names 'Disaster Must Come'). name is
+        the whole folder or file name, which alone can spell a catalogued release whose title
+        has no significant word ('The Singles vol.1')."""
+        release_songs = self._release_songs()
+        if name and self._plain_title_songs:
+            spelled = normalize_text(name).split()
+            own_title = tuple(normalize_text(release).split())
+            plain = [title for title in self._plain_title_songs
+                     if title != own_title and is_sublist(list(title), spelled)]
+            if plain:
+                return "shares" if any(keys & self._plain_title_songs[title] for title in plain) else "other"
         if not words:
             return "loose"
         aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
-        release_songs = self._release_songs()
         stem = (lambda word: word[:-1] if len(word) >= 5 and word.endswith("s") else word) if lenient else (lambda word: word)
         words = [stem(word) for word in words]
         own = tuple(stem(word) for word in _title_words(release, aliases))
@@ -1672,7 +1926,51 @@ class SlskdArtistScraper:
         place = self._folder_place(folder, release, slot["keys"])
         return place == "other" or (place == "unknown" and _is_generic_title(slot["title"]))
 
-    def _other_release_copy(self, file: Dict[str, Any], release: str, slot: Dict[str, Any]) -> Optional[str]:
+    def _tracklist_releases(self, user: str, folder: str, release: str) -> List[Set[Hashable]]:
+        """Songs of each other catalogued release whose tracklist a discovered folder holds.
+
+        Peers name folders in other words than MusicBrainz titles a release (an English
+        'Sailorsuit and Speedcore Archives' for a Japanese title): four of its songs or
+        more, and most of the release, still show which release the folder is. Folders of
+        other peers with the same name are the same release, also where a peer's capped
+        search response showed too few of its files to tell.
+        """
+        if self.candidate_index is None:
+            return []
+        if self._release_tracklists is None:
+            tracklists: Dict[str, Dict[str, Set[Hashable]]] = {}
+            for track in (self.catalog.tracks if self.catalog else []):
+                base = parse_track_title_structure(track.get("title") or "", is_filename=False)["base_norm"]
+                for title in set(track.get("all_releases") or ()) | {track.get("release_title") or ""}:
+                    if base and normalize_text(title):
+                        tracklists.setdefault(normalize_text(title), {}).setdefault(base, set()).update(
+                            self._song_keys(track))
+            self._release_tracklists = tracklists
+
+        def held(cd: CandidateDir) -> List[Tuple[str, Set[Hashable]]]:
+            key = (cd.user, cd.dir_name, len(cd.audio_files))
+            if key not in self._tracklist_cache:
+                bases = {base for cf in cd.audio_files for base in cf.title_bases()} if len(cd.audio_files) >= 4 else set()
+                self._tracklist_cache[key] = [
+                    (title, set().union(*songs.values())) for title, songs in self._release_tracklists.items()
+                    if len(songs) >= 4 and len(bases.intersection(songs)) >= max(4, 0.7 * len(songs))
+                ]
+            return self._tracklist_cache[key]
+
+        aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
+        words = _folder_title_words(folder, aliases)
+        own = self.candidate_index.dirs_map.get((user, folder))
+        folders = [own] if own is not None else []
+        if words:
+            folders += [
+                cd for cd in self.candidate_index.word_to_dirs.get(max(words, key=len), ())
+                if cd is not own and not cd.dir_info.get("merged") and _folder_title_words(cd.dir_name, aliases) == words
+            ]
+        requested = normalize_text(release)
+        return [songs for cd in folders for title, songs in held(cd) if title != requested]
+
+    def _other_release_copy(self, file: Dict[str, Any], release: str, slot: Dict[str, Any],
+                            user: Optional[str] = None) -> Optional[str]:
         """The folder of a peer file that is another release's song, else None.
 
         Its folder names a catalogued release without the song, or its own name does once
@@ -1680,13 +1978,21 @@ class SlskdArtistScraper:
         - No Surrenda !!!.mp3' in a folder called 'ROTATOR- STAZMA-' is Insized's copy. A name
         that only repeats the song's title ('Rotator - HXC Militia.mp3') or names this release
         says nothing. A generic title ('Rain', 'Intro') in a folder the catalog does not know
-        is another release's unless its length matches the song's (slot 'duration').
+        is another release's unless its length matches the song's (slot 'duration'). A
+        discovered folder (user given) that holds another catalogued release's tracklist is
+        that release's whatever it is called.
         """
         folder, basename = extract_dir_and_filename(file.get("filename") or "")
         aliases = frozenset(alias for alias in self.all_artist_aliases if alias)
         if _is_release_folder(folder, release, aliases):
             return None
-        place = self._words_place(_folder_title_words(folder, aliases), release, slot["keys"], lenient=True)
+        if user is not None:
+            held = self._tracklist_releases(user, folder, release)
+            if held and not any(slot["keys"] & songs for songs in held):
+                return folder
+        place = self._words_place(
+            _folder_title_words(folder, aliases), release, slot["keys"], lenient=True, name=_release_folder_name(folder),
+        )
         if place == "other":
             return folder
         if place == "unknown" and _is_generic_title(slot["title"]):
@@ -1768,7 +2074,8 @@ class SlskdArtistScraper:
         def history_matches(index: PeerCandidateIndex, track: str, release: str = "", reference: str = "",
                             repeated: bool = False, compilation: bool = False, unique: bool = True,
                             keys: FrozenSet[Hashable] = frozenset(),
-                            position: Optional[Tuple[Optional[int], Optional[int]]] = None):
+                            position: Optional[Tuple[Optional[int], Optional[int]]] = None,
+                            own_copy: bool = False):
             parsed = pre_parse_single_track(track)
             expected_base = parsed["p_struct"]["base_norm"]
             generic = _is_generic_title(track)
@@ -1811,6 +2118,10 @@ class SlskdArtistScraper:
                 # title ('Intro'); a distinctive title is the same song.
                 if place == "other" or (place == "unknown" and generic):
                     continue
+                # A release fetched whole takes its own copy of a song it shares with
+                # another release: that release's transfer does not stand for this one's.
+                if own_copy and place == "shares":
+                    continue
                 # Another release has a song with this title: only a copy from
                 # this release's folder (or one that has this song) accounts for it.
                 if not unique and place not in ("own", "shares"):
@@ -1832,19 +2143,21 @@ class SlskdArtistScraper:
         def protected_track(track: str, release: str = "", reference: str = "",
                             repeated: bool = False, compilation: bool = False,
                             unique: bool = True, keys: FrozenSet[Hashable] = frozenset(),
-                            position: Optional[Tuple[Optional[int], Optional[int]]] = None) -> Optional[CandidateFile]:
+                            position: Optional[Tuple[Optional[int], Optional[int]]] = None,
+                            own_copy: bool = False) -> Optional[CandidateFile]:
             return next(history_matches(
-                protected_index, track, release, reference, repeated, compilation, unique, keys, position,
+                protected_index, track, release, reference, repeated, compilation, unique, keys, position, own_copy,
             ), None)
 
         def superseded(track: str, release: str = "", reference: str = "", repeated: bool = False,
                        compilation: bool = False, unique: bool = True,
-                       keys: FrozenSet[Hashable] = frozenset()) -> Set[Tuple[str, str]]:
+                       keys: FrozenSet[Hashable] = frozenset(), own_copy: bool = False) -> Set[Tuple[str, str]]:
             """Stale or failed transfers of this song that a new submission replaces."""
             return {
                 source_key(candidate.user, candidate.full_filename)
                 for candidate in history_matches(
                     recovery_index, track, release, reference, repeated, compilation, unique, keys,
+                    own_copy=own_copy,
                 )
                 if history.excludes(candidate.user, candidate.full_filename)
             }
@@ -1972,11 +2285,14 @@ class SlskdArtistScraper:
                 for candidate in candidates:
                     for filename, slot_id in file_targets(candidate).items():
                         references.setdefault(slot_id, filename)
+                # A release fetched whole takes each song from its own folder, also one
+                # queued for another release in this pass; otherwise each song is queued once.
+                own_copy = plan["whole"]
                 for slot_id in remaining:
                     slot = plan["slots"][slot_id]
-                    if slot["keys"] & self.queued_song_keys or protected_track(
+                    if (not own_copy and slot["keys"] & self.queued_song_keys) or protected_track(
                         slot["title"], release, references.get(slot_id, ""),
-                        repeated=slot["repeated"], unique=slot["unique"], keys=slot["keys"],
+                        repeated=slot["repeated"], unique=slot["unique"], keys=slot["keys"], own_copy=own_copy,
                     ):
                         protected_targets.add(slot_id)
             else:
@@ -1998,7 +2314,7 @@ class SlskdArtistScraper:
                     slot = plan["slots"][slot_id]
                     sources = superseded(
                         slot["title"], release, references.get(slot_id, ""),
-                        repeated=slot["repeated"], unique=slot["unique"], keys=slot["keys"],
+                        repeated=slot["repeated"], unique=slot["unique"], keys=slot["keys"], own_copy=plan["whole"],
                     )
                     if sources:
                         replaced.setdefault(slot_id, set()).update(sources)
@@ -2316,9 +2632,10 @@ class SlskdArtistScraper:
             # Songs no discovered source supplied, and songs whose sources all
             # refused or were offline. A submission that failed for an unknown
             # reason may have been accepted, so it is never repeated elsewhere.
+            # A song held on another release is fetched again only with this release's folder.
             slots = [
                 slot_id for slot_id in plan["needed"]
-                if (slot_id in plan["unfilled"] or slot_id in plan["unqueued"])
+                if (slot_id in plan["unfilled"] or slot_id in plan["unqueued"]) and slot_id in plan["fresh"]
                 and slot_id not in plan["queue_failed"] and slot_id not in plan["resolved"]
                 and not (plan["slots"][slot_id]["keys"] & self.queued_song_keys)
             ]
@@ -2334,7 +2651,7 @@ class SlskdArtistScraper:
                 slot_id = slot_of_row.get(id(row))
                 if slot_id is None:
                     return True
-                folder = self._other_release_copy(file, plan["release"], plan["slots"][slot_id])
+                folder = self._other_release_copy(file, plan["release"], plan["slots"][slot_id], user)
                 if folder is not None:
                     plan["other_release"].setdefault(slot_id, folder)
                     return False

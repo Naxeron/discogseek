@@ -49,7 +49,8 @@ class FakeSlskdClient:
         return {"status": "enqueued", "files_count": len(files)}
 
 
-def artist_scraper(client, releases=None):
+def artist_scraper(client, releases=None, group=None):
+    """A scraper for releases given as {title: track titles}; group puts them in one release group."""
     scraper = SlskdArtistScraper("Target Artist", slskd_client=client)
     scraper.all_artist_aliases = {"target artist"}
     scraper.catalog = ArtistCatalog({
@@ -58,6 +59,7 @@ def artist_scraper(client, releases=None):
             {
                 "id": f"release-{release_index}",
                 "title": title,
+                **({"release-group": {"id": group}} if group else {}),
                 "medium-list": [{"track-list": [
                     {"id": f"track-{release_index}-{track_index}", "title": track}
                     for track_index, track in enumerate(tracks)
@@ -579,7 +581,7 @@ def test_artist_primary_releases_do_not_queue_same_track_from_two_editions():
     scraper = artist_scraper(client, {
         "Night Signals": ["Neon Memory", "Midnight Echo"],
         "Night Signals Expanded": ["Neon Memory", "Morning Light"],
-    })
+    }, group="night-signals")
     first = add_peer_files(scraper, "first-peer", "Night Signals", ["Neon Memory", "Midnight Echo"])
     second = add_peer_files(scraper, "second-peer", "Night Signals Expanded", ["Neon Memory", "Morning Light"], "mp3")
 
